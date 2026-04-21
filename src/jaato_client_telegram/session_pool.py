@@ -24,7 +24,7 @@ from jaato_sdk.events import (
 from jaato_client_telegram.transport import WSTransport
 
 if TYPE_CHECKING:
-    from jaato_client_telegram.config import JaatoWSConfig
+    pass  # JaatoWSConfig available via config module
 
 
 logger = logging.getLogger(__name__)

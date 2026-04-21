@@ -157,7 +157,6 @@ class Config(BaseModel):
     """Root configuration for jaato-client-telegram."""
 
     telegram: TelegramConfig
-    jaato: JaatoConfig = Field(default_factory=JaatoConfig)
     jaato_ws: JaatoWSConfig = Field(default_factory=JaatoWSConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     rendering: RenderingConfig = Field(default_factory=RenderingConfig)

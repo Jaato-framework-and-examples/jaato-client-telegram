@@ -6,6 +6,7 @@ multiplexing events for multiple sessions over one connection.
 
 import asyncio
 import logging
+import ssl
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
@@ -13,8 +14,7 @@ import websockets
 import websockets.exceptions
 from jaato_sdk.events import serialize_event, deserialize_event
 
-if TYPE_CHECKING:
-    from jaato_client_telegram.config import TLSConfig
+from jaato_client_telegram.config import TLSConfig
 
 logger = logging.getLogger(__name__)
 
