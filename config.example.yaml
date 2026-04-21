@@ -1,0 +1,207 @@
+# jaato-client-telegram Configuration
+
+# Telegram Bot Configuration
+telegram:
+  # Get your bot token from @BotFather on Telegram
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+
+  # Mode: "polling" (default) or "webhook"
+  # Polling is simpler for development, webhook is better for production
+  mode: "polling"
+
+  # Webhook configuration (only used if mode: "webhook")
+  webhook:
+    # Public URL where Telegram will send updates
+    url: "https://your-domain.com/tg-webhook"
+
+    # Host to bind webhook server to (default 0.0.0.0 for all interfaces)
+    host: "0.0.0.0"
+
+    # Port for webhook server
+    port: 8443
+
+    # Webhook path (must match your reverse proxy configuration)
+    path: "/tg-webhook"
+
+    # Secret token for webhook security (recommended for production)
+    # Generate a random string: openssl rand -hex 32
+    secret_token: "${WEBHOOK_SECRET}"
+
+    # Path to SSL certificate (optional, for self-signed certificates)
+    # cert_path: null
+
+    # Maximum number of concurrent connections to webhook
+    max_connections: 40
+
+    # List of update types to receive (null = all updates)
+    # allowed_updates: ["message", "callback_query"]
+
+  # Access control
+  access:
+    # List of allowed chat IDs (empty = allow all)
+    # Get your chat ID from @userinfobot on Telegram
+    allowed_chat_ids: []
+
+    # List of admin user IDs (can use /reset, /status)
+    admin_user_ids: []
+
+  # Group chat behavior
+  group:
+    # Only respond when @mentioned or replied to
+    require_mention: true
+
+    # Optional prefix to trigger bot in groups (e.g., "!ask")
+    # trigger_prefix: null
+
+# jaato SDK Connection
+jaato:
+  # Unix socket path to jaato server
+  socket_path: "/tmp/jaato.sock"
+
+  # Auto-start jaato server if not running
+  # (typically false - server is started separately)
+  auto_start: false
+
+  # Environment file for jaato server config
+  env_file: ".env"
+
+  # Per-user workspace directory (will be resolved to absolute path)
+  workspace_path: "workspaces"
+
+# Session Pool Configuration
+session:
+  # Maximum concurrent SDK clients
+  max_concurrent: 50
+
+  # Disconnect idle sessions after N minutes
+  idle_timeout_minutes: 60
+
+  # Use SDK's built-in reconnection on error
+  reconnect_on_error: true
+
+# Response Rendering
+rendering:
+  # Telegram's message length limit
+  max_message_length: 4096
+
+  # Edit-in-place streaming as events arrive
+  stream_edits: true
+
+  # Show "typing..." indicator while waiting for response
+  typing_indicator: true
+
+  # Throttle edits to respect rate limits (milliseconds)
+  edit_throttle_ms: 500
+
+# Permission Request UI
+permissions:
+  # Action types to filter from inline keyboard (comma or pipe separated)
+  # These require complex UI (text input, modals) that Telegram doesn't support
+  #
+  # jaato-sdk action values:
+  # - allow: Simple yes button (✅)
+  # - deny: Simple no button (❌)
+  # - allow_session: Always allow for this session
+  # - allow_turn: Allow for this turn only
+  # - allow_until_idle: Allow until session goes idle
+  # - allow_once: Allow only once
+  # - deny_session: Always deny for this session
+  # - allow_all: Allow all requests
+  # - comment: Requires free-form text input
+  # - edit: Requires editing interface
+  #
+  # Example to show only allow/deny buttons:
+  #   unsupported_actions: "allow_session,allow_turn,allow_until_idle,allow_once,deny_session,allow_all,comment,edit"
+  unsupported_actions: "comment,edit"
+
+# File Sharing Configuration
+file_sharing:
+  # Enable/disable file sharing (default: true)
+  enabled: true
+
+  # Maximum file size in MB (Telegram bot limit is 50MB, default 10MB)
+  max_file_size_mb: 10
+
+  # Allowed file extensions (lowercase with dots)
+  # Add or remove extensions as needed for your use case
+  allowed_extensions:
+    - ".txt"
+    - ".csv"
+    - ".json"
+    - ".xml"
+    - ".yaml"
+    - ".yml"
+    - ".md"
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".html"
+    - ".css"
+    - ".java"
+    - ".kt"
+    - ".rs"
+    - ".go"
+    - ".sh"
+    - ".bash"
+    - ".zsh"
+    - ".cfg"
+    - ".conf"
+    - ".ini"
+    - ".toml"
+    - ".lock"
+
+  # Size threshold for determining delivery method (in KB)
+  # Files < this size are sent as document attachments
+  # Files >= this size are sent as Telegram file hosting URLs (download links)
+  link_threshold_kb: 100
+
+# Rate Limiting
+rate_limiting:
+  # Enable rate limiting to prevent abuse
+  enabled: false
+
+  # Maximum messages per user per minute
+  messages_per_minute: 30
+
+  # Maximum messages per user per hour
+  messages_per_hour: 200
+
+  # Cooldown period after hitting limits (seconds)
+  cooldown_seconds: 60
+
+  # Allow admin users to bypass rate limits
+  admin_bypass: true
+
+  # How often to clean up old user states (minutes)
+  cleanup_interval_minutes: 60
+
+  # Maximum age of user state before cleanup (hours)
+  cleanup_max_age_hours: 24
+
+# Telemetry (Minimal Bot-Layer Metrics)
+telemetry:
+  enabled: false
+  collect_telegram_delivery: true
+  collect_ui_interactions: true
+  collect_session_pool: true
+  collect_rate_limiting: true
+  collect_abuse_protection: true
+  collect_latency: true
+  retention_hours: 24
+  cleanup_interval_minutes: 60
+
+# Logging
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+
+  # Format: "structured" (JSON) or "text"
+  format: "structured"
+
+# Trace Log (jaato-sdk client standard)
+# If JAATO_TRACE_LOG environment variable is set and non-empty,
+# all logs are written to the specified file instead of console.
+# Only a single console message will indicate where logs are being written.
+# Example: export JAATO_TRACE_LOG="/var/log/jaato-client-telegram.log"
+#
+# If JAATO_TRACE_LOG is not set, logs are sent to the console as usual.

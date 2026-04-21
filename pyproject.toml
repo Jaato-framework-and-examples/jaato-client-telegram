@@ -1,0 +1,80 @@
+[project]
+name = "jaato-client-telegram"
+version = "0.1.0"
+description = "Telegram bot client for jaato AI agent system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Daniel Alonso", email = "dani.apanoia@gmail.com"}
+]
+keywords = ["telegram", "bot", "jaato", "ai", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+    "Topic :: Communications :: Chat",
+]
+
+dependencies = [
+    "jaato-sdk>=0.1.0",
+    "aiogram>=3.15",
+    "aiohttp>=3.9",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "structlog>=24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Jaato-framework-and-examples/jaato-client-telegram"
+Documentation = "https://github.com/Jaato-framework-and-examples/jaato-client-telegram#readme"
+Repository = "https://github.com/Jaato-framework-and-examples/jaato-client-telegram"
+Issues = "https://github.com/Jaato-framework-and-examples/jaato-client-telegram/issues"
+
+[project.optional-dependencies]
+multimodal = [
+    "aiofiles>=24.0",
+    "Pillow>=10.0",
+]
+observability = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+jaato-tg = "jaato_client_telegram.__main__:main"
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

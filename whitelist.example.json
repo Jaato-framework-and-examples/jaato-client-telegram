@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "admin_usernames": [
+    "alice",
+    "bob"
+  ],
+  "entries": [
+    {
+      "username": "alice",
+      "added_by": "system",
+      "added_at": "2024-01-01T00:00:00"
+    },
+    {
+      "username": "bob",
+      "added_by": "alice",
+      "added_at": "2024-01-01T12:00:00"
+    }
+  ]
+}
