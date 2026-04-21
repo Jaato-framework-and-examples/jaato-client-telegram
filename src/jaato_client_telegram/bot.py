@@ -16,7 +16,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from jaato_client_telegram.config import Config
 from jaato_client_telegram.file_handler import FileHandler
 from jaato_client_telegram.workspace_tracker import WorkspaceFileTracker
-from jaato_client_telegram.workspace_event_subscriber import WorkspaceEventSubscriber
 from jaato_client_telegram.agent_response_tracker import AgentResponseTracker
 from jaato_client_telegram.handlers import (
     admin_router,
@@ -33,7 +32,7 @@ from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.whitelist import WhitelistManager
-from jaato_client_telegram.workspace import WorkspaceManager
+from jaato_client_telegram.transport import WSTransport
 
 
 logger = logging.getLogger(__name__)
@@ -51,11 +50,10 @@ def _create_renderer(config: Config, permission_handler: PermissionHandler | Non
     )
 
 
-def _create_session_pool(config: Config, workspace_manager: WorkspaceManager) -> SessionPool:
+def _create_session_pool(config: Config, transport: WSTransport) -> SessionPool:
     """Create a SessionPool with config settings."""
     return SessionPool(
-        config=config.jaato,
-        workspace_manager=workspace_manager,
+        transport=transport,
         max_concurrent=config.session.max_concurrent,
     )
 
@@ -89,8 +87,12 @@ def create_bot_and_dispatcher(
     dp = Dispatcher(storage=MemoryStorage())
 
     # Create shared dependencies
-    workspace_manager = WorkspaceManager(config)
-    pool = _create_session_pool(config, workspace_manager)
+    transport = WSTransport(
+        url=config.jaato_ws.url,
+        tls_config=config.jaato_ws.tls,
+        secret_token=config.jaato_ws.secret_token,
+    )
+    pool = _create_session_pool(config, transport)
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
     file_handler = FileHandler(config.file_sharing)
     workspace_tracker = WorkspaceFileTracker()
@@ -99,7 +101,6 @@ def create_bot_and_dispatcher(
     # Note: WorkspaceEventSubscriber needs an IPC backend from jaato-server
     # This will be added once we determine the source of the IPC connection
     # For now, event_subscriber is None and won't be started
-    event_subscriber = None  # WorkspaceEventSubscriber(ipc_backend, workspace_tracker)
 
     renderer = _create_renderer(config, permission_handler, file_handler, agent_response_tracker, pool)
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
@@ -151,7 +152,6 @@ def create_bot_and_dispatcher(
     dp["telemetry"] = telemetry
     dp["admin_user_ids"] = config.telegram.access.admin_user_ids
     dp["workspace_tracker"] = workspace_tracker
-    dp["event_subscriber"] = event_subscriber
     dp["agent_response_tracker"] = agent_response_tracker
 
     logger.info(

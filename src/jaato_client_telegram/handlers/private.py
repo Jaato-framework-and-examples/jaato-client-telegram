@@ -113,20 +113,17 @@ async def handle_private_message(
                 # Returning user: quick typing indicator
                 await message.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-            # Get SDK client for this user (triggers connection if needed)
-            client = await pool.get_client(chat_id)
+            session_id = await pool.get_or_create_session(chat_id)
 
-            logger.debug(f"User {chat_id}: client session_id = {client.session_id}")
+            logger.debug(f"User {chat_id}: session_id = {session_id}")
 
             # Send user message to jaato
-            # If this fails due to stale session, the next message will trigger recreation
-            await client.send_message(user_text)
+            await pool.send_message(session_id, user_text)
 
             # Stream response events and render progressively
-            # This handles everything including final display
             await renderer.stream_response(
                 initial_message=message,
-                event_stream=client.events(),
+                event_stream=pool.events(session_id),
             )
 
         except Exception as e:

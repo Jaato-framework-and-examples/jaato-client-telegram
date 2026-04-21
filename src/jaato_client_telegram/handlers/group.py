@@ -194,24 +194,20 @@ async def handle_group_message(
                     chat_id=message.chat.id, action="typing"
                 )
 
-            # Get SDK client for this GROUP context (all users share same workspace)
-            # Use chat_id for group isolation (not user_id)
-            # This allows all group members to share the same conversation context
-            client = await pool.get_client(message.chat.id)
+            session_id = await pool.get_or_create_session(message.chat.id)
 
             logger.info(
                 f"Group message from user {user_id} in chat {message.chat.id}: "
-                f"chat_workspace={message.chat.id}, session_id={client.session_id}"
+                f"session_id={session_id}"
             )
 
             # Send cleaned user message to jaato
-            await client.send_message(cleaned_text)
+            await pool.send_message(session_id, cleaned_text)
 
             # Stream response events and render progressively
-            # This handles everything including final display
             await renderer.stream_response(
                 initial_message=message,
-                event_stream=client.events(),
+                event_stream=pool.events(session_id),
             )
 
         except Exception as e:
@@ -329,22 +325,21 @@ async def _process_group_message(
                     chat_id=message.chat.id, action="typing"
                 )
 
-            # Get SDK client for this GROUP (shared by all members)
-            client = await pool.get_client(chat_id)
+            session_id = await pool.get_or_create_session(chat_id)
 
             user_id = message.from_user.id if message.from_user else "unknown"
             logger.info(
                 f"Group message from user {user_id} in chat {chat_id}: "
-                f"session_id={client.session_id}"
+                f"session_id={session_id}"
             )
 
             # Send message to jaato
-            await client.send_message(cleaned_text)
+            await pool.send_message(session_id, cleaned_text)
 
             # Stream response
             await renderer.stream_response(
                 initial_message=message,
-                event_stream=client.events(),
+                event_stream=pool.events(session_id),
             )
 
         except Exception as e:

@@ -100,14 +100,17 @@ async def handle_permission_callback(
 
     # Send permission response to jaato SDK
     try:
-        # Get the SDK client for this user
-        client = await pool.get_client(chat_id)
-        
-        # Call respond_to_permission
-        await client.respond_to_permission(
+        # Get the session_id for this user
+        session_id = pool.get_session_id(chat_id)
+        if not session_id:
+            await query.answer("No active session found")
+            return
+
+        # Send permission response to jaato
+        await pool.respond_to_permission(
+            session_id=session_id,
             request_id=request_id,
             response=option_key,
-            edited_arguments=None,
         )
         
         logger.info(
