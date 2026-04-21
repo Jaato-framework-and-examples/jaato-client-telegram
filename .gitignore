@@ -160,3 +160,5 @@ test_workspace_*.py
 # Additional exclusions
 MagicMock/
 logs/
+
+.jdtls/
