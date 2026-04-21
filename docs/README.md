@@ -9,6 +9,7 @@ Development notes, design documents, and implementation details for jaato-client
 | [design-prompt.md](design/design-prompt.md) | Original design prompt that guided the client's architecture and feature set |
 | [event-flow-diagram.md](design/event-flow-diagram.md) | Visual diagram of how events flow through the system — from Telegram to jaato server and back |
 | [rendering-pipeline.md](design/rendering-pipeline.md) | How agent responses are rendered into Telegram messages, including markdown, code blocks, and expandable content |
+| [ipc-to-ws-migration.md](design/ipc-to-ws-migration.md) | Detailed migration plan for moving from IPC (Unix socket) to WebSocket transport — phases, interface contracts, risk assessment, and rollback strategy |
 
 ## Features
 
