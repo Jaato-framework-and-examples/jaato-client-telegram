@@ -90,7 +90,10 @@ def create_bot_and_dispatcher(
     transport = WSTransport(
         url=config.jaato_ws.url,
         tls_config=config.jaato_ws.tls,
-        secret_token=config.jaato_ws.secret_token,
+        keycloak_base_url=config.jaato_ws.keycloak_base_url,
+        keycloak_realm=config.jaato_ws.keycloak_realm,
+        keycloak_client_id=config.jaato_ws.keycloak_client_id,
+        keycloak_client_secret=config.jaato_ws.keycloak_client_secret,
     )
     pool = _create_session_pool(config, transport)
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
