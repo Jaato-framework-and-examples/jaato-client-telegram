@@ -1,8 +1,5 @@
-path: /home/apanoia/Sources/Jaato-framework-and-examples/jaato-client-telegram/docs/design/ipc-to-ws-migration.md | lines: 439 | size: 15849
 
-path: /home/apanoia/Sources/Jaato-framework-and-examples/jaato-client-telegram/docs/design/ipc-to-ws-migration.md | lines: 201 | size: 6727
 
-path: /home/apanoia/Sources/Jaato-framework-and-examples/jaato-client-telegram/docs/design/ipc-to-ws-migration.md | lines: 38 | size: 1870
 
 # IPC → WebSocket Migration Plan
 
