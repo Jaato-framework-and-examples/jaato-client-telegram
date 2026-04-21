@@ -53,20 +53,28 @@ telegram:
     # Optional prefix to trigger bot in groups (e.g., "!ask")
     # trigger_prefix: null
 
-# jaato SDK Connection
-jaato:
-  # Unix socket path to jaato server
-  socket_path: "/tmp/jaato.sock"
+# jaato SDK Connection (WebSocket transport)
+# When using WebSocket transport, the server handles workspace provisioning,
+# AppArmor sandboxing, and TLS. Remove the jaato: section above and
+# configure jaato_ws: instead.
+jaato_ws:
+  # WebSocket server URL
+  # Use wss:// for TLS, ws:// for plain (development only)
+  url: "${JAATO_WS_URL:ws://localhost:8080}"
 
-  # Auto-start jaato server if not running
-  # (typically false - server is started separately)
-  auto_start: false
+  # TLS configuration (required when using wss://)
+  tls:
+    enabled: false
+    # cert_path: "/path/to/cert.pem"
+    # key_path: "/path/to/key.pem"
+    # ca_cert_path: "/path/to/ca.pem"
 
-  # Environment file for jaato server config
-  env_file: ".env"
+  # Authentication token (if server requires it)
+  # secret_token: "${JAATO_WS_TOKEN}"
 
-  # Per-user workspace directory (will be resolved to absolute path)
-  workspace_path: "workspaces"
+  # Workspace template for server-side provisioning
+  # The server creates workspaces from this template directory
+  workspace_template: "default"
 
 # Session Pool Configuration
 session:

@@ -49,13 +49,22 @@ class TelegramConfig(BaseModel):
     group: TelegramGroupConfig = Field(default_factory=TelegramGroupConfig)
 
 
-class JaatoConfig(BaseModel):
-    """jaato SDK connection configuration."""
+class TLSConfig(BaseModel):
+    """TLS configuration for WebSocket transport."""
 
-    socket_path: str = "/tmp/jaato.sock"
-    auto_start: bool = False
-    env_file: str = ".env"
-    workspace_path: str = "workspaces"
+    enabled: bool = False
+    cert_path: str | None = None
+    key_path: str | None = None
+    ca_cert_path: str | None = None
+
+
+class JaatoWSConfig(BaseModel):
+    """jaato WebSocket transport configuration."""
+
+    url: str = "ws://localhost:8080"
+    tls: TLSConfig = Field(default_factory=TLSConfig)
+    secret_token: str | None = None
+    workspace_template: str = "default"
 
 
 class SessionConfig(BaseModel):
@@ -149,6 +158,7 @@ class Config(BaseModel):
 
     telegram: TelegramConfig
     jaato: JaatoConfig = Field(default_factory=JaatoConfig)
+    jaato_ws: JaatoWSConfig = Field(default_factory=JaatoWSConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     rendering: RenderingConfig = Field(default_factory=RenderingConfig)
     permissions: PermissionConfig = Field(default_factory=PermissionConfig)
