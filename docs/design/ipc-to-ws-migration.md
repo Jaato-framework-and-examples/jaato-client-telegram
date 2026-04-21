@@ -1,6 +1,3 @@
-
-
-
 # IPC → WebSocket Migration Plan
 
 **Status**: Draft  
