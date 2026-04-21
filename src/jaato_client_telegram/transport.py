@@ -80,6 +80,9 @@ class WSTransport:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         if self._tls_config.ca_cert_path:
             ctx.load_verify_locations(self._tls_config.ca_cert_path)
+        else:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
         if self._tls_config.cert_path and self._tls_config.key_path:
             ctx.load_cert_chain(self._tls_config.cert_path, self._tls_config.key_path)
         return ctx
@@ -106,7 +109,7 @@ class WSTransport:
             payload = json.loads(resp.read().decode())
         return payload["access_token"]
 
-    async def _authenticate(self) -> str | None:
+    async def _send_auth_token(self) -> str:
         """Send auth.token frame and wait for server reply. Returns user_id."""
         token = await self._fetch_token()
         auth_frame = json.dumps({"type": "auth.token", "token": token})
@@ -125,13 +128,23 @@ class WSTransport:
         return user_id
 
     async def connect(self) -> None:
-        """Connect to the server, optionally authenticate, start receiver loop."""
+        """Connect to the server, optionally authenticate, start receiver loop.
+
+        Message interchange:
+          1. Server sends: ConnectedEvent (protocol_version, server_info)
+          2. Client sends: {"type": "auth.token", "token": "<JWT>"}  [if auth enabled]
+          3. Server replies: {"type": "auth.token", "user_id": "<username>"}
+        """
         ssl_ctx = self._build_ssl_context()
         self._ws = await websockets.connect(self._url, ssl=ssl_ctx)
         self._connected = True
 
+        # Drain the server's initial ConnectedEvent
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
+        logger.debug("Received: %s", raw[:100])
+
         if self._auth_enabled:
-            self._user_id = await self._authenticate()
+            self._user_id = await self._send_auth_token()
             logger.info("Connected to %s (user=%s)", self._url, self._user_id)
         else:
             logger.info("Connected to %s (no auth)", self._url)
