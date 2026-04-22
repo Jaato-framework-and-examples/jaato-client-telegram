@@ -89,10 +89,7 @@ class SessionPool:
                 await self._transport.send(config_event)
                 logger.info("Sent presentation context for chat_id %d", chat_id)
 
-                send_req = SendMessageRequest(text="/start")
-                await self._transport.send(send_req)
-
-                session_id = await self._wait_for_session_id(timeout=10.0)
+                session_id = await self._transport.create_session()
 
                 self._transport.register_session(session_id)
                 self._sessions[chat_id] = SessionMetadata(

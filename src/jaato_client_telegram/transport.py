@@ -37,6 +37,10 @@ import websockets.exceptions
 from jaato_sdk.events import (
     serialize_event,
     deserialize_event,
+    CommandRequest,
+    ConnectedEvent,
+    ErrorEvent,
+    SessionInfoEvent,
     ToolExecuteRequestEvent,
     ToolExecuteResultEvent,
     ToolsRegisterClientRequest,
@@ -151,13 +155,13 @@ class WSTransport:
         self._connected = True
 
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
-        logger.debug("Received: %s", raw[:100])
+        event = deserialize_event(raw)
+        if not isinstance(event, ConnectedEvent):
+            raise RuntimeError(f"Expected ConnectedEvent, got {type(event).__name__}")
+        logger.info("Connected to %s (protocol=%s)", self._url, event.protocol_version)
 
         if self._auth_enabled:
             self._user_id = await self._send_auth_token()
-            logger.info("Connected to %s (user=%s)", self._url, self._user_id)
-        else:
-            logger.info("Connected to %s (no auth)", self._url)
 
         self._receiver_task = asyncio.create_task(self._receiver_loop())
 
@@ -221,6 +225,18 @@ class WSTransport:
         reply = ToolExecuteResultEvent(call_id=call_id, result=result, error="")
         await self.send(reply)
 
+    async def create_session(self, args: list[str] | None = None) -> str:
+        req = CommandRequest(command="session.new", args=args or [])
+        await self.send(req)
+        while True:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=30.0)
+            event = deserialize_event(raw)
+            if isinstance(event, SessionInfoEvent):
+                logger.info("Session created: %s", event.session_id)
+                return event.session_id
+            if isinstance(event, ErrorEvent):
+                raise RuntimeError(f"session.new failed: {event.error} [{event.error_type}]")
+
     async def events(self, session_id: str) -> AsyncIterator:
         queue = self.register_session(session_id)
         while self._connected:
@@ -242,6 +258,10 @@ class WSTransport:
 
                     if isinstance(event, ToolExecuteRequestEvent):
                         asyncio.create_task(self._handle_tool_execute_request(event))
+                        continue
+
+                    if isinstance(event, ErrorEvent):
+                        logger.error("Server error: %s [%s]", event.error, event.error_type)
                         continue
 
                     session_id = getattr(event, "session_id", None)
