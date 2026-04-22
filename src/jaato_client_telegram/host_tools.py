@@ -119,13 +119,12 @@ async def _send_file(
     if ext not in config.allowed_extensions:
         return f"File type not supported: {ext}"
 
-    with open(path, "rb") as f:
-        await bot.send_document(
-            chat_id=chat_id,
-            document=f,
-            filename=path.name,
-            caption=f"\U0001f4c4 {path.name}",
-        )
+    from aiogram.types import FSInputFile
+    await bot.send_document(
+        chat_id=chat_id,
+        document=FSInputFile(path),
+        caption=f"\U0001f4c4 {path.name}",
+    )
     return f"sent {path.name} ({size_mb:.1f}MB)"
 
 
