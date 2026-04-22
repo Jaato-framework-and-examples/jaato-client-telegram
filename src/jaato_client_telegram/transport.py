@@ -86,6 +86,7 @@ class WSTransport:
         self._user_id: str | None = None
         self._tool_executors: dict[str, dict[str, Callable]] = {}
         self._tools_registered: bool = False
+        self._session_future: asyncio.Future | None = None
 
     @property
     def connected(self) -> bool:
@@ -226,16 +227,15 @@ class WSTransport:
         await self.send(reply)
 
     async def create_session(self, args: list[str] | None = None) -> str:
-        req = CommandRequest(command="session.new", args=args or [])
-        await self.send(req)
-        while True:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=30.0)
-            event = deserialize_event(raw)
-            if isinstance(event, SessionInfoEvent):
-                logger.info("Session created: %s", event.session_id)
-                return event.session_id
-            if isinstance(event, ErrorEvent):
-                raise RuntimeError(f"session.new failed: {event.error} [{event.error_type}]")
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._session_future = future
+        try:
+            req = CommandRequest(command="session.new", args=args or [])
+            await self.send(req)
+            return await asyncio.wait_for(future, timeout=30.0)
+        finally:
+            self._session_future = None
 
     async def events(self, session_id: str) -> AsyncIterator:
         queue = self.register_session(session_id)
@@ -260,8 +260,14 @@ class WSTransport:
                         asyncio.create_task(self._handle_tool_execute_request(event))
                         continue
 
+                    if isinstance(event, SessionInfoEvent) and self._session_future and not self._session_future.done():
+                        self._session_future.set_result(event.session_id)
+                        continue
+
                     if isinstance(event, ErrorEvent):
                         logger.error("Server error: %s [%s]", event.error, event.error_type)
+                        if self._session_future and not self._session_future.done():
+                            self._session_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
                         continue
 
                     session_id = getattr(event, "session_id", None)
