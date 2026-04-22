@@ -41,6 +41,9 @@ from jaato_sdk.events import (
     ConnectedEvent,
     ErrorEvent,
     SessionInfoEvent,
+    StageFilesEvent,
+    StageFilesRequest,
+    StagedFileSpec,
     ToolExecuteRequestEvent,
     ToolExecuteResultEvent,
     ToolsRegisterClientRequest,
@@ -84,9 +87,10 @@ class WSTransport:
         self._session_queues: dict[str, asyncio.Queue] = {}
         self._connected = False
         self._user_id: str | None = None
-        self._tool_executors: dict[str, dict[str, Callable]] = {}
+        self._tool_executors: dict[str, Callable] = {}
         self._tools_registered: bool = False
         self._session_future: asyncio.Future | None = None
+        self._stage_files_future: asyncio.Future | None = None
 
     @property
     def connected(self) -> bool:
@@ -188,10 +192,9 @@ class WSTransport:
 
     def unregister_session(self, session_id: str) -> None:
         self._session_queues.pop(session_id, None)
-        self._tool_executors.pop(session_id, None)
 
     def set_session_tool_executors(self, session_id: str, executors: dict[str, Callable]) -> None:
-        self._tool_executors[session_id] = executors
+        self._tool_executors.update(executors)
 
     async def register_host_tools(self, tool_schemas: list[dict], categories: dict[str, str] | None = None) -> None:
         if self._tools_registered:
@@ -202,13 +205,11 @@ class WSTransport:
         logger.info("Registered %d host-provided tools", len(tool_schemas))
 
     async def _handle_tool_execute_request(self, event: ToolExecuteRequestEvent) -> None:
-        session_id = getattr(event, "agent_id", "") or ""
         tool_name = event.tool_name
         tool_args = event.tool_args
         call_id = event.call_id
 
-        session_execs = self._tool_executors.get(session_id, {})
-        executor = session_execs.get(tool_name)
+        executor = self._tool_executors.get(tool_name)
 
         if executor is None:
             result = json.dumps({"error": f"Unknown client tool: {tool_name}"})
@@ -236,6 +237,48 @@ class WSTransport:
             return await asyncio.wait_for(future, timeout=30.0)
         finally:
             self._session_future = None
+
+    async def stage_files(
+        self,
+        workspace_id: str,
+        specs: list[StagedFileSpec],
+        payloads: list[bytes],
+    ) -> StageFilesEvent:
+        """Stage files into a workspace via multi-frame WS protocol.
+
+        Sends a TEXT frame with StageFilesRequest metadata, then N BINARY
+        frames with the raw file payloads. Awaits the StageFilesEvent
+        response from the server.
+
+        Args:
+            workspace_id: Target workspace (empty string = current).
+            specs: Per-file metadata (name, size, content_type).
+            payloads: Raw bytes for each file, same order as specs.
+
+        Returns:
+            StageFilesEvent with staged[] and failed[] lists.
+        """
+        if not self._ws or not self._connected:
+            raise RuntimeError("Not connected")
+        if len(specs) != len(payloads):
+            raise ValueError("specs and payloads must have the same length")
+
+        request = StageFilesRequest(
+            workspace_id=workspace_id,
+            files=specs,
+        )
+        await self._ws.send(serialize_event(request))
+
+        for data in payloads:
+            await self._ws.send(data)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._stage_files_future = future
+        try:
+            return await asyncio.wait_for(future, timeout=120.0)
+        finally:
+            self._stage_files_future = None
 
     async def events(self, session_id: str) -> AsyncIterator:
         queue = self.register_session(session_id)
@@ -268,6 +311,12 @@ class WSTransport:
                         logger.error("Server error: %s [%s]", event.error, event.error_type)
                         if self._session_future and not self._session_future.done():
                             self._session_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
+                        if self._stage_files_future and not self._stage_files_future.done():
+                            self._stage_files_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
+                        continue
+
+                    if isinstance(event, StageFilesEvent) and self._stage_files_future and not self._stage_files_future.done():
+                        self._stage_files_future.set_result(event)
                         continue
 
                     session_id = getattr(event, "session_id", None)
