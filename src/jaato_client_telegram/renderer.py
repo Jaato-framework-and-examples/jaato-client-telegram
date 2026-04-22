@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from jaato_client_telegram.semantic_markup import render_semantic_markup
+
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
@@ -81,9 +83,20 @@ class StreamingContext:
     edits_count: int = 0
     seen_model_output: bool = False  # Track if we've received any model output yet
     permission_sent: bool = False  # Track if permission UI was sent as separate message
+    content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
+
+
+def _has_telegram_html(text: str) -> bool:
+    """Check if text contains Telegram-compatible HTML tags.
+
+    Telegram parse_mode=HTML supports: <b>, <i>, <u>, <s>, <code>,
+    <pre>, <blockquote>, <a>, <spoiler>. We check for the ones
+    our pipeline actually emits.
+    """
+    return bool(re.search(r"<(?:pre|code|b|i|u|s|blockquote|a\s)[\s>]", text))
 
 
 def split_preserving_paragraphs(text: str, max_len: int) -> list[str]:
@@ -250,7 +263,7 @@ class ResponseRenderer:
                     # This ensures each flush creates a separate message in the chat
                     display_text = ctx.accumulated_text[: self._max_message_length]
                     if display_text:  # Only send if there's content
-                        has_html = "<blockquote>" in display_text
+                        has_html = _has_telegram_html(display_text)
                         # Use the new helper that sends typing action before the message
                         if has_html:
                             sent_msg = await self._send_with_typing_indicator(initial_message, display_text, parse_mode="HTML")
@@ -268,9 +281,14 @@ class ResponseRenderer:
                     # Don't use _edit_or_send - we want new messages, not edits
                 # Buffer model output for later display
                 elif source == "model" and mode in ("write", "append"):
-                    # Buffer text chunks for later display
-                    # Escape HTML to prevent parsing errors with content like <dependency>
-                    ctx.text_buffer.append(escape_html_content(content))
+                    # Process semantic markup tags first, then escape remaining HTML
+                    rendered = render_semantic_markup(content)
+                    if rendered != content:
+                        # Semantic tags were found and rendered; don't double-escape
+                        ctx.text_buffer.append(rendered)
+                    else:
+                        # No semantic tags; escape HTML as before
+                        ctx.text_buffer.append(escape_html_content(content))
 
                 elif source == "tool":
                     # Tool output - format with tool name and parameters
@@ -308,6 +326,7 @@ class ResponseRenderer:
                 # Agent completed - flush all buffers before finishing
                 self._flush_all_buffers(ctx)
                 await self._edit_or_send(initial_message, ctx)
+                ctx.content_sent = True
                 break
 
             elif event_type == "turn.completed" or event_type == "TURN_COMPLETED":
@@ -332,6 +351,7 @@ class ResponseRenderer:
                 else:
                     # No formatted_text provided, ensure we have the final response displayed
                     await self._edit_or_send(initial_message, ctx)
+                    ctx.content_sent = True
 
                 # NOTE: Do NOT break on turn.completed!
                 # Multi-turn agentic flows have multiple turn.completed events
@@ -352,6 +372,7 @@ class ResponseRenderer:
                     log.debug(f"Agent finished with status={status}, flushing buffers and completing stream")
                     self._flush_all_buffers(ctx)
                     await self._edit_or_send(initial_message, ctx)
+                    ctx.content_sent = True
                     break
                 # Ignore "active" status - that's the start signal
 
@@ -524,7 +545,9 @@ class ResponseRenderer:
                     log.warning("File generated event received but no file_handler configured")
 
         # Final edit with complete response
-        await self._edit_or_send(initial_message, ctx)
+        # Only if content hasn't already been sent by a terminal event
+        if not ctx.content_sent:
+            await self._edit_or_send(initial_message, ctx)
 
         return ctx
 
@@ -582,8 +605,8 @@ class ResponseRenderer:
         if not display_text and not ctx.text_buffer:
             return
 
-        # Check if text contains HTML formatting (expandable blockquotes)
-        has_html = "<blockquote>" in display_text
+        # Check if text contains Telegram HTML formatting
+        has_html = _has_telegram_html(display_text)
 
         # If permission was sent, don't edit the streaming message anymore
         # Send new content as separate messages instead
@@ -637,8 +660,8 @@ class ResponseRenderer:
 
         text = streaming_context.accumulated_text
 
-        # Check if text contains HTML formatting (expandable blockquotes)
-        has_html = "<blockquote>" in text
+        # Check if text contains Telegram HTML formatting
+        has_html = _has_telegram_html(text)
 
         # If fits in one message, just update
         if len(text) <= self._max_message_length:
