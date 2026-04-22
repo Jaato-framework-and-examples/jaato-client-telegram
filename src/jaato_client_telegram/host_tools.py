@@ -47,7 +47,7 @@ TOOL_SCHEMAS = [
                 },
             },
         },
-        "category": "communication",
+        "category": "telegram",
         "timeout": 30000,
         "auto_approve": True,
     },
