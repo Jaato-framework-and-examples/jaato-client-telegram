@@ -248,14 +248,14 @@ class PermissionHandler:
         # Log all incoming options at DEBUG level
         logger.debug(
             f"Creating permission keyboard with {len(options)} options: "
-            f"{[{'key': opt.get('key', '?'), 'action': opt.get('action', '?'), 'label': opt.get('label', '?')} for opt in options]}"
+            f"{[{'key': opt.get('short', '?'), 'full': opt.get('full', '?'), 'decision': opt.get('decision', '?')} for opt in options]}"
         )
         logger.debug(f"Filtering unsupported actions: {sorted(self._unsupported_actions)}")
 
         # Filter out unsupported action types
         filtered_options = [
             opt for opt in options
-            if opt.get("action", "") not in self._unsupported_actions
+            if opt.get("full", "") not in self._unsupported_actions
         ]
 
         logger.debug(f"After filtering: {len(filtered_options)} options remain")
@@ -267,7 +267,7 @@ class PermissionHandler:
             logger.info(
                 f"Filtered out {filtered_count} unsupported permission option(s) "
                 f"(Telegram inline keyboard limitation): "
-                f"{[opt.get('action', 'unknown') for opt in options if opt.get('action', '') in self._unsupported_actions]}"
+                f"{[opt.get('full', 'unknown') for opt in options if opt.get('full', '') in self._unsupported_actions]}"
             )
 
         # If no valid options remain, show a default allow/deny
@@ -276,14 +276,14 @@ class PermissionHandler:
                 f"No supported permission options available, adding default yes/no buttons"
             )
             filtered_options = [
-                {"key": "yes", "label": "Allow", "action": "yes"},
-                {"key": "no", "label": "Deny", "action": "no"},
+                {"short": "yes", "description": "Allow", "full": "yes"},
+                {"short": "no", "description": "Deny", "full": "no"},
             ]
 
         for option in filtered_options:
-            key = option.get("key", "")
-            label = option.get("label", key)
-            action = option.get("action", "unknown")
+            key = option.get("short", "")
+            label = option.get("description", key)
+            action = option.get("full", "unknown")
 
             # Add emoji based on action
             emoji = {
