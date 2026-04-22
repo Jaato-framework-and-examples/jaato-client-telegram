@@ -15,8 +15,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from jaato_client_telegram.config import Config
 from jaato_client_telegram.file_handler import FileHandler
-from jaato_client_telegram.workspace_tracker import WorkspaceFileTracker
-from jaato_client_telegram.agent_response_tracker import AgentResponseTracker
 from jaato_client_telegram.handlers import (
     admin_router,
     callbacks_router,
@@ -39,15 +37,13 @@ from jaato_client_telegram.transport import WSTransport
 logger = logging.getLogger(__name__)
 
 
-def _create_renderer(config: Config, permission_handler: PermissionHandler | None = None, file_handler: FileHandler | None = None, agent_response_tracker: AgentResponseTracker | None = None, session_pool: "SessionPool | None" = None) -> ResponseRenderer:
+def _create_renderer(config: Config, permission_handler: PermissionHandler | None = None, file_handler: FileHandler | None = None) -> ResponseRenderer:
     """Create a ResponseRenderer with config settings."""
     return ResponseRenderer(
         max_message_length=config.rendering.max_message_length,
         edit_throttle_ms=config.rendering.edit_throttle_ms,
         permission_handler=permission_handler,
         file_handler=file_handler,
-        agent_response_tracker=agent_response_tracker,
-        session_pool=session_pool,
     )
 
 
@@ -102,14 +98,12 @@ def create_bot_and_dispatcher(
     pool.set_bot(bot, getattr(config, "file_sharing", None))
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
     file_handler = FileHandler(config.file_sharing)
-    workspace_tracker = WorkspaceFileTracker()
-    agent_response_tracker = AgentResponseTracker(workspace_tracker)
 
     # Note: WorkspaceEventSubscriber needs an IPC backend from jaato-server
     # This will be added once we determine the source of the IPC connection
     # For now, event_subscriber is None and won't be started
 
-    renderer = _create_renderer(config, permission_handler, file_handler, agent_response_tracker, pool)
+    renderer = _create_renderer(config, permission_handler, file_handler)
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
 
     # Create rate limiter if enabled
@@ -158,8 +152,6 @@ def create_bot_and_dispatcher(
     dp["abuse_protector"] = abuse_protector
     dp["telemetry"] = telemetry
     dp["admin_user_ids"] = config.telegram.access.admin_user_ids
-    dp["workspace_tracker"] = workspace_tracker
-    dp["agent_response_tracker"] = agent_response_tracker
 
     logger.info(
         "Bot and dispatcher configured: "
@@ -167,7 +159,6 @@ def create_bot_and_dispatcher(
         f"max_sessions={config.session.max_concurrent}, "
         f"whitelist_enabled={whitelist.config.enabled}, "
         f"rate_limiting_enabled={config.rate_limiting.enabled}, "
-        f"workspace_tracking_enabled={workspace_tracker is not None}"
     )
 
     return bot, dp

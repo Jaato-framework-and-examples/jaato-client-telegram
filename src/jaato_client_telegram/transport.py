@@ -271,6 +271,15 @@ class WSTransport:
                         continue
 
                     session_id = getattr(event, "session_id", None)
+                    if not session_id:
+                        queues = self._session_queues
+                        if len(queues) == 1:
+                            session_id = next(iter(queues))
+                        elif queues:
+                            logger.warning(
+                                "Cannot route event %s: %d sessions active, no session_id on event",
+                                type(event).__name__, len(queues),
+                            )
                     if session_id and session_id in self._session_queues:
                         await self._session_queues[session_id].put(event)
                     else:

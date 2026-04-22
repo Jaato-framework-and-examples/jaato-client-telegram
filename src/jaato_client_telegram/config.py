@@ -64,7 +64,6 @@ class JaatoWSConfig(BaseModel):
     url: str = "ws://localhost:8080"
     tls: TLSConfig = Field(default_factory=TLSConfig)
     secret_token: str | None = None
-    workspace_template: str = "default"
     keycloak_base_url: str = ""
     keycloak_realm: str = "jaato"
     keycloak_client_id: str = ""

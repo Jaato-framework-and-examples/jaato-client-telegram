@@ -73,9 +73,6 @@ jaato_ws:
   # secret_token: "${JAATO_WS_TOKEN}"
 
   # Workspace template for server-side provisioning
-  # The server creates workspaces from this template directory
-  workspace_template: "default"
-
 # Session Pool Configuration
 session:
   # Maximum concurrent SDK clients

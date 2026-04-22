@@ -18,7 +18,6 @@ from aiogram.types import Message
 if TYPE_CHECKING:
     from jaato_client_telegram.file_handler import FileHandler
     from jaato_client_telegram.permissions import PermissionHandler
-    from jaato_client_telegram.agent_response_tracker import AgentResponseTracker
     from jaato_client_telegram.session_pool import SessionPool
 
 
@@ -155,8 +154,7 @@ class ResponseRenderer:
         edit_throttle_ms: int = 500,
         permission_handler: "PermissionHandler | None" = None,
         file_handler: "FileHandler | None" = None,
-        agent_response_tracker: "AgentResponseTracker | None" = None,
-        session_pool: "SessionPool | None" = None,
+
     ):
         """
         Initialize the renderer.
@@ -166,15 +164,11 @@ class ResponseRenderer:
             edit_throttle_ms: Minimum time between edit_message_text calls (currently unused - reserved for future progressive streaming)
             permission_handler: Optional handler for permission requests
             file_handler: Optional handler for file sending (ATTACH/SHARE)
-            agent_response_tracker: Optional tracker for detecting file mentions in agent responses
-            session_pool: Optional session pool for looking up workspace paths
         """
         self._max_message_length = max_message_length
         self._edit_throttle_seconds = edit_throttle_ms / 1000.0
         self._permission_handler = permission_handler
         self._file_handler = file_handler
-        self._agent_response_tracker = agent_response_tracker
-        self._session_pool = session_pool
 
     def _flush_text_buffer(self, ctx: StreamingContext) -> None:
         """
@@ -278,12 +272,6 @@ class ResponseRenderer:
                     # Escape HTML to prevent parsing errors with content like <dependency>
                     ctx.text_buffer.append(escape_html_content(content))
 
-                    # Track file mentions in model output
-                    if self._agent_response_tracker:
-                        await self._agent_response_tracker.process_agent_response(
-                            initial_message.chat.id,
-                            content
-                        )
                 elif source == "tool":
                     # Tool output - format with tool name and parameters
                     tool_name = getattr(event, "tool_name", None)
@@ -326,8 +314,6 @@ class ResponseRenderer:
                 # Turn completed - flush all buffers first
                 self._flush_all_buffers(ctx)
 
-                # Send files mentioned by the agent during this turn
-                await self._send_mentioned_files(initial_message, ctx)
 
                 # Check for formatted text - this replaces the streaming text
                 formatted_text = getattr(event, "formatted_text", None)
@@ -833,78 +819,6 @@ class ResponseRenderer:
         import re
         if re.search(r'https?://[^\s]{80,}', text):
             return True
-
-        return False
-
-    async def _send_mentioned_files(self, initial_message: Message, ctx: StreamingContext) -> None:
-        """
-        Send files mentioned by the agent during the turn.
-
-        Called on turn.completed to send files that the agent mentioned
-        in its response. Files are sent using the FileHandler which
-        decides whether to ATTACH or SHARE based on size.
-
-        Args:
-            initial_message: The user's message (for context)
-            ctx: Streaming context with accumulated text
-        """
-        import logging
-        log = logging.getLogger(__name__)
-
-        if not self._agent_response_tracker or not self._file_handler:
-            return
-
-        chat_id = initial_message.chat.id
-
-        # Get queued file mentions for this chat
-        mentioned_files = await self._agent_response_tracker.get_queued_files(chat_id)
-
-        if not mentioned_files:
-            log.debug(f"No files mentioned for chat {chat_id}")
-            return
-
-        log.info(f"Sending {len(mentioned_files)} mentioned files for chat {chat_id}")
-
-        # Send each mentioned file
-        from pathlib import Path
-        for file_path_str in mentioned_files:
-            file_path = Path(file_path_str)
-
-            # Resolve relative paths against the workspace directory
-            if not file_path.is_absolute():
-                # Get the workspace path for this chat
-                workspace_path = None
-                if self._session_pool:
-                    session_info = self._session_pool.get_session_info(chat_id)
-                    if session_info:
-                        workspace_path = Path(session_info.workspace_path)
-
-                # Resolve relative path against workspace if available
-                if workspace_path and workspace_path.exists():
-                    resolved_path = workspace_path / file_path
-                    log.debug(f"Resolved relative path {file_path_str} -> {resolved_path}")
-                    file_path = resolved_path
-
-            if not file_path.exists():
-                log.warning(f"Mentioned file does not exist: {file_path}")
-                # Could wait for it to appear, but for now just log and skip
-                continue
-
-            try:
-                # Send the file (ATTACH or SHARE based on size)
-                success = await self._file_handler.send_file(file_path, initial_message)
-
-                if success:
-                    log.info(f"Successfully sent file: {file_path}")
-                else:
-                    log.warning(f"Failed to send file: {file_path}")
-
-            except Exception as e:
-                log.exception(f"Error sending file {file_path}: {e}")
-
-        # Clear the queue after sending
-        await self._agent_response_tracker.clear_queue(chat_id)
-
     def _format_expandable_blockquote(self, content: str) -> str:
         """
         Format content as an expandable blockquote.
