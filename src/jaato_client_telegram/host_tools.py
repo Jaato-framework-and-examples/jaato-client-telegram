@@ -80,12 +80,14 @@ def make_send_to_telegram_executor(
         message = args.get("message", "")
 
         try:
+            logger.info("send_to_telegram called: chat_id=%s file_path=%r message=%r", chat_id, file_path, message)
             if file_path:
                 result = await _send_file(bot, chat_id, file_path, file_config)
                 return {"result": result}
 
             if message:
-                await bot.send_message(chat_id=chat_id, text=message)
+                msg = await bot.send_message(chat_id=chat_id, text=message)
+                logger.info("send_message response: %s", msg)
                 return {"result": "sent"}
 
             return {"error": "Provide file_path or message"}

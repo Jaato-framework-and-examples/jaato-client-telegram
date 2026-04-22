@@ -19,6 +19,8 @@ from jaato_sdk.events import (
     ClientConfigRequest,
     StopRequest,
     SessionInfoEvent,
+    StageFilesEvent,
+    StagedFileSpec,
 )
 
 from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors
@@ -150,6 +152,33 @@ class SessionPool:
     async def stop(self, session_id: str) -> None:
         request = StopRequest()
         await self._transport.send(request)
+
+    async def stage_files(
+        self,
+        chat_id: int,
+        files: list[tuple[str, bytes, str | None]],
+    ) -> StageFilesEvent:
+        """Stage files into the session's workspace.
+
+        Args:
+            chat_id: Telegram chat_id.
+            files: List of (name, raw_bytes, content_type_or_None).
+
+        Returns:
+            StageFilesEvent from the server.
+        """
+        if chat_id not in self._sessions:
+            raise RuntimeError(f"No session for chat_id {chat_id}")
+        specs = [
+            StagedFileSpec(name=name, size=len(data), content_type=ct)
+            for name, data, ct in files
+        ]
+        payloads = [data for _, data, _ in files]
+        return await self._transport.stage_files(
+            workspace_id="",
+            specs=specs,
+            payloads=payloads,
+        )
 
     def get_session_id(self, chat_id: int) -> str | None:
         session = self._sessions.get(chat_id)
