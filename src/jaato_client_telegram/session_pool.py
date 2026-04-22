@@ -1,14 +1,14 @@
 """Session pool for managing per-user jaato sessions via WebSocket transport.
 
-Each Telegram user (chat_id) gets an isolated session on the jaato server.
-A single shared WebSocket connection multiplexes events for all sessions.
+Each Telegram user (chat_id) gets its own isolated WebSocket connection
+and session on the jaato server.  This matches the server's 1-client-1-session
+model and avoids the multi-tenancy routing issues of a single shared WS.
 """
 
 import asyncio
-import json
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -28,7 +28,7 @@ from jaato_client_telegram.transport import WSTransport
 
 if TYPE_CHECKING:
     from aiogram import Bot
-    from jaato_client_telegram.config import FileSharingConfig
+    from jaato_client_telegram.config import FileSharingConfig, JaatoWSConfig
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class SessionMetadata:
     session_id: str
     created_at: datetime
     last_activity: datetime
+    transport: WSTransport
 
 
 def create_telegram_presentation_context() -> dict:
@@ -58,20 +59,37 @@ def create_telegram_presentation_context() -> dict:
 
 
 class SessionPool:
-    """Manages per-user sessions via a single WebSocket connection."""
+    """Manages per-user sessions, each with its own WebSocket connection."""
 
-    def __init__(self, transport: WSTransport, max_concurrent: int = 50) -> None:
-        self._transport = transport
+    def __init__(
+        self,
+        ws_config: "JaatoWSConfig",
+        bot: "Bot | None" = None,
+        file_config: "FileSharingConfig | None" = None,
+        max_concurrent: int = 50,
+    ) -> None:
+        self._ws_config = ws_config
+        self._bot = bot
+        self._file_config = file_config
         self._max_concurrent = max_concurrent
         self._sessions: dict[int, SessionMetadata] = {}
         self._lock = asyncio.Lock()
         self._pending_session_future: asyncio.Future | None = None
-        self._bot = None
-        self._file_config = None
 
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
         self._file_config = file_config
+
+    def _make_transport(self) -> WSTransport:
+        return WSTransport(
+            url=self._ws_config.url,
+            tls_config=self._ws_config.tls,
+            keycloak_base_url=self._ws_config.keycloak_base_url,
+            keycloak_realm=self._ws_config.keycloak_realm,
+            keycloak_client_id=self._ws_config.keycloak_client_id,
+            keycloak_client_secret=self._ws_config.keycloak_client_secret,
+            secret_token=self._ws_config.secret_token,
+        )
 
     async def get_or_create_session(self, chat_id: int) -> str:
         async with self._lock:
@@ -79,32 +97,33 @@ class SessionPool:
                 self._sessions[chat_id].last_activity = datetime.now()
                 return self._sessions[chat_id].session_id
 
-            if not self._transport.connected:
-                await self._transport.connect()
-
             if len(self._sessions) >= self._max_concurrent:
                 await self._evict_oldest()
 
             try:
+                transport = self._make_transport()
+                await transport.connect()
+
                 presentation_ctx = create_telegram_presentation_context()
                 config_event = ClientConfigRequest(presentation=presentation_ctx)
-                await self._transport.send(config_event)
+                await transport.send(config_event)
                 logger.info("Sent presentation context for chat_id %d", chat_id)
 
-                session_id = await self._transport.create_session()
+                session_id = await transport.create_session()
+                transport.register_session(session_id)
 
-                self._transport.register_session(session_id)
+                if self._bot and self._file_config:
+                    executors = create_tool_executors(self._bot, chat_id, self._file_config)
+                    transport.set_session_tool_executors(session_id, executors)
+                    await transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
+                    logger.info("Registered host tools for session %s", session_id)
+
                 self._sessions[chat_id] = SessionMetadata(
                     session_id=session_id,
                     created_at=datetime.now(),
                     last_activity=datetime.now(),
+                    transport=transport,
                 )
-
-                if self._bot and self._file_config:
-                    executors = create_tool_executors(self._bot, chat_id, self._file_config)
-                    self._transport.set_session_tool_executors(session_id, executors, chat_id=chat_id)
-                    await self._transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
-                    logger.info("Registered host tools for session %s", session_id)
 
                 logger.info("Created session %s for chat_id %d", session_id, chat_id)
                 return session_id
@@ -113,68 +132,56 @@ class SessionPool:
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
 
-    async def _wait_for_session_id(self, timeout: float = 10.0) -> str:
-        future = asyncio.get_event_loop().create_future()
-        self._pending_session_future = future
-        try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        finally:
-            self._pending_session_future = None
-
     def on_session_info_event(self, event: SessionInfoEvent) -> None:
         if self._pending_session_future and not self._pending_session_future.done():
             self._pending_session_future.set_result(event.session_id)
 
     async def send_message(self, session_id: str, text: str) -> None:
+        transport = self._find_transport(session_id)
         request = SendMessageRequest(text=text)
-        await self._transport.send(request)
+        await transport.send(request)
 
     async def respond_to_permission(
         self, session_id: str, request_id: str,
         response: str, edited_arguments: dict | None = None,
     ) -> None:
+        transport = self._find_transport(session_id)
         request = PermissionResponseRequest(
             request_id=request_id, response=response,
         )
-        await self._transport.send(request)
+        await transport.send(request)
 
     async def respond_to_clarification(
         self, session_id: str, request_id: str, responses: dict,
     ) -> None:
+        transport = self._find_transport(session_id)
         request = ClarificationResponseRequest(
             request_id=request_id, responses=responses,
         )
-        await self._transport.send(request)
+        await transport.send(request)
 
     async def events(self, session_id: str) -> AsyncIterator:
-        return self._transport.events(session_id)
+        return self._find_transport(session_id).events(session_id)
 
     async def stop(self, session_id: str) -> None:
+        transport = self._find_transport(session_id)
         request = StopRequest()
-        await self._transport.send(request)
+        await transport.send(request)
 
     async def stage_files(
         self,
         chat_id: int,
         files: list[tuple[str, bytes, str | None]],
     ) -> StageFilesEvent:
-        """Stage files into the session's workspace.
-
-        Args:
-            chat_id: Telegram chat_id.
-            files: List of (name, raw_bytes, content_type_or_None).
-
-        Returns:
-            StageFilesEvent from the server.
-        """
         if chat_id not in self._sessions:
             raise RuntimeError(f"No session for chat_id {chat_id}")
+        transport = self._sessions[chat_id].transport
         specs = [
             StagedFileSpec(name=name, size=len(data), content_type=ct)
             for name, data, ct in files
         ]
         payloads = [data for _, data, _ in files]
-        return await self._transport.stage_files(
+        return await transport.stage_files(
             workspace_id="",
             specs=specs,
             payloads=payloads,
@@ -184,11 +191,20 @@ class SessionPool:
         session = self._sessions.get(chat_id)
         return session.session_id if session else None
 
+    def _find_transport(self, session_id: str) -> WSTransport:
+        for meta in self._sessions.values():
+            if meta.session_id == session_id:
+                return meta.transport
+        raise RuntimeError(f"No transport for session_id {session_id}")
+
     async def remove_client(self, chat_id: int) -> None:
         async with self._lock:
             session = self._sessions.pop(chat_id, None)
             if session:
-                self._transport.unregister_session(session.session_id)
+                try:
+                    await session.transport.disconnect()
+                except Exception:
+                    logger.exception("Error disconnecting transport for chat_id %d", chat_id)
 
     async def _evict_oldest(self) -> None:
         if not self._sessions:
@@ -214,7 +230,6 @@ class SessionPool:
             chat_ids = list(self._sessions.keys())
         for chat_id in chat_ids:
             await self.remove_client(chat_id)
-        await self._transport.disconnect()
 
     @property
     def active_count(self) -> int:

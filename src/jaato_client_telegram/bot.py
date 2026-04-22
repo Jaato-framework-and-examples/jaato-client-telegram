@@ -30,8 +30,7 @@ from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.whitelist import WhitelistManager
-from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES
-from jaato_client_telegram.transport import WSTransport
+from jaato_client_telegram.transport import WSTransport  # noqa: F401 (used by tests)
 
 
 logger = logging.getLogger(__name__)
@@ -47,13 +46,12 @@ def _create_renderer(config: Config, permission_handler: PermissionHandler | Non
     )
 
 
-def _create_session_pool(config: Config, transport: WSTransport) -> SessionPool:
+def _create_session_pool(config: Config) -> SessionPool:
     """Create a SessionPool with config settings."""
-    pool = SessionPool(
-        transport=transport,
+    return SessionPool(
+        ws_config=config.jaato_ws,
         max_concurrent=config.session.max_concurrent,
     )
-    return pool
 
 
 def create_bot_and_dispatcher(
@@ -85,16 +83,7 @@ def create_bot_and_dispatcher(
     dp = Dispatcher(storage=MemoryStorage())
 
     # Create shared dependencies
-    transport = WSTransport(
-        url=config.jaato_ws.url,
-        tls_config=config.jaato_ws.tls,
-        keycloak_base_url=config.jaato_ws.keycloak_base_url,
-        keycloak_realm=config.jaato_ws.keycloak_realm,
-        keycloak_client_id=config.jaato_ws.keycloak_client_id,
-        keycloak_client_secret=config.jaato_ws.keycloak_client_secret,
-        secret_token=config.jaato_ws.secret_token,
-    )
-    pool = _create_session_pool(config, transport)
+    pool = _create_session_pool(config)
     pool.set_bot(bot, getattr(config, "file_sharing", None))
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
     file_handler = FileHandler(config.file_sharing)

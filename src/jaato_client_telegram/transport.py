@@ -88,7 +88,6 @@ class WSTransport:
         self._connected = False
         self._user_id: str | None = None
         self._tool_executors: dict[str, Callable] = {}
-        self._last_chat_id: int = 0
         self._tools_registered: bool = False
         self._session_future: asyncio.Future | None = None
         self._stage_files_future: asyncio.Future | None = None
@@ -194,10 +193,8 @@ class WSTransport:
     def unregister_session(self, session_id: str) -> None:
         self._session_queues.pop(session_id, None)
 
-    def set_session_tool_executors(self, session_id: str, executors: dict[str, Callable], chat_id: int = 0) -> None:
+    def set_session_tool_executors(self, session_id: str, executors: dict[str, Callable]) -> None:
         self._tool_executors.update(executors)
-        if chat_id:
-            self._last_chat_id = chat_id
 
     async def register_host_tools(self, tool_schemas: list[dict], categories: dict[str, str] | None = None) -> None:
         if self._tools_registered:
@@ -218,8 +215,6 @@ class WSTransport:
             result = json.dumps({"error": f"Unknown client tool: {tool_name}"})
         else:
             try:
-                if self._last_chat_id:
-                    tool_args = {**tool_args, "_chat_id": self._last_chat_id}
                 if asyncio.iscoroutinefunction(executor):
                     out = await executor(tool_args)
                 else:
