@@ -104,7 +104,7 @@ class PermissionHandler:
     # and require more complex UI (text input, modal dialogs, etc.)
     _DEFAULT_UNSUPPORTED_ACTIONS = {
         "comment",      # Requires free-form text input
-        "allow_comment", # Requires free-form text input
+        "allow-comment", # Requires free-form text input
         "edit",         # Requires editing existing text
         "modify",       # Requires modification interface
         "custom",       # Requires custom input
