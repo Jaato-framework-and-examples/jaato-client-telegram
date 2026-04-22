@@ -5,6 +5,7 @@ A single shared WebSocket connection multiplexes events for all sessions.
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -20,10 +21,12 @@ from jaato_sdk.events import (
     SessionInfoEvent,
 )
 
+from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors
 from jaato_client_telegram.transport import WSTransport
 
 if TYPE_CHECKING:
-    pass  # JaatoWSConfig available via config module
+    from aiogram import Bot
+    from jaato_client_telegram.config import FileSharingConfig
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +67,7 @@ class SessionPool:
         self._bot = None
         self._file_config = None
 
-    def set_bot(self, bot, file_config) -> None:
+    def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
         self._file_config = file_config
 
@@ -98,7 +101,11 @@ class SessionPool:
                     last_activity=datetime.now(),
                 )
 
-                await self._register_session_tools(chat_id, session_id)
+                if self._bot and self._file_config:
+                    executors = create_tool_executors(self._bot, chat_id, self._file_config)
+                    self._transport.set_session_tool_executors(session_id, executors)
+                    await self._transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
+                    logger.info("Registered host tools for session %s", session_id)
 
                 logger.info("Created session %s for chat_id %d", session_id, chat_id)
                 return session_id
@@ -106,21 +113,6 @@ class SessionPool:
                 raise RuntimeError(
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
-
-    async def _register_session_tools(self, chat_id: int, session_id: str) -> None:
-        from jaato_client_telegram.host_tools import (
-            TOOL_SCHEMAS,
-            TOOL_CATEGORIES,
-            register_host_tools,
-        )
-
-        if not self._bot or not self._file_config:
-            logger.warning("Bot or file_config not set, skipping host tool registration")
-            return
-
-        executors = register_host_tools(self._bot, chat_id, self._file_config)
-        self._transport.set_session_tool_executors(session_id, executors)
-        await self._transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
 
     async def _wait_for_session_id(self, timeout: float = 10.0) -> str:
         future = asyncio.get_event_loop().create_future()

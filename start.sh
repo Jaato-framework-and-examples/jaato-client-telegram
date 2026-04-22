@@ -47,16 +47,17 @@ elif echo "$TOKEN_LINE" | grep -q 'bot_token:[[:space:]]*"[0-9]'; then
     echo ""
 fi
 
-# Check if jaato server is running
-SOCKET_PATH=$(grep 'socket_path:' jaato-client-telegram.yaml | awk '{print $2}' | tr -d '"')
-if [ ! -S "$SOCKET_PATH" ]; then
-    echo "❌ ERROR: jaato server socket not found at $SOCKET_PATH"
-    echo ""
-    echo "Please ensure jaato server is running:"
-    echo "  cd /path/to/jaato"
-    echo "  python -m jaato"
-    echo ""
-    read -p "Press Enter to start anyway (will fail if server not running)..."
+# Check if jaato server is reachable (WS port check)
+WS_URL=$(grep -A1 '^jaato_ws:' jaato-client-telegram.yaml | grep 'url:' | head -1 | awk '{print $2}' | tr -d '"')
+WS_HOST=$(echo "$WS_URL" | sed 's|wss\?://\([^:/]*\).*||')
+WS_PORT=$(echo "$WS_URL" | sed 's|wss\?://[^:]*:\([0-9]*\).*||')
+if command -v ss &>/dev/null && [ -n "$WS_PORT" ]; then
+    if ! ss -tlnp | grep -q ":${WS_PORT} "; then
+        echo "⚠️  WARNING: jaato server not listening on ${WS_HOST}:${WS_PORT}"
+        echo "  The bot will attempt to connect anyway."
+    else
+        echo "✅ jaato server detected on ${WS_HOST}:${WS_PORT}"
+    fi
 fi
 
 # Install dependencies if needed

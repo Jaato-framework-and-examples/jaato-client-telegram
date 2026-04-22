@@ -65,6 +65,10 @@ class JaatoWSConfig(BaseModel):
     tls: TLSConfig = Field(default_factory=TLSConfig)
     secret_token: str | None = None
     workspace_template: str = "default"
+    keycloak_base_url: str = ""
+    keycloak_realm: str = "jaato"
+    keycloak_client_id: str = ""
+    keycloak_client_secret: str = ""
 
 
 class SessionConfig(BaseModel):

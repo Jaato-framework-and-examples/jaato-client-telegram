@@ -54,8 +54,16 @@ TOOL_SCHEMAS = [
 ]
 
 TOOL_CATEGORIES = {
-    "communication": "Telegram client-side communication tools",
+    "telegram": "Telegram client-side communication tools",
 }
+
+
+def create_tool_executors(bot, chat_id: int, file_config) -> dict:
+    exec = make_send_to_telegram_executor(bot, chat_id, file_config)
+    return {
+        "send_to_telegram": exec,
+        "telegram_notify": exec,
+    }
 
 
 def make_send_to_telegram_executor(

@@ -51,13 +51,13 @@ def _create_renderer(config: Config, permission_handler: PermissionHandler | Non
     )
 
 
-def _create_session_pool(config: Config, transport: WSTransport, bot: Bot) -> SessionPool:
+def _create_session_pool(config: Config, transport: WSTransport) -> SessionPool:
     """Create a SessionPool with config settings."""
-    return SessionPool(
+    pool = SessionPool(
         transport=transport,
         max_concurrent=config.session.max_concurrent,
-        bot=bot,
     )
+    return pool
 
 
 def create_bot_and_dispatcher(
@@ -97,7 +97,8 @@ def create_bot_and_dispatcher(
         keycloak_client_id=config.jaato_ws.keycloak_client_id,
         keycloak_client_secret=config.jaato_ws.keycloak_client_secret,
     )
-    pool = _create_session_pool(config, transport, bot)
+    pool = _create_session_pool(config, transport)
+    pool.set_bot(bot, getattr(config, "file_sharing", None))
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
     file_handler = FileHandler(config.file_sharing)
     workspace_tracker = WorkspaceFileTracker()
