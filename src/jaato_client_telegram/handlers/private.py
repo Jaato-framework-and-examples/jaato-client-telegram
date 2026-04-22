@@ -123,7 +123,7 @@ async def handle_private_message(
             # Stream response events and render progressively
             await renderer.stream_response(
                 initial_message=message,
-                event_stream=pool.events(session_id),
+                event_stream=await pool.events(session_id),
             )
 
         except Exception as e:
