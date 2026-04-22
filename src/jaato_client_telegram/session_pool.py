@@ -102,7 +102,7 @@ class SessionPool:
 
                 if self._bot and self._file_config:
                     executors = create_tool_executors(self._bot, chat_id, self._file_config)
-                    self._transport.set_session_tool_executors(session_id, executors)
+                    self._transport.set_session_tool_executors(session_id, executors, chat_id=chat_id)
                     await self._transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
                     logger.info("Registered host tools for session %s", session_id)
 
