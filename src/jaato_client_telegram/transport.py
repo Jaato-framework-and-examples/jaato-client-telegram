@@ -65,9 +65,11 @@ class WSTransport:
         keycloak_realm: str = "jaato",
         keycloak_client_id: str = "",
         keycloak_client_secret: str = "",
+        secret_token: str | None = None,
     ) -> None:
         self._url = url
         self._tls_config = tls_config
+        self._secret_token = secret_token
         self._kc_base_url = keycloak_base_url.rstrip("/")
         self._kc_realm = keycloak_realm
         self._kc_client_id = keycloak_client_id
@@ -142,7 +144,10 @@ class WSTransport:
 
     async def connect(self) -> None:
         ssl_ctx = self._build_ssl_context()
-        self._ws = await websockets.connect(self._url, ssl=ssl_ctx)
+        headers = {}
+        if self._secret_token:
+            headers["Authorization"] = f"Bearer {self._secret_token}"
+        self._ws = await websockets.connect(self._url, ssl=ssl_ctx, additional_headers=headers or None)
         self._connected = True
 
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)

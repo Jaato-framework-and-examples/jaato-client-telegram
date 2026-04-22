@@ -96,6 +96,7 @@ def create_bot_and_dispatcher(
         keycloak_realm=config.jaato_ws.keycloak_realm,
         keycloak_client_id=config.jaato_ws.keycloak_client_id,
         keycloak_client_secret=config.jaato_ws.keycloak_client_secret,
+        secret_token=config.jaato_ws.secret_token,
     )
     pool = _create_session_pool(config, transport)
     pool.set_bot(bot, getattr(config, "file_sharing", None))
