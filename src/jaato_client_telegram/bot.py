@@ -32,6 +32,7 @@ from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.whitelist import WhitelistManager
+from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES
 from jaato_client_telegram.transport import WSTransport
 
 
@@ -50,11 +51,12 @@ def _create_renderer(config: Config, permission_handler: PermissionHandler | Non
     )
 
 
-def _create_session_pool(config: Config, transport: WSTransport) -> SessionPool:
+def _create_session_pool(config: Config, transport: WSTransport, bot: Bot) -> SessionPool:
     """Create a SessionPool with config settings."""
     return SessionPool(
         transport=transport,
         max_concurrent=config.session.max_concurrent,
+        bot=bot,
     )
 
 
@@ -95,7 +97,7 @@ def create_bot_and_dispatcher(
         keycloak_client_id=config.jaato_ws.keycloak_client_id,
         keycloak_client_secret=config.jaato_ws.keycloak_client_secret,
     )
-    pool = _create_session_pool(config, transport)
+    pool = _create_session_pool(config, transport, bot)
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
     file_handler = FileHandler(config.file_sharing)
     workspace_tracker = WorkspaceFileTracker()

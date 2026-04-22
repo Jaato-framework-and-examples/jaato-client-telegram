@@ -1,5 +1,4 @@
-"""
-Session pool for managing per-user jaato sessions via WebSocket transport.
+"""Session pool for managing per-user jaato sessions via WebSocket transport.
 
 Each Telegram user (chat_id) gets an isolated session on the jaato server.
 A single shared WebSocket connection multiplexes events for all sessions.
@@ -30,17 +29,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-
 @dataclass
 class SessionMetadata:
-    """Metadata about an active session."""
     session_id: str
     created_at: datetime
     last_activity: datetime
 
 
 def create_telegram_presentation_context() -> dict:
-    """Create presentation context for Telegram chat clients."""
     return {
         "content_width": 45,
         "content_height": None,
@@ -57,11 +53,7 @@ def create_telegram_presentation_context() -> dict:
 
 
 class SessionPool:
-    """Manages per-user sessions via a single WebSocket connection.
-
-    Each Telegram user (chat_id) maps to a session_id on the server.
-    Events are dispatched to per-session queues via WSTransport.
-    """
+    """Manages per-user sessions via a single WebSocket connection."""
 
     def __init__(self, transport: WSTransport, max_concurrent: int = 50) -> None:
         self._transport = transport
@@ -69,9 +61,14 @@ class SessionPool:
         self._sessions: dict[int, SessionMetadata] = {}
         self._lock = asyncio.Lock()
         self._pending_session_future: asyncio.Future | None = None
+        self._bot = None
+        self._file_config = None
+
+    def set_bot(self, bot, file_config) -> None:
+        self._bot = bot
+        self._file_config = file_config
 
     async def get_or_create_session(self, chat_id: int) -> str:
-        """Get existing session_id or create a new session on the server."""
         async with self._lock:
             if chat_id in self._sessions:
                 self._sessions[chat_id].last_activity = datetime.now()
@@ -100,6 +97,9 @@ class SessionPool:
                     created_at=datetime.now(),
                     last_activity=datetime.now(),
                 )
+
+                await self._register_session_tools(chat_id, session_id)
+
                 logger.info("Created session %s for chat_id %d", session_id, chat_id)
                 return session_id
             except Exception as e:
@@ -107,8 +107,22 @@ class SessionPool:
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
 
+    async def _register_session_tools(self, chat_id: int, session_id: str) -> None:
+        from jaato_client_telegram.host_tools import (
+            TOOL_SCHEMAS,
+            TOOL_CATEGORIES,
+            register_host_tools,
+        )
+
+        if not self._bot or not self._file_config:
+            logger.warning("Bot or file_config not set, skipping host tool registration")
+            return
+
+        executors = register_host_tools(self._bot, chat_id, self._file_config)
+        self._transport.set_session_tool_executors(session_id, executors)
+        await self._transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
+
     async def _wait_for_session_id(self, timeout: float = 10.0) -> str:
-        """Wait for a SessionInfoEvent from the server."""
         future = asyncio.get_event_loop().create_future()
         self._pending_session_future = future
         try:
@@ -117,12 +131,10 @@ class SessionPool:
             self._pending_session_future = None
 
     def on_session_info_event(self, event: SessionInfoEvent) -> None:
-        """Called by transport when a SessionInfoEvent arrives."""
         if self._pending_session_future and not self._pending_session_future.done():
             self._pending_session_future.set_result(event.session_id)
 
     async def send_message(self, session_id: str, text: str) -> None:
-        """Send a user message to the jaato server."""
         request = SendMessageRequest(text=text)
         await self._transport.send(request)
 
@@ -130,7 +142,6 @@ class SessionPool:
         self, session_id: str, request_id: str,
         response: str, edited_arguments: dict | None = None,
     ) -> None:
-        """Send a permission response to the jaato server."""
         request = PermissionResponseRequest(
             request_id=request_id, response=response,
         )
@@ -139,35 +150,29 @@ class SessionPool:
     async def respond_to_clarification(
         self, session_id: str, request_id: str, responses: dict,
     ) -> None:
-        """Send a clarification response to the jaato server."""
         request = ClarificationResponseRequest(
             request_id=request_id, responses=responses,
         )
         await self._transport.send(request)
 
     async def events(self, session_id: str) -> AsyncIterator:
-        """Yield events for a specific session."""
         return self._transport.events(session_id)
 
     async def stop(self, session_id: str) -> None:
-        """Stop the current agent execution."""
         request = StopRequest()
         await self._transport.send(request)
 
     def get_session_id(self, chat_id: int) -> str | None:
-        """Get the session_id for a chat_id without updating activity."""
         session = self._sessions.get(chat_id)
         return session.session_id if session else None
 
     async def remove_client(self, chat_id: int) -> None:
-        """Remove a session and clean up its queue."""
         async with self._lock:
             session = self._sessions.pop(chat_id, None)
             if session:
                 self._transport.unregister_session(session.session_id)
 
     async def _evict_oldest(self) -> None:
-        """Evict the least recently used session."""
         if not self._sessions:
             return
         oldest = min(
@@ -176,7 +181,6 @@ class SessionPool:
         await self.remove_client(oldest)
 
     async def cleanup_idle(self, max_idle_minutes: int = 60) -> int:
-        """Disconnect sessions that have been idle too long."""
         now = datetime.now()
         to_remove = []
         async with self._lock:
@@ -188,7 +192,6 @@ class SessionPool:
         return len(to_remove)
 
     async def shutdown(self) -> None:
-        """Disconnect all sessions and close the transport."""
         async with self._lock:
             chat_ids = list(self._sessions.keys())
         for chat_id in chat_ids:

@@ -15,6 +15,14 @@ The server validates the JWT against Keycloak JWKS and replies with::
 Auth provides inter-user session isolation (user A cannot attach/delete
 user B's sessions) but does not gate individual commands.
 For local/VPN deployments behind a firewall, auth can be omitted.
+
+Host-Provided Tools
+-------------------
+After connecting and creating a session, the client registers tools
+via ``tools.register_client``.  When the model calls one, the server
+sends ``tool.execute_request`` back over the WS connection.  The
+transport dispatches this to the executor registered for that
+session (see ``set_session_tool_executor`` / ``set_session_tool_executors``).
 """
 
 import asyncio
@@ -22,17 +30,22 @@ import json
 import logging
 import ssl
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import websockets
 import websockets.exceptions
-from jaato_sdk.events import serialize_event, deserialize_event
+from jaato_sdk.events import (
+    serialize_event,
+    deserialize_event,
+    ToolExecuteRequestEvent,
+    ToolExecuteResultEvent,
+    ToolsRegisterClientRequest,
+)
 
 from jaato_client_telegram.config import TLSConfig
 
 if TYPE_CHECKING:
     from jaato_client_telegram.config import JaatoWSConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +78,8 @@ class WSTransport:
         self._session_queues: dict[str, asyncio.Queue] = {}
         self._connected = False
         self._user_id: str | None = None
+        self._tool_executors: dict[str, dict[str, Callable]] = {}
+        self._tools_registered: bool = False
 
     @property
     def connected(self) -> bool:
@@ -88,7 +103,6 @@ class WSTransport:
         return ctx
 
     async def _fetch_token(self) -> str:
-        """Obtain an access token from Keycloak via client_credentials grant."""
         import urllib.request
         import urllib.parse
 
@@ -110,7 +124,6 @@ class WSTransport:
         return payload["access_token"]
 
     async def _send_auth_token(self) -> str:
-        """Send auth.token frame and wait for server reply. Returns user_id."""
         token = await self._fetch_token()
         auth_frame = json.dumps({"type": "auth.token", "token": token})
         await self._ws.send(auth_frame)
@@ -128,18 +141,10 @@ class WSTransport:
         return user_id
 
     async def connect(self) -> None:
-        """Connect to the server, optionally authenticate, start receiver loop.
-
-        Message interchange:
-          1. Server sends: ConnectedEvent (protocol_version, server_info)
-          2. Client sends: {"type": "auth.token", "token": "<JWT>"}  [if auth enabled]
-          3. Server replies: {"type": "auth.token", "user_id": "<username>"}
-        """
         ssl_ctx = self._build_ssl_context()
         self._ws = await websockets.connect(self._url, ssl=ssl_ctx)
         self._connected = True
 
-        # Drain the server's initial ConnectedEvent
         raw = await asyncio.wait_for(self._ws.recv(), timeout=10.0)
         logger.debug("Received: %s", raw[:100])
 
@@ -152,7 +157,6 @@ class WSTransport:
         self._receiver_task = asyncio.create_task(self._receiver_loop())
 
     async def disconnect(self) -> None:
-        """Stop the receiver loop and close the connection."""
         self._connected = False
         if self._receiver_task:
             self._receiver_task.cancel()
@@ -165,15 +169,52 @@ class WSTransport:
             await self._ws.close()
             self._ws = None
         self._user_id = None
+        self._tools_registered = False
 
     def register_session(self, session_id: str) -> asyncio.Queue:
-        """Register a session queue for receiving events."""
         if session_id not in self._session_queues:
             self._session_queues[session_id] = asyncio.Queue()
         return self._session_queues[session_id]
 
     def unregister_session(self, session_id: str) -> None:
         self._session_queues.pop(session_id, None)
+        self._tool_executors.pop(session_id, None)
+
+    def set_session_tool_executors(self, session_id: str, executors: dict[str, Callable]) -> None:
+        self._tool_executors[session_id] = executors
+
+    async def register_host_tools(self, tool_schemas: list[dict], categories: dict[str, str] | None = None) -> None:
+        if self._tools_registered:
+            return
+        event = ToolsRegisterClientRequest(tools=tool_schemas, categories=categories or {})
+        await self.send(event)
+        self._tools_registered = True
+        logger.info("Registered %d host-provided tools", len(tool_schemas))
+
+    async def _handle_tool_execute_request(self, event: ToolExecuteRequestEvent) -> None:
+        session_id = getattr(event, "agent_id", "") or ""
+        tool_name = event.tool_name
+        tool_args = event.tool_args
+        call_id = event.call_id
+
+        session_execs = self._tool_executors.get(session_id, {})
+        executor = session_execs.get(tool_name)
+
+        if executor is None:
+            result = json.dumps({"error": f"Unknown client tool: {tool_name}"})
+        else:
+            try:
+                if asyncio.iscoroutinefunction(executor):
+                    out = await executor(tool_args)
+                else:
+                    out = executor(tool_args)
+                result = json.dumps(out if isinstance(out, dict) else {"result": str(out)})
+            except Exception as e:
+                logger.exception("Client tool %s failed", tool_name)
+                result = json.dumps({"error": str(e)})
+
+        reply = ToolExecuteResultEvent(call_id=call_id, result=result, error="")
+        await self.send(reply)
 
     async def events(self, session_id: str) -> AsyncIterator:
         queue = self.register_session(session_id)
@@ -193,6 +234,11 @@ class WSTransport:
             async for raw in self._ws:
                 try:
                     event = deserialize_event(raw)
+
+                    if isinstance(event, ToolExecuteRequestEvent):
+                        asyncio.create_task(self._handle_tool_execute_request(event))
+                        continue
+
                     session_id = getattr(event, "session_id", None)
                     if session_id and session_id in self._session_queues:
                         await self._session_queues[session_id].put(event)
