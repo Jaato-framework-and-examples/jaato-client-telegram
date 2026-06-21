@@ -6,11 +6,38 @@ name: telegram_chat
 description: Conversational assistant for the Telegram bot client.
 provider: zhipuai
 model: glm-5-turbo
-# clarification → request_clarification (the bot surfaces questions to the user).
 # permission / reliability / lifecycle are always-on; host tools are registered
 # client-side via tools.register_client, independent of this list.
+# NOTE: cli / interactive_shell / file_edit grant shell + file access on the
+# SERVER host — execution is gated by the permission plugin (button approval)
+# and the bot whitelist. Consider apparmor: true for a user-facing deployment.
 plugins:
   - clarification
+  # knowledge / web
+  - web_search
+  - web_fetch
+  - references
+  - result_grep
+  # memory + waypoint
+  - memory
+  - waypoint
+  # code / files
+  - file_edit
+  - filesystem_query
+  - ast_search
+  - lsp
+  - cli
+  - interactive_shell
+  - notebook
+  # orchestration
+  - subagent
+  - flow_tools
+  - template
+  - prompt_library
+  - profile_tools
+  - session_ops
+  # environment
+  - environment
 # Chat-style turns; the bot streams output and surfaces tool/permission/
 # clarification UIs over the WS protocol.
 max_turns: 12
