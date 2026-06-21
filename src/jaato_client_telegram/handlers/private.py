@@ -170,12 +170,11 @@ async def handle_private_message(
             await message.answer(error_text)
 
 
-# Flip to True once the telegram_chat profile is on a vision-capable model
-# (e.g. OpenRouter google/gemini-2.5-flash). zhipuai glm-4.5v is
-# documented-unreliable for vision, so image understanding ships OFF: the
-# download + attachment plumbing below is complete and #353-validated end to
-# end, but we don't deliver images to a model that can't reliably see them.
-_VISION_ENABLED = False
+# Image understanding is ON: the telegram_chat profile carries a real vision
+# tier (OpenRouter google/gemini-2.5-flash) via V2 cross-provider model_tiers,
+# so a user-message image is ferried (#353) to a model that actually sees it.
+# Set back to False if the profile drops its vision tier.
+_VISION_ENABLED = True
 
 # Image MIME types are attached for vision; other documents would be staged
 # into the workspace (a separate, non-vision path — not wired here yet).
