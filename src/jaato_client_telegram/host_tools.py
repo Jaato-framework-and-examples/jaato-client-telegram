@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Image types Telegram renders inline via send_photo.
 _DISPLAYABLE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
+# Telegram's upload cap for send_photo (we fetch remote images ourselves rather
+# than relying on Telegram's flaky direct-URL fetch).
+_MAX_PHOTO_BYTES = 10 * 1024 * 1024
+
 
 TOOL_SCHEMAS = [
     {
@@ -191,11 +195,7 @@ def make_show_image_executor(
             if url:
                 if not (url.startswith("http://") or url.startswith("https://")):
                     return {"error": "url must be an http(s) image URL"}
-                # Telegram fetches the URL and renders it inline. Limits: direct
-                # image URL, ~5MB, Telegram-reachable — else send_photo raises and
-                # we return the error for the agent to recover from.
-                await bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
-                return {"result": "shown"}
+                return await _show_remote_image(bot, chat_id, url, caption)
 
             return {"error": "Provide url or file_path"}
         except Exception as e:
@@ -240,6 +240,79 @@ async def _show_local_image(
         chat_id=chat_id, photo=FSInputFile(path), caption=caption,
     )
     return {"result": f"shown {path.name}"}
+
+
+async def _show_remote_image(
+    bot: "Bot",
+    chat_id: int,
+    url: str,
+    caption: "str | None",
+) -> dict:
+    """Fetch an image URL ourselves and render it inline.
+
+    Telegram's own ``send_photo(photo=url)`` is unreliable for redirected /
+    headered / hotlink-protected image URLs ("failed to get HTTP URL content"),
+    so we download the bytes (following redirects, with a browser User-Agent),
+    confirm it isn't an HTML page, size-guard it, and upload the bytes. Returns
+    a result dict; on any failure the agent can fall back to pasting the link.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    # A realistic browser UA — some hosts block non-browser
+                    # agents / hotlinking on image URLs.
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+                },
+            )
+            resp.raise_for_status()
+    except Exception as e:
+        return {"error": f"Could not download the image: {e}"}
+
+    ctype = (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if ctype.startswith("text/") or ctype.startswith("application/json"):
+        return {
+            "error": (
+                f"That URL returned {ctype} (a web page), not a direct image. "
+                f"Use the image's direct URL."
+            )
+        }
+
+    data = resp.content
+    if not data:
+        return {"error": "The URL returned no data."}
+    if len(data) > _MAX_PHOTO_BYTES:
+        return {
+            "error": (
+                f"Image too large to display ({len(data) / 1024 / 1024:.1f}MB > 10MB). "
+                f"Use send_to_telegram to deliver it as a file instead."
+            )
+        }
+
+    # Filename extension hints Telegram at the format.
+    sub = ctype.split("/", 1)[-1] if ctype.startswith("image/") else "jpg"
+    sub = "jpg" if sub in ("jpeg", "jpg") else sub
+    if sub not in ("jpg", "png", "gif", "webp"):
+        sub = "jpg"
+
+    from aiogram.types import BufferedInputFile
+    try:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=BufferedInputFile(data, filename=f"image.{sub}"),
+            caption=caption,
+        )
+    except Exception as e:
+        return {"error": f"Telegram rejected the image: {e}"}
+    return {"result": "shown"}
 
 
 def register_host_tools(
