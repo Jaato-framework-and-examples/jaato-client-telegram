@@ -17,6 +17,7 @@ from jaato_sdk.events import (
     PermissionResponseRequest,
     ClarificationBatchResponseEvent,
     ClientConfigRequest,
+    CommandRequest,
     StopRequest,
     SessionInfoEvent,
     StageFilesEvent,
@@ -108,6 +109,13 @@ class SessionPool:
                 config_event = ClientConfigRequest(presentation=presentation_ctx)
                 await transport.send(config_event)
                 logger.info("Sent presentation context for chat_id %d", chat_id)
+
+                # Tell the server where this client's workspace is, so session.new
+                # can discover workspace-local profiles/agents (.jaato/...).
+                if self._ws_config.workspace:
+                    await transport.send(CommandRequest(
+                        command="set_workspace", args=[self._ws_config.workspace],
+                    ))
 
                 session_args: list[str] = []
                 if self._ws_config.profile:

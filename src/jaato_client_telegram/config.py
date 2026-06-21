@@ -73,6 +73,11 @@ class JaatoWSConfig(BaseModel):
     # the persona in .jaato/agents/<agent>.md.
     profile: str = ""
     agent: str = ""
+    # Server-side workspace path the bot declares on connect (set_workspace), so
+    # the WS server discovers profiles/agents from <workspace>/.jaato. Required
+    # when `profile`/`agent` name workspace-local definitions. Empty = don't send
+    # (server uses its own default workspace).
+    workspace: str = ""
 
 
 class SessionConfig(BaseModel):

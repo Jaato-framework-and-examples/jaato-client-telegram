@@ -77,6 +77,10 @@ jaato_ws:
   # in .jaato/agents/<agent>.md. Leave empty to use the framework default.
   profile: "telegram_chat"
   agent: "telegram_chat"
+  # Absolute path to this workspace on the SERVER's filesystem, declared via
+  # set_workspace on connect so the WS server discovers the profile/agent above.
+  # Required when profile/agent name workspace-local definitions.
+  # workspace: "/abs/path/to/jaato-client-telegram"
 
 # Session Pool Configuration
 session:
