@@ -182,6 +182,14 @@ def make_show_image_executor(
         url = (args.get("url") or "").strip()
         file_path = (args.get("file_path") or "").strip()
         caption = args.get("caption") or None
+        # Telegram caps photo captions at 1024 chars; a longer caption makes
+        # send_photo fail ("caption is too long") and the image never shows.
+        if caption and len(caption) > 1024:
+            caption = caption[:1021] + "…"
+        logger.info(
+            "show_image call: url=%r file_path=%r caption_len=%d",
+            url[:80] or None, file_path or None, len(caption) if caption else 0,
+        )
 
         try:
             if url and file_path:
@@ -304,6 +312,8 @@ async def _show_remote_image(
         sub = "jpg"
 
     from aiogram.types import BufferedInputFile
+    logger.info("show_image remote: ctype=%s size=%d caption_len=%d",
+                ctype, len(data), len(caption) if caption else 0)
     try:
         await bot.send_photo(
             chat_id=chat_id,
@@ -311,7 +321,9 @@ async def _show_remote_image(
             caption=caption,
         )
     except Exception as e:
+        logger.warning("show_image: send_photo rejected: %s", e)
         return {"error": f"Telegram rejected the image: {e}"}
+    logger.info("show_image: rendered inline (%d bytes)", len(data))
     return {"result": "shown"}
 
 
