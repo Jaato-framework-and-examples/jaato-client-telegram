@@ -6,6 +6,12 @@ name: telegram_chat
 description: Conversational assistant for the Telegram bot client.
 provider: zhipuai
 model: glm-5-turbo
+# NOTE: no vision tier. zhipuai glm-4.5v is documented-unreliable for vision
+# (it hallucinates — confirmed via the multimodal e2e), so a vision model_tier
+# is intentionally omitted. To enable real image understanding, move this
+# profile to a vision-capable provider+model (e.g. OpenRouter
+# google/gemini-2.5-flash, which also drives the agentic tool flow) and flip
+# _VISION_ENABLED in handlers/private.py.
 # permission / reliability / lifecycle are always-on; host tools are registered
 # client-side via tools.register_client, independent of this list.
 # NOTE: cli / interactive_shell / file_edit grant shell + file access on the

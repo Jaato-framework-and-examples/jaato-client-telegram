@@ -173,9 +173,18 @@ class SessionPool:
         if self._pending_session_future and not self._pending_session_future.done():
             self._pending_session_future.set_result(event.session_id)
 
-    async def send_message(self, session_id: str, text: str) -> None:
+    async def send_message(
+        self, session_id: str, text: str, attachments: list | None = None,
+    ) -> None:
+        """Send a user message, optionally with multimodal attachments.
+
+        Each attachment is a dict {mime_type, data, display_name} where `data`
+        is base64-encoded bytes (the canonical WS wire contract for
+        user-message images, e.g. a photo for a vision tier). The framework
+        ferries these to the runner-tier model.
+        """
         transport = self._find_transport(session_id)
-        request = SendMessageRequest(text=text)
+        request = SendMessageRequest(text=text, attachments=attachments or [])
         await transport.send(request)
 
     async def respond_to_permission(

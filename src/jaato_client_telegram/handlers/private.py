@@ -6,6 +6,7 @@ Each user gets their own isolated jaato SDK client session.
 """
 
 import asyncio
+import base64
 import logging
 from typing import TYPE_CHECKING
 
@@ -167,3 +168,96 @@ async def handle_private_message(
                 error_text = error_text[:4000] + "\n\n... (truncated)"
 
             await message.answer(error_text)
+
+
+# Flip to True once the telegram_chat profile is on a vision-capable model
+# (e.g. OpenRouter google/gemini-2.5-flash). zhipuai glm-4.5v is
+# documented-unreliable for vision, so image understanding ships OFF: the
+# download + attachment plumbing below is complete and #353-validated end to
+# end, but we don't deliver images to a model that can't reliably see them.
+_VISION_ENABLED = False
+
+# Image MIME types are attached for vision; other documents would be staged
+# into the workspace (a separate, non-vision path — not wired here yet).
+_IMAGE_MIME_PREFIX = "image/"
+
+
+def _build_image_attachments(data: bytes, mime_type: str, name: str) -> list[dict]:
+    """Build the canonical user-message image attachment list.
+
+    Wire contract (per the framework multimodal ferry): a list of dicts
+    ``{mime_type, data, display_name}`` where ``data`` is base64-encoded bytes.
+    The daemon decodes them and builds image parts for the vision-tier model.
+    """
+    return [{
+        "mime_type": mime_type,
+        "data": base64.b64encode(data).decode("ascii"),
+        "display_name": name,
+    }]
+
+
+@router.message((F.photo | F.document), F.chat.type == "private")
+async def handle_private_media(
+    message: Message,
+    pool: SessionPool,
+    renderer: ResponseRenderer,
+) -> None:
+    """Handle an inbound photo / image document: download it from Telegram and
+    deliver it to the agent as a user-message image attachment, so the profile's
+    vision tier (glm-4.5v) can describe it.
+
+    NOTE: end-to-end delivery depends on the framework multimodal ferry
+    (user-message attachments → runner-tier model), which is a separate
+    framework change. The bot side is complete and uses the canonical
+    ``{mime_type, data: base64, display_name}`` contract.
+    """
+    chat_id = message.chat.id
+    caption = (message.caption or "").strip() or "Describe what you see in this image."
+
+    if not _VISION_ENABLED:
+        await message.answer(
+            "📷 Got your image — but image understanding isn't enabled yet. "
+            "(It needs a vision-capable model; coming soon.) Send me text in the "
+            "meantime."
+        )
+        return
+
+    # Resolve the Telegram file + its MIME type.
+    if message.photo:
+        tg_file = message.photo[-1]          # largest rendition
+        mime_type = "image/jpeg"             # Telegram re-encodes photos as JPEG
+        name = f"photo_{tg_file.file_unique_id}.jpg"
+    else:
+        doc = message.document
+        tg_file = doc
+        mime_type = (doc.mime_type or "application/octet-stream")
+        name = doc.file_name or "file"
+
+    if not mime_type.startswith(_IMAGE_MIME_PREFIX):
+        await message.answer(
+            "📎 I can currently only look at images. Send a photo or an image "
+            "file and ask what you'd like to know about it."
+        )
+        return
+
+    user_lock = _get_user_lock(chat_id)
+    async with user_lock:
+        try:
+            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+            tg_file_info = await message.bot.get_file(tg_file.file_id)
+            buf = await message.bot.download_file(tg_file_info.file_path)
+            data = buf.read()
+            attachments = _build_image_attachments(data, mime_type, name)
+
+            session_id = await pool.get_or_create_session(chat_id)
+            await pool.send_message(session_id, caption, attachments=attachments)
+            await renderer.stream_response(
+                initial_message=message,
+                event_stream=await pool.events(session_id),
+            )
+        except Exception as e:
+            logger.exception("Error handling media from chat_id %s", chat_id)
+            await message.answer(
+                f"❌ Error processing your image.\n\nDetails: {e}\n\n"
+                f"Use /reset to start a fresh session if this persists."
+            )
