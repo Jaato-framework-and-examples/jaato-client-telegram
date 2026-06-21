@@ -133,6 +133,14 @@ class SessionPool:
                         command="set_workspace", args=[self._ws_config.workspace],
                     ))
 
+                # Register host-tool SCHEMAS BEFORE session.new so they ride the
+                # bootstrap envelope into the runner (server PR #349, the #344
+                # sibling). Registering AFTER session.new only updates the daemon
+                # registry — the runner-tier model never sees the tools, so the
+                # agent can't call e.g. send_to_telegram.
+                if self._bot and self._file_config:
+                    await transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
+
                 session_args: list[str] = []
                 if self._ws_config.profile:
                     session_args += ["--profile", self._ws_config.profile]
@@ -141,11 +149,11 @@ class SessionPool:
                 session_id = await transport.create_session(session_args)
                 transport.register_session(session_id)
 
+                # Executor routing is local to the transport and needs session_id.
                 if self._bot and self._file_config:
                     executors = create_tool_executors(self._bot, chat_id, self._file_config)
                     transport.set_session_tool_executors(session_id, executors)
-                    await transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
-                    logger.info("Registered host tools for session %s", session_id)
+                    logger.info("Wired host-tool executors for session %s", session_id)
 
                 self._sessions[chat_id] = SessionMetadata(
                     session_id=session_id,
