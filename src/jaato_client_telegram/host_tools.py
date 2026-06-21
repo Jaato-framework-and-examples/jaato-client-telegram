@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Image types Telegram renders inline via send_photo.
+_DISPLAYABLE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
 
 TOOL_SCHEMAS = [
     {
@@ -51,6 +54,35 @@ TOOL_SCHEMAS = [
         "timeout": 30000,
         "auto_approve": True,
     },
+    {
+        "name": "show_image",
+        "description": (
+            "Display an image to the user INLINE in the chat (rendered, not a "
+            "download). Pass `url` for an image you found on the web, or "
+            "`file_path` for one saved in the workspace. For a downloadable file "
+            "(full quality, any type), use send_to_telegram instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Direct image URL (http/https; jpg/png/gif/webp).",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute path to a workspace image to display.",
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional caption shown under the image.",
+                },
+            },
+        },
+        "category": "telegram",
+        "timeout": 30000,
+        "auto_approve": True,
+    },
 ]
 
 TOOL_CATEGORIES = {
@@ -59,10 +91,12 @@ TOOL_CATEGORIES = {
 
 
 def create_tool_executors(bot, chat_id: int, file_config) -> dict:
-    exec = make_send_to_telegram_executor(bot, chat_id, file_config)
+    send_exec = make_send_to_telegram_executor(bot, chat_id, file_config)
+    show_exec = make_show_image_executor(bot, chat_id, file_config)
     return {
-        "send_to_telegram": exec,
-        "telegram_notify": exec,
+        "send_to_telegram": send_exec,
+        "telegram_notify": send_exec,
+        "show_image": show_exec,
     }
 
 
@@ -128,6 +162,86 @@ async def _send_file(
     return f"sent {path.name} ({size_mb:.1f}MB)"
 
 
+def make_show_image_executor(
+    bot: "Bot",
+    chat_id: int,
+    file_config: FileSharingConfig,
+):
+    """Create an executor for the show_image tool.
+
+    Renders an image INLINE via ``bot.send_photo`` (vs send_to_telegram's
+    download bubble). ``url`` is passed straight to Telegram, which fetches +
+    renders it; ``file_path`` displays a workspace image. On failure the executor
+    returns an error so the agent can fall back to pasting the link as text.
+    """
+    async def executor(args: dict) -> dict:
+        url = (args.get("url") or "").strip()
+        file_path = (args.get("file_path") or "").strip()
+        caption = args.get("caption") or None
+
+        try:
+            if url and file_path:
+                return {"error": "Provide either url or file_path, not both"}
+
+            if file_path:
+                return await _show_local_image(
+                    bot, chat_id, file_path, caption, file_config
+                )
+
+            if url:
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    return {"error": "url must be an http(s) image URL"}
+                # Telegram fetches the URL and renders it inline. Limits: direct
+                # image URL, ~5MB, Telegram-reachable — else send_photo raises and
+                # we return the error for the agent to recover from.
+                await bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
+                return {"result": "shown"}
+
+            return {"error": "Provide url or file_path"}
+        except Exception as e:
+            logger.exception("show_image failed")
+            return {"error": str(e)}
+
+    return executor
+
+
+async def _show_local_image(
+    bot: "Bot",
+    chat_id: int,
+    file_path: str,
+    caption: "str | None",
+    config: FileSharingConfig,
+) -> dict:
+    """Render a workspace image inline via send_photo. Returns a result dict."""
+    path = Path(file_path)
+
+    if not path.exists():
+        return {"error": f"File not found: {file_path}"}
+    if not config.enabled:
+        return {"error": "File sharing is disabled"}
+
+    ext = path.suffix.lower()
+    if ext not in _DISPLAYABLE_IMAGE_EXTS:
+        return {
+            "error": (
+                f"Not a displayable image type: {ext or '(none)'}. "
+                f"Use send_to_telegram to deliver it as a file instead."
+            )
+        }
+
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > config.max_file_size_mb:
+        return {
+            "error": f"Image too large: {size_mb:.1f}MB > {config.max_file_size_mb}MB limit"
+        }
+
+    from aiogram.types import FSInputFile
+    await bot.send_photo(
+        chat_id=chat_id, photo=FSInputFile(path), caption=caption,
+    )
+    return {"result": f"shown {path.name}"}
+
+
 def register_host_tools(
     bot: "Bot",
     chat_id: int,
@@ -140,4 +254,5 @@ def register_host_tools(
     """
     return {
         "send_to_telegram": make_send_to_telegram_executor(bot, chat_id, file_config),
+        "show_image": make_show_image_executor(bot, chat_id, file_config),
     }
