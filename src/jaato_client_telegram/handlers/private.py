@@ -176,17 +176,28 @@ async def handle_private_message(
 # Set back to False if the profile drops its vision tier.
 _VISION_ENABLED = True
 
-# Image MIME types are attached for vision; other documents would be staged
-# into the workspace (a separate, non-vision path — not wired here yet).
-_IMAGE_MIME_PREFIX = "image/"
+def _is_vision_input(mime_type: str) -> bool:
+    """Attachment types the vision tier (OpenRouter gemini-2.5-flash) can read:
+    images and PDFs. Both ride the same #353 ferry as base64 inline_data; the
+    OpenRouter provider marshals image/* and application/pdf (both validated
+    e2e). Other documents would need a separate staging path (not wired here).
+    """
+    return mime_type.startswith("image/") or mime_type == "application/pdf"
+
+
+# Telegram bots can download files only up to 20 MB via getFile; larger files
+# fail at download time. We pre-check the size Telegram sends with the message
+# and tell the user clearly, rather than surfacing a raw "file is too big".
+_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 
 def _build_image_attachments(data: bytes, mime_type: str, name: str) -> list[dict]:
-    """Build the canonical user-message image attachment list.
+    """Build the canonical user-message attachment list (image or PDF).
 
     Wire contract (per the framework multimodal ferry): a list of dicts
     ``{mime_type, data, display_name}`` where ``data`` is base64-encoded bytes.
-    The daemon decodes them and builds image parts for the vision-tier model.
+    The daemon decodes them and builds inline_data parts for the vision-tier
+    model — mime-agnostic, so images and application/pdf use the same path.
     """
     return [{
         "mime_type": mime_type,
@@ -201,21 +212,16 @@ async def handle_private_media(
     pool: SessionPool,
     renderer: ResponseRenderer,
 ) -> None:
-    """Handle an inbound photo / image document: download it from Telegram and
-    deliver it to the agent as a user-message image attachment, so the profile's
-    vision tier (glm-4.5v) can describe it.
-
-    NOTE: end-to-end delivery depends on the framework multimodal ferry
-    (user-message attachments → runner-tier model), which is a separate
-    framework change. The bot side is complete and uses the canonical
-    ``{mime_type, data: base64, display_name}`` contract.
+    """Handle an inbound photo, image, or PDF: download it from Telegram and
+    deliver it to the agent as a user-message attachment so the profile's vision
+    tier (OpenRouter gemini-2.5-flash) can describe an image or read a PDF.
+    Validated e2e for both (the #353 ferry + #355 cross-provider tier).
     """
     chat_id = message.chat.id
-    caption = (message.caption or "").strip() or "Describe what you see in this image."
 
     if not _VISION_ENABLED:
         await message.answer(
-            "📷 Got your image — but image understanding isn't enabled yet. "
+            "📷 Got your file — but image/PDF understanding isn't enabled yet. "
             "(It needs a vision-capable model; coming soon.) Send me text in the "
             "meantime."
         )
@@ -232,12 +238,33 @@ async def handle_private_media(
         mime_type = (doc.mime_type or "application/octet-stream")
         name = doc.file_name or "file"
 
-    if not mime_type.startswith(_IMAGE_MIME_PREFIX):
+    if not _is_vision_input(mime_type):
         await message.answer(
-            "📎 I can currently only look at images. Send a photo or an image "
-            "file and ask what you'd like to know about it."
+            "📎 I can look at images and PDFs. Send a photo or a PDF and ask "
+            "what you'd like to know about it."
         )
         return
+
+    is_pdf = mime_type == "application/pdf"
+    kind = "PDF" if is_pdf else "image"
+
+    # Pre-check size against Telegram's 20 MB bot-download cap using the size
+    # Telegram sends BEFORE download, so the user gets a clear reason rather than
+    # a raw "file is too big" from get_file.
+    size = getattr(tg_file, "file_size", None)
+    if size and size > _MAX_DOWNLOAD_BYTES:
+        await message.answer(
+            f"📄 That {kind} is {size / 1024 / 1024:.0f} MB — I can only read "
+            f"files up to 20 MB. "
+            + ("Try splitting it or sending a smaller PDF."
+               if is_pdf else "Try sending a smaller image.")
+        )
+        return
+
+    # Default ask depends on the kind of file (a PDF is read, not "seen").
+    caption = (message.caption or "").strip() or (
+        "Summarize this document." if is_pdf else "Describe what you see in this image."
+    )
 
     user_lock = _get_user_lock(chat_id)
     async with user_lock:
@@ -255,8 +282,10 @@ async def handle_private_media(
                 event_stream=await pool.events(session_id),
             )
         except Exception as e:
+            # Covers download failures and model-turn errors (e.g. a PDF with
+            # too many pages for the vision model). Friendly + file-aware; the
+            # full trace is logged, not dumped at the user.
             logger.exception("Error handling media from chat_id %s", chat_id)
             await message.answer(
-                f"❌ Error processing your image.\n\nDetails: {e}\n\n"
-                f"Use /reset to start a fresh session if this persists."
+                f"❌ Sorry, I couldn't process that {kind} — {e}"
             )
