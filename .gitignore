@@ -107,6 +107,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+jaatotelegram/
 
 # Spyder project settings
 .spyderproject
@@ -143,7 +144,14 @@ cython_debug/
 *.yaml
 !config.example.yaml
 *.sock
-.jaato
+# jaato workspace: ignore runtime state (sessions, logs, memories, vision,
+# instructions), but track the versioned profile + agent persona. The negations
+# come after *.yaml above so they win for files under these two dirs.
+.jaato/*
+!.jaato/profiles/
+!.jaato/profiles/**
+!.jaato/agents/
+!.jaato/agents/**
 
 # User data and workspaces
 workspaces/

@@ -16,10 +16,12 @@ from jaato_client_telegram.semantic_markup import render_semantic_markup
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
+from jaato_sdk.events import EventType
 
 if TYPE_CHECKING:
     from jaato_client_telegram.file_handler import FileHandler
     from jaato_client_telegram.permissions import PermissionHandler
+    from jaato_client_telegram.clarification import ClarificationHandler
     from jaato_client_telegram.session_pool import SessionPool
 
 
@@ -167,7 +169,7 @@ class ResponseRenderer:
         edit_throttle_ms: int = 500,
         permission_handler: "PermissionHandler | None" = None,
         file_handler: "FileHandler | None" = None,
-
+        clarification_handler: "ClarificationHandler | None" = None,
     ):
         """
         Initialize the renderer.
@@ -177,11 +179,13 @@ class ResponseRenderer:
             edit_throttle_ms: Minimum time between edit_message_text calls (currently unused - reserved for future progressive streaming)
             permission_handler: Optional handler for permission requests
             file_handler: Optional handler for file sending (ATTACH/SHARE)
+            clarification_handler: Optional handler for clarification requests
         """
         self._max_message_length = max_message_length
         self._edit_throttle_seconds = edit_throttle_ms / 1000.0
         self._permission_handler = permission_handler
         self._file_handler = file_handler
+        self._clarification_handler = clarification_handler
 
     def _flush_text_buffer(self, ctx: StreamingContext) -> None:
         """
@@ -243,7 +247,7 @@ class ResponseRenderer:
                 log.debug(f"Event session_id: {event_session_id}")
 
             # Handle different event types
-            if event_type == "agent.output" or event_type == "AGENT_OUTPUT":
+            if event_type == EventType.AGENT_OUTPUT:
                 # Agent output - check source and mode
                 source = getattr(event, "source", None)
                 mode = getattr(event, "mode", None)
@@ -322,14 +326,14 @@ class ResponseRenderer:
                     if source != "system" or content:  # Skip system flush events (already handled)
                         log.debug(f"Non-model output: source={source}, mode={mode}, buffering anyway")
 
-            elif event_type == "agent.completed" or event_type == "AGENT_COMPLETED":
+            elif event_type == EventType.AGENT_COMPLETED:
                 # Agent completed - flush all buffers before finishing
                 self._flush_all_buffers(ctx)
                 await self._edit_or_send(initial_message, ctx)
                 ctx.content_sent = True
                 break
 
-            elif event_type == "turn.completed" or event_type == "TURN_COMPLETED":
+            elif event_type == EventType.TURN_COMPLETED:
                 # Turn completed - flush all buffers first
                 self._flush_all_buffers(ctx)
 
@@ -359,7 +363,7 @@ class ResponseRenderer:
                 # the response after the first turn.
                 log.debug("Turn completed, continuing to stream events...")
 
-            elif event_type == "agent.status_changed" or event_type == "AGENT_STATUS_CHANGED":
+            elif event_type == EventType.AGENT_STATUS_CHANGED:
                 # Agent status changed - check for completion signals
                 status = getattr(event, "status", "")
                 log.debug(f"Agent status changed: {status}")
@@ -376,7 +380,7 @@ class ResponseRenderer:
                     break
                 # Ignore "active" status - that's the start signal
 
-            elif event_type == "init.progress" or event_type == "INIT_PROGRESS":
+            elif event_type == EventType.INIT_PROGRESS:
                 # Initialization progress - show to user with in-place updates
                 init_progress_count += 1
                 step = getattr(event, "step", "")
@@ -427,7 +431,7 @@ class ResponseRenderer:
                         await self._edit_or_send(initial_message, ctx)
                         ctx.last_edit_time = time.monotonic()
 
-            elif event_type == "system.message" or event_type == "SYSTEM_MESSAGE":
+            elif event_type == EventType.SYSTEM_MESSAGE:
                 # System message - add to output
                 msg = getattr(event, "message", "")
                 style = getattr(event, "style", "info")
@@ -451,7 +455,7 @@ class ResponseRenderer:
                     await self._edit_or_send(initial_message, ctx)
                     ctx.last_edit_time = time.monotonic()
 
-            elif event_type == "error" or event_type == "ERROR":
+            elif event_type == EventType.ERROR:
                 # Error event - extract error details
                 error_msg = getattr(event, "error", "Unknown error")
                 error_type = getattr(event, "error_type", "")
@@ -471,7 +475,7 @@ class ResponseRenderer:
                 # Stop streaming on error
                 break
 
-            elif event_type == "permission.input_mode" or event_type == "PERMISSION_INPUT_MODE":
+            elif event_type == EventType.PERMISSION_INPUT_MODE:
                 # Permission input mode - flush text first, then show permission UI
                 if self._permission_handler:
                     log.debug(f"Permission input mode: request_id={getattr(event, 'request_id', 'unknown')}")
@@ -511,7 +515,43 @@ class ResponseRenderer:
                     # Don't break streaming - server is blocked but events continues
                     log.debug(f"Permission UI shown, continuing to stream events")
 
-            elif event_type == "file.generated" or event_type == "FILE_GENERATED":
+            elif event_type == EventType.CLARIFICATION_BATCH:
+                # Clarification batch - surface the agent's questions. WS clients
+                # receive every question at once; we ask them one at a time and the
+                # answer path (button callback / text reply) sends the batch
+                # response once all are answered. Server blocks until then.
+                if self._clarification_handler:
+                    log.debug(f"Clarification batch: request_id={getattr(event, 'request_id', 'unknown')}")
+
+                    # Flush the model's lead-in text before showing questions
+                    self._flush_text_buffer(ctx)
+                    await self._edit_or_send(initial_message, ctx)
+                    ctx.accumulated_text = ""
+                    ctx.permission_sent = True  # stop editing the streaming message
+
+                    chat_id = initial_message.chat.id
+                    pending = self._clarification_handler.store_pending(event, chat_id)
+                    question = self._clarification_handler.current_question(chat_id)
+                    if question is not None:
+                        text, keyboard = self._clarification_handler.build_question_ui(
+                            pending, question, include_context=True,
+                        )
+                        await initial_message.bot.send_chat_action(
+                            chat_id=chat_id, action="typing")
+                        await asyncio.sleep(0.1)
+                        if keyboard is not None:
+                            await initial_message.answer(text, reply_markup=keyboard)
+                        else:
+                            await initial_message.answer(text)
+                    # Don't break - server is blocked on channel input until answered
+                    log.debug("Clarification UI shown, continuing to stream events")
+
+            # NOTE (drift): there is no EventType.FILE_GENERATED and the current
+            # server never emits "file.generated" — this branch is dead. File
+            # delivery now flows through host tools (e.g. send_document) /
+            # WORKSPACE_FILES events. Kept (string-matched, not typed) so the
+            # FileHandler wiring survives until it's re-pointed at the real event.
+            elif event_type == "file.generated":
                 # File generated event - send file to user
                 if self._file_handler:
                     log.debug(f"File generated: {getattr(event, 'path', 'unknown')}")

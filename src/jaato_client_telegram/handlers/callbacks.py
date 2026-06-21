@@ -4,12 +4,14 @@ Callback query handlers for jaato-client-telegram.
 Handles inline keyboard button callbacks, including permission approvals.
 """
 
+import html
 import logging
 
 from aiogram import Router
 from aiogram.types import CallbackQuery
 
 from jaato_client_telegram.permissions import PermissionHandler, format_tool_params
+from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.session_pool import SessionPool
 
 
@@ -23,6 +25,66 @@ def _is_permission_callback(callback_query: CallbackQuery) -> bool:
     if not callback_query.data:
         return False
     return callback_query.data.startswith("perm:")
+
+
+def _is_clarification_callback(callback_query: CallbackQuery) -> bool:
+    """Check if callback query is a single-choice clarification answer."""
+    if not callback_query.data:
+        return False
+    return callback_query.data.startswith("clar:")
+
+
+@router.callback_query(_is_clarification_callback)
+async def handle_clarification_callback(
+    query: CallbackQuery,
+    clarification_handler: ClarificationHandler,
+    pool: SessionPool,
+) -> None:
+    """Handle a single-choice clarification button tap.
+
+    Callback data: ``clar:request_id:question_index:choice_ordinal``. Records the
+    chosen ordinal, then either shows the next question or submits the batch.
+    """
+    if not query.data or not query.message:
+        await query.answer("❌ Invalid callback")
+        return
+
+    chat_id = query.message.chat.id
+    parsed = clarification_handler.parse_callback_data(query.data)
+    if not parsed:
+        await query.answer("❌ Invalid callback format")
+        return
+
+    request_id, question_index, choice_ordinal = parsed
+    pending = clarification_handler.get_pending(chat_id)
+    if (
+        not pending
+        or pending.request_id != request_id
+        or pending.current != question_index
+    ):
+        await query.answer("❌ Clarification not found or already answered")
+        return
+
+    await query.answer()
+
+    # Reflect the chosen option in the question message
+    current_q = pending.questions[pending.current]
+    choices = current_q.get("choices") or []
+    chosen = choices[choice_ordinal - 1].get("text", "") if 1 <= choice_ordinal <= len(choices) else str(choice_ordinal)
+    try:
+        await query.message.edit_text(
+            f"❓ <i>{html.escape(current_q.get('text', ''), quote=False)}</i>\n"
+            f"✅ {html.escape(chosen, quote=False)}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to edit clarification message: {e}")
+
+    # Answer is the 1-based ordinal as a string (server channel parser expects it)
+    status, payload = clarification_handler.record_answer(chat_id, str(choice_ordinal))
+    await advance_clarification(
+        query.message, chat_id, status, payload, clarification_handler, pool,
+    )
 
 
 @router.callback_query(_is_permission_callback)

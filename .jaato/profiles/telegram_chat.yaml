@@ -1,0 +1,20 @@
+# Profile for the Telegram bot's per-chat sessions.
+# Selected via jaato_ws.profile=telegram_chat in the bot config, passed as
+# `--profile telegram_chat` at session.new. The persona lives in
+# .jaato/agents/telegram_chat.md (passed as `--agent telegram_chat`).
+name: telegram_chat
+description: Conversational assistant for the Telegram bot client.
+provider: zhipuai
+model: glm-5-turbo
+# clarification → request_clarification (the bot surfaces questions to the user).
+# permission / reliability / lifecycle are always-on; host tools are registered
+# client-side via tools.register_client, independent of this list.
+plugins:
+  - clarification
+# Chat-style turns; the bot streams output and surfaces tool/permission/
+# clarification UIs over the WS protocol.
+max_turns: 12
+plugin_configs:
+  zhipuai:
+    api_params:
+      temperature: 0.7

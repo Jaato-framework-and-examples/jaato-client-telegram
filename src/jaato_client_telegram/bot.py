@@ -24,6 +24,7 @@ from jaato_client_telegram.handlers import (
     private_router,
 )
 from jaato_client_telegram.permissions import PermissionHandler
+from jaato_client_telegram.clarification import ClarificationHandler
 from jaato_client_telegram.rate_limiter import RateLimiter
 from jaato_client_telegram.abuse_protection import AbuseProtector
 from jaato_client_telegram.telemetry import TelemetryCollector
@@ -36,13 +37,19 @@ from jaato_client_telegram.transport import WSTransport  # noqa: F401 (used by t
 logger = logging.getLogger(__name__)
 
 
-def _create_renderer(config: Config, permission_handler: PermissionHandler | None = None, file_handler: FileHandler | None = None) -> ResponseRenderer:
+def _create_renderer(
+    config: Config,
+    permission_handler: PermissionHandler | None = None,
+    file_handler: FileHandler | None = None,
+    clarification_handler: ClarificationHandler | None = None,
+) -> ResponseRenderer:
     """Create a ResponseRenderer with config settings."""
     return ResponseRenderer(
         max_message_length=config.rendering.max_message_length,
         edit_throttle_ms=config.rendering.edit_throttle_ms,
         permission_handler=permission_handler,
         file_handler=file_handler,
+        clarification_handler=clarification_handler,
     )
 
 
@@ -86,13 +93,14 @@ def create_bot_and_dispatcher(
     pool = _create_session_pool(config)
     pool.set_bot(bot, getattr(config, "file_sharing", None))
     permission_handler = PermissionHandler(config.permissions.unsupported_actions)
+    clarification_handler = ClarificationHandler()
     file_handler = FileHandler(config.file_sharing)
 
     # Note: WorkspaceEventSubscriber needs an IPC backend from jaato-server
     # This will be added once we determine the source of the IPC connection
     # For now, event_subscriber is None and won't be started
 
-    renderer = _create_renderer(config, permission_handler, file_handler)
+    renderer = _create_renderer(config, permission_handler, file_handler, clarification_handler)
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
 
     # Create rate limiter if enabled
@@ -136,6 +144,7 @@ def create_bot_and_dispatcher(
     dp["renderer"] = renderer
     dp["whitelist"] = whitelist
     dp["permission_handler"] = permission_handler
+    dp["clarification_handler"] = clarification_handler
     dp["config"] = config
     dp["rate_limiter"] = rate_limiter
     dp["abuse_protector"] = abuse_protector

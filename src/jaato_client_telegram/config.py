@@ -68,6 +68,11 @@ class JaatoWSConfig(BaseModel):
     keycloak_realm: str = "jaato"
     keycloak_client_id: str = ""
     keycloak_client_secret: str = ""
+    # Profile + agent passed to session.new (empty = framework default).
+    # The named profile lives in <workspace>/.jaato/profiles/<profile>.yaml and
+    # the persona in .jaato/agents/<agent>.md.
+    profile: str = ""
+    agent: str = ""
 
 
 class SessionConfig(BaseModel):

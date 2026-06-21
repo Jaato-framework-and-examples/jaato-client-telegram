@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from jaato_sdk.events import (
     SendMessageRequest,
     PermissionResponseRequest,
-    ClarificationResponseRequest,
+    ClarificationBatchResponseEvent,
     ClientConfigRequest,
     StopRequest,
     SessionInfoEvent,
@@ -109,7 +109,12 @@ class SessionPool:
                 await transport.send(config_event)
                 logger.info("Sent presentation context for chat_id %d", chat_id)
 
-                session_id = await transport.create_session()
+                session_args: list[str] = []
+                if self._ws_config.profile:
+                    session_args += ["--profile", self._ws_config.profile]
+                if self._ws_config.agent:
+                    session_args += ["--agent", self._ws_config.agent]
+                session_id = await transport.create_session(session_args)
                 transport.register_session(session_id)
 
                 if self._bot and self._file_config:
@@ -148,15 +153,23 @@ class SessionPool:
         transport = self._find_transport(session_id)
         request = PermissionResponseRequest(
             request_id=request_id, response=response,
+            edited_arguments=edited_arguments,
         )
         await transport.send(request)
 
     async def respond_to_clarification(
-        self, session_id: str, request_id: str, responses: dict,
+        self, session_id: str, request_id: str, answers: list[str],
     ) -> None:
+        """Answer a clarification request with one string per question, in order.
+
+        WS clients receive all questions at once (ClarificationBatchEvent) and
+        reply in one batch; the server feeds each answer into the channel queue
+        sequentially. Single/multiple-choice answers are 1-based ordinals
+        ("2", "1,3"); free-text answers are the literal text.
+        """
         transport = self._find_transport(session_id)
-        request = ClarificationResponseRequest(
-            request_id=request_id, responses=responses,
+        request = ClarificationBatchResponseEvent(
+            request_id=request_id, answers=answers,
         )
         await transport.send(request)
 

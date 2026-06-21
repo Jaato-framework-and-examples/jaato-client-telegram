@@ -72,7 +72,12 @@ jaato_ws:
   # Authentication token (if server requires it)
   # secret_token: "${JAATO_WS_TOKEN}"
 
-  # Workspace template for server-side provisioning
+  # Profile + agent passed to session.new for every chat session.
+  # The named profile lives in .jaato/profiles/<profile>.yaml and the persona
+  # in .jaato/agents/<agent>.md. Leave empty to use the framework default.
+  profile: "telegram_chat"
+  agent: "telegram_chat"
+
 # Session Pool Configuration
 session:
   # Maximum concurrent SDK clients

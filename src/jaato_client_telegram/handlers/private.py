@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from aiogram import Router, F
 from aiogram.types import Message
 
+from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
 
@@ -41,6 +42,7 @@ async def handle_private_message(
     message: Message,
     pool: SessionPool,
     renderer: ResponseRenderer,
+    clarification_handler: ClarificationHandler | None = None,
     rate_limiter: "RateLimiter | None" = None,
     abuse_protector: "AbuseProtector | None" = None,
     telemetry: "TelemetryCollector | None" = None,
@@ -70,6 +72,18 @@ async def handle_private_message(
     user_text = message.text
 
     if not user_text:
+        return
+
+    # If a clarification is awaiting this user's reply, route the text as the
+    # answer to the current question instead of a new prompt. This runs BEFORE
+    # the per-user lock: the turn that asked the question is still streaming and
+    # holds that lock, so acquiring it here would deadlock. The answer unblocks
+    # the server and the in-flight stream renders the continuation.
+    if clarification_handler and clarification_handler.get_pending(chat_id) is not None:
+        status, payload = clarification_handler.record_answer(chat_id, user_text)
+        await advance_clarification(
+            message, chat_id, status, payload, clarification_handler, pool,
+        )
         return
 
     # Check abuse protection if enabled
