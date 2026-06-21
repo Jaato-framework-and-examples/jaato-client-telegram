@@ -622,9 +622,41 @@ class ResponseRenderer:
 
         # Send the actual message
         if parse_mode:
-            return await initial_message.answer(text, parse_mode=parse_mode)
+            return await self._safe_answer(initial_message, text, parse_mode=parse_mode)
         else:
             return await initial_message.answer(text)
+
+    @staticmethod
+    def _is_html_parse_error(exc: TelegramBadRequest) -> bool:
+        """True for Telegram 'can't parse entities' / bad-tag errors — i.e. the
+        text isn't valid HTML (e.g. unescaped '<' / '<=' in agent code output).
+        These must fall back to plain text; other BadRequests propagate."""
+        s = str(exc).lower()
+        return "parse entities" in s or "can't parse" in s or "unsupported start tag" in s or "tag" in s
+
+    async def _safe_answer(self, target: Message, text: str, parse_mode: str | None = "HTML", **kwargs):
+        """answer() that falls back to plain text if Telegram rejects the HTML."""
+        if not parse_mode:
+            return await target.answer(text, **kwargs)
+        try:
+            return await target.answer(text, parse_mode=parse_mode, **kwargs)
+        except TelegramBadRequest as e:
+            if self._is_html_parse_error(e):
+                return await target.answer(text, **kwargs)  # plain text
+            raise
+
+    async def _safe_edit(self, msg: Message, text: str) -> None:
+        """edit_text() that falls back to plain text on HTML parse errors and
+        silently ignores 'message is not modified'."""
+        try:
+            await msg.edit_text(text, parse_mode="HTML")
+        except TelegramBadRequest as e:
+            if self._is_html_parse_error(e):
+                try:
+                    await msg.edit_text(text)
+                except TelegramBadRequest:
+                    pass
+            # else: 'message is not modified' / other — ignore
 
     async def _edit_or_send(
         self,
@@ -653,10 +685,10 @@ class ResponseRenderer:
         if ctx.permission_sent and ctx.sent_message is not None:
             # Only send if there's actual content
             if display_text:
-                if has_html:
-                    await initial_message.answer(display_text, parse_mode="HTML")
-                else:
-                    await initial_message.answer(display_text)
+                await self._safe_answer(
+                    initial_message, display_text,
+                    parse_mode="HTML" if has_html else None,
+                )
             # Clear accumulated text after sending to prevent duplication
             ctx.accumulated_text = ""
             return
@@ -664,21 +696,22 @@ class ResponseRenderer:
         # Normal editing behavior (no permission sent yet)
         if ctx.sent_message is None:
             # First time - send new message
-            if has_html:
-                ctx.sent_message = await initial_message.answer(display_text, parse_mode="HTML")
-            else:
-                ctx.sent_message = await initial_message.answer(display_text)
+            ctx.sent_message = await self._safe_answer(
+                initial_message, display_text,
+                parse_mode="HTML" if has_html else None,
+            )
         else:
             # Edit in place
-            try:
-                if has_html:
-                    await ctx.sent_message.edit_text(display_text, parse_mode="HTML")
-                else:
-                    await ctx.sent_message.edit_text(display_text)
+            if has_html:
+                await self._safe_edit(ctx.sent_message, display_text)
                 ctx.edits_count += 1
-            except TelegramBadRequest:
-                # Text unchanged or other Telegram error - ignore
-                pass
+            else:
+                try:
+                    await ctx.sent_message.edit_text(display_text)
+                    ctx.edits_count += 1
+                except TelegramBadRequest:
+                    # Text unchanged or other Telegram error - ignore
+                    pass
 
     async def send_final_response(
         self,
@@ -706,18 +739,17 @@ class ResponseRenderer:
         # If fits in one message, just update
         if len(text) <= self._max_message_length:
             if streaming_context.sent_message:
+                if has_html:
+                    await self._safe_edit(streaming_context.sent_message, text)
+                    return
                 try:
-                    if has_html:
-                        await streaming_context.sent_message.edit_text(text, parse_mode="HTML")
-                    else:
-                        await streaming_context.sent_message.edit_text(text)
+                    await streaming_context.sent_message.edit_text(text)
                     return
                 except TelegramBadRequest:
                     pass
-            if has_html:
-                await initial_message.answer(text, parse_mode="HTML")
-            else:
-                await initial_message.answer(text)
+            await self._safe_answer(
+                initial_message, text, parse_mode="HTML" if has_html else None,
+            )
             return
 
         # Too long - split into multiple messages
@@ -732,10 +764,10 @@ class ResponseRenderer:
         chunks = split_preserving_paragraphs(text, self._max_message_length)
         for chunk in chunks:
             # Check if chunk has HTML
-            if "<blockquote>" in chunk:
-                await initial_message.answer(chunk, parse_mode="HTML")
-            else:
-                await initial_message.answer(chunk)
+            await self._safe_answer(
+                initial_message, chunk,
+                parse_mode="HTML" if "<blockquote>" in chunk else None,
+            )
 
     async def send_simple_response(
         self,

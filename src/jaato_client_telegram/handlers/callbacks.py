@@ -132,12 +132,12 @@ async def handle_permission_callback(
             option_label = option.get("label", option_key)
             break
 
-    # Update message to show decision
+    # Update message to show decision (option keys: y=allow, n=deny, a=always, t=turn)
     action_emoji = {
-        "yes": "✅",
-        "no": "❌",
-        "always_allow": "🔄",
-        "always_deny": "🚫",
+        "y": "✅",
+        "n": "❌",
+        "a": "🔄",
+        "t": "▶️",
     }.get(option_key, "▶️")
 
     # Build result message with tool name and parameters (HTML format)
@@ -201,7 +201,8 @@ async def handle_permission_callback(
             logger.warning(f"Failed to update success message: {e}")
         
         # Store approved tool info so renderer can format output with parameters
-        if option_key not in ("no", "always_deny"):
+        # (deny key is "n"; y/a/t are allow variants)
+        if option_key != "n":
             permission_handler.store_approved(
                 chat_id=chat_id,
                 tool_name=pending.tool_name,

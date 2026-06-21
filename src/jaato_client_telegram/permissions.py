@@ -252,10 +252,12 @@ class PermissionHandler:
         )
         logger.debug(f"Filtering unsupported actions: {sorted(self._unsupported_actions)}")
 
-        # Filter out unsupported action types
+        # Filter out unsupported action types. Current PermissionResponseOption
+        # schema is {key, label, action, description}; `action` may be absent on
+        # the wire (the simple y/n/a/t options carry only key/label/description).
         filtered_options = [
             opt for opt in options
-            if opt.get("full", "") not in self._unsupported_actions
+            if opt.get("action", "") not in self._unsupported_actions
         ]
 
         logger.debug(f"After filtering: {len(filtered_options)} options remain")
@@ -267,7 +269,7 @@ class PermissionHandler:
             logger.info(
                 f"Filtered out {filtered_count} unsupported permission option(s) "
                 f"(Telegram inline keyboard limitation): "
-                f"{[opt.get('full', 'unknown') for opt in options if opt.get('full', '') in self._unsupported_actions]}"
+                f"{[opt.get('action', 'unknown') for opt in options if opt.get('action', '') in self._unsupported_actions]}"
             )
 
         # If no valid options remain, show a default allow/deny
@@ -276,22 +278,26 @@ class PermissionHandler:
                 f"No supported permission options available, adding default yes/no buttons"
             )
             filtered_options = [
-                {"short": "yes", "description": "Allow", "full": "yes"},
-                {"short": "no", "description": "Deny", "full": "no"},
+                {"key": "y", "label": "yes", "action": "allow_once"},
+                {"key": "n", "label": "no", "action": "deny"},
             ]
 
         for option in filtered_options:
-            key = option.get("short", "")
-            label = option.get("description", key)
-            action = option.get("full", "unknown")
+            # Field names per PermissionResponseOption: key/label/action.
+            # (Was reading short/full — stale schema — which made callback_data
+            # carry an EMPTY key, so the server could never match the response
+            # and every approval was effectively a no-op / deny.)
+            key = option.get("key", "")
+            label = option.get("label") or option.get("description") or key
 
-            # Add emoji based on action
+            # Emoji by key (y=allow, n=deny, a=always, t=turn); action is not
+            # always present on the wire so we don't key the emoji off it.
             emoji = {
-                "yes": "✅",
-                "no": "❌",
-                "always_allow": "🔄",
-                "always_deny": "🚫",
-            }.get(action, "▶️")
+                "y": "✅",
+                "n": "❌",
+                "a": "🔄",
+                "t": "▶️",
+            }.get(key, "▶️")
 
             button_label = f"{emoji} {label}"
 

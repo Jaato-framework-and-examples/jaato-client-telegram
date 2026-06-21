@@ -106,9 +106,25 @@ class SessionPool:
                 await transport.connect()
 
                 presentation_ctx = create_telegram_presentation_context()
-                config_event = ClientConfigRequest(presentation=presentation_ctx)
+                # working_dir wires the server's self._workspace_path, which gates
+                # set_workspace_root() — the ContextVar that runner-tier PATH tools
+                # (filesystem_query/cli/notebook) read for their sandbox root.
+                # config_root wires registry.set_config_root() before expose_all,
+                # which file_edit needs to resolve its backup dir
+                # (<config_root>/sessions/<id>/backups) — without it file_edit
+                # fails to initialize and is not exposed at all.
+                # Both mirror what the SDK IPCClient sends from workspace_path/
+                # config_root; the hand-rolled WS transport must send them too.
+                # (set_workspace below is a SEPARATE wire that drives profile
+                # discovery — all three are needed today.)
+                workspace = self._ws_config.workspace
+                config_event = ClientConfigRequest(
+                    presentation=presentation_ctx,
+                    working_dir=workspace or None,
+                    config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
+                )
                 await transport.send(config_event)
-                logger.info("Sent presentation context for chat_id %d", chat_id)
+                logger.info("Sent presentation + working_dir + config_root for chat_id %d", chat_id)
 
                 # Tell the server where this client's workspace is, so session.new
                 # can discover workspace-local profiles/agents (.jaato/...).
