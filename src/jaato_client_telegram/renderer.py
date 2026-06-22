@@ -548,9 +548,9 @@ class ResponseRenderer:
                             chat_id=chat_id, action="typing")
                         await asyncio.sleep(0.1)
                         if keyboard is not None:
-                            await initial_message.answer(text, reply_markup=keyboard)
+                            await self._safe_answer(initial_message, text, reply_markup=keyboard)
                         else:
-                            await initial_message.answer(text)
+                            await self._safe_answer(initial_message, text)
                     # Don't break - server is blocked on channel input until answered
                     log.debug("Clarification UI shown, continuing to stream events")
 
@@ -632,7 +632,7 @@ class ResponseRenderer:
         if parse_mode:
             return await self._safe_answer(initial_message, text, parse_mode=parse_mode)
         else:
-            return await initial_message.answer(text)
+            return await initial_message.answer(text, parse_mode=None)
 
     @staticmethod
     def _is_html_parse_error(exc: TelegramBadRequest) -> bool:
@@ -643,15 +643,21 @@ class ResponseRenderer:
         return "parse entities" in s or "can't parse" in s or "unsupported start tag" in s or "tag" in s
 
     async def _safe_answer(self, target: Message, text: str, parse_mode: str | None = "HTML", **kwargs):
-        """answer() that falls back to plain text if Telegram rejects the HTML."""
+        """answer() that falls back to plain text if Telegram rejects the HTML.
+
+        NOTE: the bot is configured with default parse_mode=HTML, so the
+        plain-text paths MUST pass parse_mode=None explicitly — otherwise the
+        "fallback" re-sends as HTML, hits the same parse error, and (unwrapped)
+        raises out to the caller.
+        """
         if not parse_mode:
-            m = await target.answer(text, **kwargs)
+            m = await target.answer(text, parse_mode=None, **kwargs)
         else:
             try:
                 m = await target.answer(text, parse_mode=parse_mode, **kwargs)
             except TelegramBadRequest as e:
                 if self._is_html_parse_error(e):
-                    m = await target.answer(text, **kwargs)  # plain text
+                    m = await target.answer(text, parse_mode=None, **kwargs)  # real plain text
                 else:
                     raise
         log.info(
@@ -668,7 +674,7 @@ class ResponseRenderer:
         except TelegramBadRequest as e:
             if self._is_html_parse_error(e):
                 try:
-                    await msg.edit_text(text)
+                    await msg.edit_text(text, parse_mode=None)  # real plain text
                 except TelegramBadRequest:
                     pass
             # else: 'message is not modified' / other — ignore
@@ -722,7 +728,7 @@ class ResponseRenderer:
                 ctx.edits_count += 1
             else:
                 try:
-                    await ctx.sent_message.edit_text(display_text)
+                    await ctx.sent_message.edit_text(display_text, parse_mode=None)
                     ctx.edits_count += 1
                 except TelegramBadRequest:
                     # Text unchanged or other Telegram error - ignore
@@ -758,7 +764,7 @@ class ResponseRenderer:
                     await self._safe_edit(streaming_context.sent_message, text)
                     return
                 try:
-                    await streaming_context.sent_message.edit_text(text)
+                    await streaming_context.sent_message.edit_text(text, parse_mode=None)
                     return
                 except TelegramBadRequest:
                     pass
@@ -801,13 +807,13 @@ class ResponseRenderer:
             text: Response text
         """
         if len(text) <= self._max_message_length:
-            await message.answer(text)
+            await self._safe_answer(message, text)
             return
 
         # Split long messages
         chunks = split_preserving_paragraphs(text, self._max_message_length)
         for chunk in chunks:
-            await message.answer(chunk)
+            await self._safe_answer(message, chunk)
 
     def split_text(self, text: str, max_len: int | None = None) -> list[str]:
         """
