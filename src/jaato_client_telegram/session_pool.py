@@ -28,6 +28,7 @@ from jaato_sdk.events import (
 from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors
 from jaato_client_telegram.host_tool_loader import load_all_tools, make_executor, validate_name, load_tool_file
 from jaato_client_telegram.transport import WSTransport
+from jaato_client_telegram.chat_session_store import ChatSessionStore
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -70,6 +71,7 @@ class SessionPool:
         bot: "Bot | None" = None,
         file_config: "FileSharingConfig | None" = None,
         max_concurrent: int = 50,
+        session_store_path: str = "",
     ) -> None:
         self._ws_config = ws_config
         self._bot = bot
@@ -78,6 +80,11 @@ class SessionPool:
         self._sessions: dict[int, SessionMetadata] = {}
         self._lock = asyncio.Lock()
         self._pending_session_future: asyncio.Future | None = None
+        # Persistent chat_id -> session_id map for re-attachment across restarts.
+        # None when unconfigured (re-attachment disabled — sessions are per-process).
+        self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
+        if self._session_store:
+            logger.info("Session re-attachment enabled (store=%s)", session_store_path)
 
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
@@ -145,12 +152,35 @@ class SessionPool:
                     host_schemas, host_executors = self._assemble_host_tools(chat_id)
                     await transport.register_host_tools(host_schemas, TOOL_CATEGORIES)
 
-                session_args: list[str] = []
-                if self._ws_config.profile:
-                    session_args += ["--profile", self._ws_config.profile]
-                if self._ws_config.agent:
-                    session_args += ["--agent", self._ws_config.agent]
-                session_id = await transport.create_session(session_args)
+                # Re-attach to this chat's persisted session if one exists and is
+                # still known to the daemon (session.list reports the unified
+                # in-memory + on-disk view, so this survives a daemon restart).
+                # Otherwise create a fresh session and remember it.
+                session_id: str | None = None
+                if self._session_store:
+                    persisted = self._session_store.get(chat_id)
+                    if persisted:
+                        if persisted in await transport.list_sessions():
+                            await transport.attach_session(persisted)
+                            session_id = persisted
+                            logger.info("Re-attached chat_id %d to session %s", chat_id, session_id)
+                        else:
+                            logger.info(
+                                "Persisted session %s for chat_id %d is gone; creating new",
+                                persisted, chat_id,
+                            )
+
+                if session_id is None:
+                    session_args: list[str] = []
+                    if self._ws_config.profile:
+                        session_args += ["--profile", self._ws_config.profile]
+                    if self._ws_config.agent:
+                        session_args += ["--agent", self._ws_config.agent]
+                    session_id = await transport.create_session(session_args)
+                    if self._session_store:
+                        self._session_store.set(chat_id, session_id)
+                    logger.info("Created session %s for chat_id %d", session_id, chat_id)
+
                 transport.register_session(session_id)
 
                 # Executor routing is local to the transport and needs session_id.
@@ -167,8 +197,6 @@ class SessionPool:
                     last_activity=datetime.now(),
                     transport=transport,
                 )
-
-                logger.info("Created session %s for chat_id %d", session_id, chat_id)
                 return session_id
             except Exception as e:
                 raise RuntimeError(

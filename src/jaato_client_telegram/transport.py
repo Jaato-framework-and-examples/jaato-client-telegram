@@ -41,6 +41,7 @@ from jaato_sdk.events import (
     ConnectedEvent,
     ErrorEvent,
     SessionInfoEvent,
+    SessionListEvent,
     StageFilesEvent,
     StageFilesRequest,
     StagedFileSpec,
@@ -90,6 +91,7 @@ class WSTransport:
         self._tool_executors: dict[str, Callable] = {}
         self._tools_registered: bool = False
         self._session_future: asyncio.Future | None = None
+        self._session_list_future: asyncio.Future | None = None
         self._stage_files_future: asyncio.Future | None = None
 
     @property
@@ -246,6 +248,30 @@ class WSTransport:
         finally:
             self._session_future = None
 
+    async def list_sessions(self) -> list[str]:
+        """Return the session_ids the daemon currently knows (in-memory AND on
+        disk — the SessionManager presents a unified view). Used to verify a
+        persisted session still exists before attaching to it."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._session_list_future = future
+        try:
+            await self.send(CommandRequest(command="session.list"))
+            event = await asyncio.wait_for(future, timeout=15.0)
+            return [s.get("id") for s in event.sessions if s.get("id")]
+        finally:
+            self._session_list_future = None
+
+    async def attach_session(self, session_id: str) -> None:
+        """Attach this connection to an EXISTING daemon session (the daemon loads
+        it from disk if it is not resident). Verify existence via
+        ``list_sessions()`` first: a missing session is answered with an
+        ErrorEvent and a workspace mismatch with a WorkspaceMismatchRequestedEvent
+        — neither occurs for this bot's own sessions, which all share the
+        runtime/ workspace. An in-memory attach emits no confirmation event, so
+        this is intentionally fire-and-forget after the existence check."""
+        await self.send(CommandRequest(command="session.attach", args=[session_id]))
+
     async def stage_files(
         self,
         workspace_id: str,
@@ -315,10 +341,16 @@ class WSTransport:
                         self._session_future.set_result(event.session_id)
                         continue
 
+                    if isinstance(event, SessionListEvent) and self._session_list_future and not self._session_list_future.done():
+                        self._session_list_future.set_result(event)
+                        continue
+
                     if isinstance(event, ErrorEvent):
                         logger.error("Server error: %s [%s]", event.error, event.error_type)
                         if self._session_future and not self._session_future.done():
                             self._session_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
+                        if self._session_list_future and not self._session_list_future.done():
+                            self._session_list_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
                         if self._stage_files_future and not self._stage_files_future.done():
                             self._stage_files_future.set_exception(RuntimeError(f"{event.error} [{event.error_type}]"))
                         continue

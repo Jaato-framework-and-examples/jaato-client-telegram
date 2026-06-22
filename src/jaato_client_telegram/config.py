@@ -91,6 +91,12 @@ class SessionConfig(BaseModel):
     max_concurrent: int = 50
     idle_timeout_minutes: int = 60
     reconnect_on_error: bool = True
+    # Path to a JSON file persisting chat_id -> daemon session_id so the bot
+    # RE-ATTACHES to the same daemon session across restarts (the daemon loads it
+    # from disk if needed) instead of starting a fresh conversation. Keep it
+    # OUTSIDE the workspace and the repo. Empty disables re-attachment (sessions
+    # are per-process and lost on restart). No hardcoded default.
+    session_store_path: str = ""
 
 
 class PermissionConfig(BaseModel):

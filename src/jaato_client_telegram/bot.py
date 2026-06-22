@@ -58,6 +58,7 @@ def _create_session_pool(config: Config) -> SessionPool:
     return SessionPool(
         ws_config=config.jaato_ws,
         max_concurrent=config.session.max_concurrent,
+        session_store_path=config.session.session_store_path,
     )
 
 
