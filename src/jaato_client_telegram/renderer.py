@@ -90,6 +90,7 @@ class StreamingContext:
     seen_model_output: bool = False  # Track if we've received any model output yet
     permission_sent: bool = False  # Track if permission UI was sent as separate message
     content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
+    last_final_text: str = ""   # Last text sent via send_final_response (dedups repeat TURN_COMPLETED)
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
@@ -753,6 +754,13 @@ class ResponseRenderer:
             return
 
         text = streaming_context.accumulated_text
+        # Dedup: multi-turn agentic flows fire TURN_COMPLETED more than once (e.g.
+        # after a host-tool call like show_image). Without this guard the SAME
+        # accumulated text is sent again on the second TURN_COMPLETED — a visible
+        # duplicate message. Only send when the final text actually changed.
+        if text == streaming_context.last_final_text:
+            return
+        streaming_context.last_final_text = text
 
         # Check if text contains Telegram HTML formatting
         has_html = _has_telegram_html(text)
