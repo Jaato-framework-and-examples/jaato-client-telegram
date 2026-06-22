@@ -7,6 +7,7 @@ including long message splitting and edit-in-place updates.
 
 import asyncio
 import html
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
     from jaato_client_telegram.permissions import PermissionHandler
     from jaato_client_telegram.clarification import ClarificationHandler
     from jaato_client_telegram.session_pool import SessionPool
+
+
+log = logging.getLogger(__name__)
 
 
 # ANSI escape code pattern - matches terminal color codes like [1;38;5;253;48;5;235m
@@ -346,6 +350,10 @@ class ResponseRenderer:
                     # Delete the streaming message and send final response with accumulated text
                     if ctx.sent_message:
                         try:
+                            log.info(
+                                "RENDER delete streaming id=%s (TURN_COMPLETED formatted_text branch)",
+                                ctx.sent_message.message_id,
+                            )
                             await ctx.sent_message.delete()
                             ctx.sent_message = None
                         except Exception:
@@ -637,13 +645,20 @@ class ResponseRenderer:
     async def _safe_answer(self, target: Message, text: str, parse_mode: str | None = "HTML", **kwargs):
         """answer() that falls back to plain text if Telegram rejects the HTML."""
         if not parse_mode:
-            return await target.answer(text, **kwargs)
-        try:
-            return await target.answer(text, parse_mode=parse_mode, **kwargs)
-        except TelegramBadRequest as e:
-            if self._is_html_parse_error(e):
-                return await target.answer(text, **kwargs)  # plain text
-            raise
+            m = await target.answer(text, **kwargs)
+        else:
+            try:
+                m = await target.answer(text, parse_mode=parse_mode, **kwargs)
+            except TelegramBadRequest as e:
+                if self._is_html_parse_error(e):
+                    m = await target.answer(text, **kwargs)  # plain text
+                else:
+                    raise
+        log.info(
+            "RENDER send msg id=%s len=%d head=%r",
+            getattr(m, "message_id", None), len(text), text[:50],
+        )
+        return m
 
     async def _safe_edit(self, msg: Message, text: str) -> None:
         """edit_text() that falls back to plain text on HTML parse errors and
@@ -756,6 +771,10 @@ class ResponseRenderer:
         # Delete the streaming message first if it exists
         if streaming_context.sent_message:
             try:
+                log.info(
+                    "RENDER delete streaming id=%s (send_final_response too-long split)",
+                    streaming_context.sent_message.message_id,
+                )
                 await streaming_context.sent_message.delete()
             except TelegramBadRequest:
                 pass
