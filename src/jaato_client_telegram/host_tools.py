@@ -87,6 +87,34 @@ TOOL_SCHEMAS = [
         "timeout": 30000,
         "auto_approve": True,
     },
+    {
+        "name": "register_tool",
+        "description": (
+            "Install a NEW host tool you have written, making it callable from "
+            "your NEXT turn. Workflow: (1) write the tool to "
+            "tool_drafts/<name>.py in the workspace — a module-level TOOL_SCHEMA "
+            "dict (name = the file stem, description, JSON-schema parameters) "
+            "plus `async def execute(args, ctx)` returning a dict; ctx.bot and "
+            "ctx.chat_id let it talk to Telegram. (2) SHOW the user the code. "
+            "(3) call register_tool(name). The user approves, then the bot "
+            "installs and registers it. Use this to extend your own capabilities "
+            "on request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Tool name = the draft file stem (tool_drafts/<name>.py).",
+                },
+            },
+            "required": ["name"],
+        },
+        "category": "telegram",
+        "timeout": 30000,
+        # NOT auto-approved: the user must approve running new executable code.
+        "auto_approve": False,
+    },
 ]
 
 TOOL_CATEGORIES = {

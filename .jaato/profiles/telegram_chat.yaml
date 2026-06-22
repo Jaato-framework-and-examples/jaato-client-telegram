@@ -6,6 +6,11 @@ name: telegram_chat
 description: Conversational assistant for the Telegram bot client.
 provider: zhipuai
 model: glm-5-turbo
+# Confine the runner to its workspace: it can read/write the workspace (incl.
+# tool_drafts/) but NOT .jaato/agents, .jaato/profiles, or .jaato/host_tools.
+# Dynamic host tools are installed into .jaato/host_tools by the UNCONFINED bot
+# process after user approval — the confined runner cannot self-install code.
+apparmor: true
 # V2 cross-provider model tiers: cheap zhipuai glm-5-turbo for text (the
 # `executor` / initial tier) + a REAL vision tier on OpenRouter
 # google/gemini-2.5-flash (zhipuai glm-4.5v hallucinates, so it's not used).

@@ -196,13 +196,21 @@ class WSTransport:
     def set_session_tool_executors(self, session_id: str, executors: dict[str, Callable]) -> None:
         self._tool_executors.update(executors)
 
-    async def register_host_tools(self, tool_schemas: list[dict], categories: dict[str, str] | None = None) -> None:
-        if self._tools_registered:
+    async def register_host_tools(
+        self,
+        tool_schemas: list[dict],
+        categories: dict[str, str] | None = None,
+        force: bool = False,
+    ) -> None:
+        # Idempotent at session startup; force=True re-registers (e.g. after a new
+        # dynamic tool is installed) so the daemon refreshes the runtime tool list
+        # and glues the new schema onto the live runner-tier model.
+        if self._tools_registered and not force:
             return
         event = ToolsRegisterClientRequest(tools=tool_schemas, categories=categories or {})
         await self.send(event)
         self._tools_registered = True
-        logger.info("Registered %d host-provided tools", len(tool_schemas))
+        logger.info("Registered %d host-provided tools (force=%s)", len(tool_schemas), force)
 
     async def _handle_tool_execute_request(self, event: ToolExecuteRequestEvent) -> None:
         tool_name = event.tool_name

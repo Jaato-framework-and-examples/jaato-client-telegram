@@ -10,6 +10,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from jaato_sdk.events import (
@@ -25,6 +26,7 @@ from jaato_sdk.events import (
 )
 
 from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors
+from jaato_client_telegram.host_tool_loader import load_all_tools, make_executor, validate_name, load_tool_file
 from jaato_client_telegram.transport import WSTransport
 
 if TYPE_CHECKING:
@@ -133,13 +135,15 @@ class SessionPool:
                         command="set_workspace", args=[self._ws_config.workspace],
                     ))
 
-                # Register host-tool SCHEMAS BEFORE session.new so they ride the
-                # bootstrap envelope into the runner (server PR #349, the #344
-                # sibling). Registering AFTER session.new only updates the daemon
-                # registry — the runner-tier model never sees the tools, so the
-                # agent can't call e.g. send_to_telegram.
+                # Assemble host tools = static (send_to_telegram, show_image,
+                # register_tool) + any dynamic tools the user has installed in
+                # .jaato/host_tools/. Register SCHEMAS BEFORE session.new so they
+                # ride the bootstrap envelope into the runner (server PR
+                # #349/#350); registering after only updates the daemon registry.
+                host_executors: dict | None = None
                 if self._bot and self._file_config:
-                    await transport.register_host_tools(TOOL_SCHEMAS, TOOL_CATEGORIES)
+                    host_schemas, host_executors = self._assemble_host_tools(chat_id)
+                    await transport.register_host_tools(host_schemas, TOOL_CATEGORIES)
 
                 session_args: list[str] = []
                 if self._ws_config.profile:
@@ -150,10 +154,12 @@ class SessionPool:
                 transport.register_session(session_id)
 
                 # Executor routing is local to the transport and needs session_id.
-                if self._bot and self._file_config:
-                    executors = create_tool_executors(self._bot, chat_id, self._file_config)
-                    transport.set_session_tool_executors(session_id, executors)
-                    logger.info("Wired host-tool executors for session %s", session_id)
+                if host_executors is not None:
+                    transport.set_session_tool_executors(session_id, host_executors)
+                    logger.info(
+                        "Wired %d host-tool executors for session %s",
+                        len(host_executors), session_id,
+                    )
 
                 self._sessions[chat_id] = SessionMetadata(
                     session_id=session_id,
@@ -168,6 +174,75 @@ class SessionPool:
                 raise RuntimeError(
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
+
+    def _host_tools_dir(self) -> Path | None:
+        """Bot-owned install dir for dynamic host tools — OUTSIDE the workspace so
+        the AppArmor-confined runner cannot write or tamper with installed code.
+        None when host_tools_dir is unconfigured (the feature is disabled)."""
+        d = self._ws_config.host_tools_dir
+        return Path(d).expanduser() if d else None
+
+    def _assemble_host_tools(self, chat_id: int) -> tuple[list[dict], dict]:
+        """(schemas, executors) for the transport: static tools (send_to_telegram,
+        show_image, register_tool) + any user-installed dynamic tools. Loaded fresh
+        so a just-installed tool is picked up on the next registration."""
+        schemas = list(TOOL_SCHEMAS)
+        executors = create_tool_executors(self._bot, chat_id, self._file_config)
+        executors["register_tool"] = self._make_register_tool_executor(chat_id)
+        tools_dir = self._host_tools_dir()
+        if tools_dir is not None:
+            for name, t in load_all_tools(tools_dir).items():
+                schemas.append(t["schema"])
+                executors[name] = make_executor(t["execute"], self._bot, chat_id)
+        return schemas, executors
+
+    def _make_register_tool_executor(self, chat_id: int):
+        async def executor(args: dict) -> dict:
+            name = (args or {}).get("name", "")
+            try:
+                return await self.install_and_register_tool(chat_id, name)
+            except Exception as e:  # noqa: BLE001 — tool boundary
+                logger.exception("register_tool failed")
+                return {"error": str(e)}
+        return executor
+
+    async def install_and_register_tool(self, chat_id: int, name: str) -> dict:
+        """Install a drafted tool and re-register it on the live session.
+
+        The agent (confined runner) wrote the draft to tool_drafts/<name>.py in
+        the workspace. The bot (this process — UNCONFINED) copies it into the
+        bot-owned .jaato/host_tools/, validates it by loading, and re-registers
+        host tools so the runner sees it next turn. Runs only AFTER the user
+        approves register_tool (auto_approve=False)."""
+        validate_name(name)
+        tools_dir = self._host_tools_dir()
+        if tools_dir is None:
+            return {"error": "Dynamic tools are disabled (set jaato_ws.host_tools_dir in the bot config)."}
+        workspace = Path(self._ws_config.workspace)
+        draft = workspace / "tool_drafts" / f"{name}.py"
+        if not draft.is_file():
+            return {"error": f"No draft at tool_drafts/{name}.py — write the tool there first."}
+
+        tools_dir.mkdir(parents=True, exist_ok=True)
+        target = tools_dir / f"{name}.py"
+        target.write_text(draft.read_text())
+
+        # Validate by loading (executes the module — trusted now: user-approved).
+        try:
+            load_tool_file(target)
+        except Exception as e:  # noqa: BLE001
+            target.unlink(missing_ok=True)  # roll back a bad install
+            return {"error": f"Tool '{name}' is invalid and was not installed: {e}"}
+
+        meta = self._sessions.get(chat_id)
+        if meta is None:
+            return {"result": f"Installed '{name}'; it will load on your next session."}
+
+        schemas, executors = self._assemble_host_tools(chat_id)
+        await meta.transport.register_host_tools(schemas, TOOL_CATEGORIES, force=True)
+        meta.transport.set_session_tool_executors(meta.session_id, executors)
+        logger.info("Installed + registered dynamic host tool %r for chat %d", name, chat_id)
+        return {"result": f"Installed '{name}'. Call it from your next message."}
 
     def on_session_info_event(self, event: SessionInfoEvent) -> None:
         if self._pending_session_future and not self._pending_session_future.done():

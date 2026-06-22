@@ -78,6 +78,11 @@ class JaatoWSConfig(BaseModel):
     # when `profile`/`agent` name workspace-local definitions. Empty = don't send
     # (server uses its own default workspace).
     workspace: str = ""
+    # Where the bot installs user-approved dynamic host tools (the `register_tool`
+    # feature). MUST be OUTSIDE `workspace` so the AppArmor-confined runner cannot
+    # write/tamper with installed tool code — only the unconfined bot writes here.
+    # Empty = dynamic tools disabled (no hardcoded fallback path).
+    host_tools_dir: str = ""
 
 
 class SessionConfig(BaseModel):
