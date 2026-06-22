@@ -144,14 +144,19 @@ cython_debug/
 *.yaml
 !config.example.yaml
 *.sock
-# jaato workspace: ignore runtime state (sessions, logs, memories, vision,
-# instructions), but track the versioned profile + agent persona. The negations
-# come after *.yaml above so they win for files under these two dirs.
-.jaato/*
-!.jaato/profiles/
-!.jaato/profiles/**
-!.jaato/agents/
-!.jaato/agents/**
+# bot runtime workspace (jaato_ws.workspace = ./runtime): the bot runs each chat
+# session inside ./runtime, so ALL runtime state (sessions, logs, memories,
+# vision, instructions, backups, zhipuai_auth) AND the agent's own file outputs
+# (tool_drafts/, scratch files) land here and are ignored. Only the versioned
+# profile + agent persona under runtime/.jaato/ are tracked. Negations come after
+# *.yaml above so they win for the profile yaml.
+runtime/*
+!runtime/.jaato/
+runtime/.jaato/*
+!runtime/.jaato/profiles/
+!runtime/.jaato/profiles/**
+!runtime/.jaato/agents/
+!runtime/.jaato/agents/**
 
 # User data and workspaces
 workspaces/
