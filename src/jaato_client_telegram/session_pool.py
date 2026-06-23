@@ -171,7 +171,13 @@ class SessionPool:
                     persisted = self._session_store.get(chat_id)
                     if persisted:
                         if persisted in await transport.list_sessions():
+                            # Register the event queue BEFORE attaching so the
+                            # daemon's conversation replay (emit_current_state) is
+                            # captured into the queue, then DRAINED — rather than
+                            # leaking into the response to the user's next message.
+                            transport.register_session(persisted)
                             await transport.attach_session(persisted)
+                            await transport.drain_pending(persisted)
                             session_id = persisted
                             self._last_reattach[chat_id] = True
                             logger.info("Re-attached chat_id %d to session %s", chat_id, session_id)

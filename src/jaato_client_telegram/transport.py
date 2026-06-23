@@ -262,6 +262,29 @@ class WSTransport:
         finally:
             self._session_list_future = None
 
+    async def drain_pending(self, session_id: str, quiet_secs: float = 2.0, max_secs: float = 25.0) -> int:
+        """Discard queued events for a session until none arrives for quiet_secs
+        (or max_secs total elapses). Used right after a re-attach to drop the
+        daemon's conversation REPLAY (emit_current_state, meant for TUI redraw)
+        plus the runner-bootstrap chatter, so that history is NOT re-rendered into
+        the response to the user's next message. Runs before send_message, so it
+        can only ever discard pre-message events, never the new turn's output."""
+        queue = self._session_queues.get(session_id)
+        if queue is None:
+            return 0
+        loop = asyncio.get_running_loop()
+        end = loop.time() + max_secs
+        discarded = 0
+        while loop.time() < end:
+            try:
+                await asyncio.wait_for(queue.get(), timeout=quiet_secs)
+                discarded += 1
+            except asyncio.TimeoutError:
+                break  # quiet for quiet_secs -> replay + bootstrap have settled
+        if discarded:
+            logger.info("drain_pending: discarded %d replay/bootstrap events for %s", discarded, session_id)
+        return discarded
+
     async def attach_session(self, session_id: str) -> None:
         """Attach this connection to an EXISTING daemon session (the daemon loads
         it from disk if it is not resident). Verify existence via
