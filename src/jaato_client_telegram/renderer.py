@@ -91,6 +91,7 @@ class StreamingContext:
     permission_sent: bool = False  # Track if permission UI was sent as separate message
     content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
     last_final_text: str = ""   # Last text sent via send_final_response (dedups repeat TURN_COMPLETED)
+    produced_output: bool = False  # Did this turn render ANY non-empty content to the user?
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
@@ -612,6 +613,17 @@ class ResponseRenderer:
         if not ctx.content_sent:
             await self._edit_or_send(initial_message, ctx)
 
+        # Empty-turn fallback: if the whole turn rendered NO visible content (e.g.
+        # interrupted before any output), the empty-send guards spare us a Telegram
+        # "message text is empty" error — but would leave the user with silence.
+        # Surface a calm notice instead.
+        if not ctx.produced_output:
+            await self._safe_answer(
+                initial_message,
+                "⚠️ I didn't get a response — please try again, or /reset if it persists.",
+                parse_mode=None,
+            )
+
         return ctx
 
     async def _send_with_typing_indicator(
@@ -710,6 +722,8 @@ class ResponseRenderer:
         Instead, new content is sent as separate messages that appear after.
         """
         display_text = ctx.accumulated_text[: self._max_message_length]
+        if display_text.strip():
+            ctx.produced_output = True
 
         # Guard against truly empty messages - Telegram rejects them
         # Check both accumulated_text AND text_buffer
@@ -772,6 +786,7 @@ class ResponseRenderer:
             return
 
         text = streaming_context.accumulated_text
+        streaming_context.produced_output = True
         # Dedup: multi-turn agentic flows fire TURN_COMPLETED more than once (e.g.
         # after a host-tool call like show_image). Without this guard the SAME
         # accumulated text is sent again on the second TURN_COMPLETED — a visible
