@@ -83,12 +83,21 @@ class SessionPool:
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
+        # Whether the most recent get_or_create_session for a chat RE-ATTACHED to
+        # a persisted session (vs created fresh / reused in-memory) — so the
+        # handler can show a "Resumed" cue. Read via took_reattach().
+        self._last_reattach: dict[int, bool] = {}
         if self._session_store:
             logger.info("Session re-attachment enabled (store=%s)", session_store_path)
 
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
         self._file_config = file_config
+
+    def took_reattach(self, chat_id: int) -> bool:
+        """True if the most recent get_or_create_session for this chat RE-ATTACHED
+        to a persisted session (vs created fresh / reused in-memory)."""
+        return self._last_reattach.get(chat_id, False)
 
     def _make_transport(self) -> WSTransport:
         return WSTransport(
@@ -105,6 +114,7 @@ class SessionPool:
         async with self._lock:
             if chat_id in self._sessions:
                 self._sessions[chat_id].last_activity = datetime.now()
+                self._last_reattach[chat_id] = False
                 return self._sessions[chat_id].session_id
 
             if len(self._sessions) >= self._max_concurrent:
@@ -163,6 +173,7 @@ class SessionPool:
                         if persisted in await transport.list_sessions():
                             await transport.attach_session(persisted)
                             session_id = persisted
+                            self._last_reattach[chat_id] = True
                             logger.info("Re-attached chat_id %d to session %s", chat_id, session_id)
                         else:
                             logger.info(
@@ -179,6 +190,7 @@ class SessionPool:
                     session_id = await transport.create_session(session_args)
                     if self._session_store:
                         self._session_store.set(chat_id, session_id)
+                    self._last_reattach[chat_id] = False
                     logger.info("Created session %s for chat_id %d", session_id, chat_id)
 
                 transport.register_session(session_id)

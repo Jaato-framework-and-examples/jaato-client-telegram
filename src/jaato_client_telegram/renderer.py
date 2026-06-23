@@ -444,7 +444,21 @@ class ResponseRenderer:
                 # System message - add to output
                 msg = getattr(event, "message", "")
                 style = getattr(event, "style", "info")
-                
+
+                # Swallow session-bootstrap chatter the daemon re-emits on EVERY
+                # session create/restore ("Session created", "Connected to ...",
+                # "Attached to session", the API-key notice, "Loading plugins").
+                # It's internal noise that makes a *resumed* conversation look
+                # brand-new; the handler shows its own "Resumed" cue instead.
+                # Errors/warnings (non-info styles) always render.
+                if msg and style in ("info", "success") and any(
+                    m in msg for m in (
+                        "Session created", "Attached to session", "Connected to ",
+                        "API key", "Initializing", "Loading plugins",
+                    )
+                ):
+                    msg = ""
+
                 if msg:
                     # Format based on style
                     if style == "error":

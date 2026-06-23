@@ -130,6 +130,11 @@ async def handle_private_message(
 
             session_id = await pool.get_or_create_session(chat_id)
 
+            if pool.took_reattach(chat_id):
+                await message.answer(
+                    "🔄 Resumed your previous conversation.", parse_mode=None
+                )
+
             logger.debug(f"User {chat_id}: session_id = {session_id}")
 
             # Send user message to jaato
@@ -276,6 +281,10 @@ async def handle_private_media(
             attachments = _build_image_attachments(data, mime_type, name)
 
             session_id = await pool.get_or_create_session(chat_id)
+            if pool.took_reattach(chat_id):
+                await message.answer(
+                    "🔄 Resumed your previous conversation.", parse_mode=None
+                )
             await pool.send_message(session_id, caption, attachments=attachments)
             await renderer.stream_response(
                 initial_message=message,
