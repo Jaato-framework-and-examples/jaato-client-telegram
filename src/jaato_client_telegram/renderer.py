@@ -79,6 +79,14 @@ def escape_html_content(text: str) -> str:
     return escaped
 
 
+# If the runner goes completely silent for this long mid-turn — no events at all —
+# the session is treated as stalled (e.g. a stuck/broken re-attach) so the bot can
+# surface a clear error and self-heal instead of hanging forever. Generous on
+# purpose: a healthy first response (runner re-spawn + first token) arrives well
+# inside this, and any active turn keeps emitting events that reset the timer.
+_STALL_TIMEOUT_SECS = 120.0
+
+
 @dataclass
 class StreamingContext:
     """State for edit-in-place streaming of responses."""
@@ -92,6 +100,7 @@ class StreamingContext:
     content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
     last_final_text: str = ""   # Last text sent via send_final_response (dedups repeat TURN_COMPLETED)
     produced_output: bool = False  # Did this turn render ANY non-empty content to the user?
+    stalled: bool = False  # Did the stream go silent (no events) past the stall timeout?
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
@@ -240,7 +249,21 @@ class ResponseRenderer:
 
         init_progress_count = 0
         
-        async for event in event_stream:
+        event_iter = event_stream.__aiter__()
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    event_iter.__anext__(), timeout=_STALL_TIMEOUT_SECS
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "stream_response: no event for %.0fs — treating session as stalled",
+                    _STALL_TIMEOUT_SECS,
+                )
+                ctx.stalled = True
+                break
+            except StopAsyncIteration:
+                break
             # Get event type - handle both enum and string
             event_type = getattr(event, "type", None)
             # Convert enum to string if needed
@@ -617,7 +640,7 @@ class ResponseRenderer:
         # interrupted before any output), the empty-send guards spare us a Telegram
         # "message text is empty" error — but would leave the user with silence.
         # Surface a calm notice instead.
-        if not ctx.produced_output:
+        if not ctx.produced_output and not ctx.stalled:
             await self._safe_answer(
                 initial_message,
                 "⚠️ I didn't get a response — please try again, or /reset if it persists.",

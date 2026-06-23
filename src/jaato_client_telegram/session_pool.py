@@ -379,6 +379,17 @@ class SessionPool:
                 except Exception:
                     logger.exception("Error disconnecting transport for chat_id %d", chat_id)
 
+    async def forget_session(self, chat_id: int) -> None:
+        """Drop a chat's session entirely: disconnect + remove from the pool AND
+        forget the persisted re-attach mapping, so the NEXT message starts a FRESH
+        session. Used to self-heal from a stalled/stuck session (e.g. a broken
+        re-attach that never produced a response)."""
+        await self.remove_client(chat_id)
+        if self._session_store:
+            self._session_store.remove(chat_id)
+        self._last_reattach.pop(chat_id, None)
+        logger.info("Forgot session for chat_id %d (stall recovery)", chat_id)
+
     async def _evict_oldest(self) -> None:
         if not self._sessions:
             return

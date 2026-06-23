@@ -141,10 +141,20 @@ async def handle_private_message(
             await pool.send_message(session_id, user_text)
 
             # Stream response events and render progressively
-            await renderer.stream_response(
+            ctx = await renderer.stream_response(
                 initial_message=message,
                 event_stream=await pool.events(session_id),
             )
+            if ctx.stalled:
+                # The runner went silent (e.g. a broken/stuck re-attach). Tell the
+                # user plainly and forget the session so the NEXT message starts a
+                # fresh one instead of re-attaching the stuck one again.
+                await message.answer(
+                    "⚠️ The session stopped responding — I've reset it. "
+                    "Please resend your message.",
+                    parse_mode=None,
+                )
+                await pool.forget_session(chat_id)
 
         except Exception as e:
             logger.exception(f"Error handling message from chat_id {chat_id}")
@@ -286,10 +296,20 @@ async def handle_private_media(
                     "🔄 Resumed your previous conversation.", parse_mode=None
                 )
             await pool.send_message(session_id, caption, attachments=attachments)
-            await renderer.stream_response(
+            ctx = await renderer.stream_response(
                 initial_message=message,
                 event_stream=await pool.events(session_id),
             )
+            if ctx.stalled:
+                # The runner went silent (e.g. a broken/stuck re-attach). Tell the
+                # user plainly and forget the session so the NEXT message starts a
+                # fresh one instead of re-attaching the stuck one again.
+                await message.answer(
+                    "⚠️ The session stopped responding — I've reset it. "
+                    "Please resend your message.",
+                    parse_mode=None,
+                )
+                await pool.forget_session(chat_id)
         except Exception as e:
             # Covers download failures and model-turn errors (e.g. a PDF with
             # too many pages for the vision model). Friendly + file-aware; the
