@@ -665,6 +665,8 @@ class ResponseRenderer:
         "fallback" re-sends as HTML, hits the same parse error, and (unwrapped)
         raises out to the caller.
         """
+        if not (text and text.strip()):
+            return None  # Telegram rejects empty text ("message text is empty")
         if not parse_mode:
             m = await target.answer(text, parse_mode=None, **kwargs)
         else:
@@ -684,6 +686,8 @@ class ResponseRenderer:
     async def _safe_edit(self, msg: Message, text: str) -> None:
         """edit_text() that falls back to plain text on HTML parse errors and
         silently ignores 'message is not modified'."""
+        if not (text and text.strip()):
+            return  # never edit to empty text ("message text is empty")
         try:
             await msg.edit_text(text, parse_mode="HTML")
         except TelegramBadRequest as e:
