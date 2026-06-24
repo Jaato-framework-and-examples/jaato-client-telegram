@@ -21,6 +21,7 @@ Development notes, design documents, and implementation details for jaato-client
 | [file-sharing.md](features/file-sharing.md) | File upload/download between users and the agent via Telegram |
 | [file-watching.md](features/file-watching.md) | Watching workspace files for changes and notifying users |
 | [file-watching-sharing-summary.md](features/file-watching-sharing-summary.md) | Combined summary of file watching and sharing implementation |
+| [host-tools.md](features/host-tools.md) | Host tools & self-extension: built-in + agent-built dynamic tools, the contract, single-poller rule, example tools |
 | [permission-approval-ui.md](features/permission-approval-ui) | Inline keyboard UI for approving or denying agent permission requests |
 | [presentation-context.md](features/presentation-context.md) | How presentation context is integrated into agent responses |
 | [service-checklist.md](features/service-checklist.md) | Deterministic session-startup service checklist (prefetch + manifest) keeping host-tool services up |

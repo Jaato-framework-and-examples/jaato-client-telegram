@@ -1,0 +1,6 @@
+[
+  {
+    "tool": "approval_webhook",
+    "args": { "action": "start" }
+  }
+]
