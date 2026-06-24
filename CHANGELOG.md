@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Session-startup service checklist: a per-agent service manifest is checked/started at the start of every session via a deterministic prefetch (`{{!py:scripts/service_checklist.py}}`), keeping host-tool services (e.g. the approval webhook) running without relying on the model. See [docs/features/service-checklist.md](docs/features/service-checklist.md)
+- `service_manifest` built-in host tool (`add`/`remove`/`list`) for maintaining the session-startup service manifest
 - JAATO_TRACE_LOG environment variable support (jaato-sdk client standard)
 - File-based logging when JAATO_TRACE_LOG is set and non-empty
 - Console message indicating log file location when using file logging

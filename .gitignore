@@ -157,6 +157,12 @@ runtime/.jaato/*
 !runtime/.jaato/profiles/**
 !runtime/.jaato/agents/
 !runtime/.jaato/agents/**
+# prefetch scripts are code referenced by the tracked personas (e.g. a mandatory
+# {{!py:scripts/...}} directive) — they must travel with the agent definition.
+# (service_manifest.json stays ignored: it's mutable runtime state, host-tool-managed.)
+!runtime/.jaato/scripts/
+!runtime/.jaato/scripts/**
+runtime/.jaato/scripts/**/__pycache__/
 
 # User data and workspaces
 workspaces/

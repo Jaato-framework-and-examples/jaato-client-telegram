@@ -27,6 +27,8 @@ The agent logic, tool execution, plugins, and permissions all remain in the jaat
 - **🆃 Expandable content** - Wide tool outputs (JSON, code, tables) automatically collapsed for mobile
 - **🆃 Presentation awareness** - Agent adapts output format based on Telegram's constraints
 - **🛡️ Rate limiting** - Token bucket algorithm to prevent abuse with per-user limits and admin bypass
+- **🔧 Self-extending tools** - The agent builds new host tools on request via `register_tool`; core tools (`send_to_telegram`, `show_image`, `register_tool`, `service_manifest`) ship as fixed built-ins
+- **🔧 Session-startup services** - A per-agent manifest of host tools is checked/started at the start of every session via a deterministic prefetch checklist, keeping long-running services (e.g. the approval webhook) up without relying on the model to remember (see [docs/features/service-checklist.md](docs/features/service-checklist.md))
 
 ## Architecture
 
@@ -475,6 +477,8 @@ jaato-client-telegram/
     ├── config.py               # Configuration model
     ├── bot.py                  # Bot & dispatcher setup
     ├── session_pool.py         # Per-user SDK client management
+    ├── host_tools.py           # Built-in host tools (send_to_telegram, show_image, register_tool, service_manifest)
+    ├── host_tool_loader.py     # Loader for agent-installed dynamic host tools
     ├── workspace.py            # Per-user workspace isolation
     ├── renderer.py             # Response streaming & formatting
     └── handlers/

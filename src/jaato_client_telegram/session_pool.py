@@ -25,7 +25,9 @@ from jaato_sdk.events import (
     StagedFileSpec,
 )
 
-from jaato_client_telegram.host_tools import TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors
+from jaato_client_telegram.host_tools import (
+    TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors, make_service_manifest_executor,
+)
 from jaato_client_telegram.host_tool_loader import load_all_tools, make_executor, validate_name, load_tool_file
 from jaato_client_telegram.transport import WSTransport
 from jaato_client_telegram.chat_session_store import ChatSessionStore
@@ -251,6 +253,7 @@ class SessionPool:
         schemas = list(TOOL_SCHEMAS)
         executors = create_tool_executors(self._bot, chat_id, self._file_config)
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
+        executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
             for name, t in load_all_tools(tools_dir).items():

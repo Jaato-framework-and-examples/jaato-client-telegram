@@ -23,6 +23,7 @@ Development notes, design documents, and implementation details for jaato-client
 | [file-watching-sharing-summary.md](features/file-watching-sharing-summary.md) | Combined summary of file watching and sharing implementation |
 | [permission-approval-ui.md](features/permission-approval-ui) | Inline keyboard UI for approving or denying agent permission requests |
 | [presentation-context.md](features/presentation-context.md) | How presentation context is integrated into agent responses |
+| [service-checklist.md](features/service-checklist.md) | Deterministic session-startup service checklist (prefetch + manifest) keeping host-tool services up |
 | [workspace-isolation.md](features/workspace-isolation.md) | Per-user workspace isolation to keep sessions separate |
 
 ## Bug Fixes

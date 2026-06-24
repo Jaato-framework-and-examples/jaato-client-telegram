@@ -115,6 +115,40 @@ TOOL_SCHEMAS = [
         # NOT auto-approved: the user must approve running new executable code.
         "auto_approve": False,
     },
+    {
+        "name": "service_manifest",
+        "description": (
+            "Maintain the session-startup service manifest: the list of host tools "
+            "that should be ensured-running at the start of every session. The "
+            "service_checklist prefetch renders this list into your prompt each "
+            "session, so you start/health-check each entry on your first turn. "
+            "action='add' registers a tool + the args to invoke it with at startup "
+            "(replaces any existing entry for that tool); 'remove' drops a tool; "
+            "'list' returns the current manifest. Example: service_manifest("
+            "action='add', tool='approval_webhook', args={'action': 'start'})."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "remove", "list"]},
+                "tool": {
+                    "type": "string",
+                    "description": "Host tool name to invoke at session start (required for add/remove).",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Arguments to invoke the tool with at session start, "
+                    "e.g. {\"action\": \"start\"}. Used by 'add'; defaults to {}.",
+                },
+            },
+            "required": ["action"],
+        },
+        "category": "telegram",
+        "timeout": 30000,
+        # Edits bot-owned config (a JSON manifest of already-installed, trusted
+        # tools) — not new executable code — so no per-call approval needed.
+        "auto_approve": True,
+    },
 ]
 
 TOOL_CATEGORIES = {
@@ -130,6 +164,59 @@ def create_tool_executors(bot, chat_id: int, file_config) -> dict:
         "telegram_notify": send_exec,
         "show_image": show_exec,
     }
+
+
+def make_service_manifest_executor(workspace: "str | None"):
+    """Executor for the ``service_manifest`` built-in.
+
+    Maintains ``<workspace>/.jaato/service_manifest.json`` — the deterministic
+    list of ``{tool, args}`` invocation specs the ``service_checklist`` prefetch
+    reads at session-prep. The manifest lives in the workspace .jaato/ (NOT the
+    host_tools_dir, which is outside the workspace where the runner-confined
+    prefetch can't read it); closes over the configured workspace path.
+    """
+    def _path() -> Path:
+        if not workspace:
+            raise RuntimeError("workspace not configured (set jaato_ws.workspace)")
+        return Path(workspace) / ".jaato" / "service_manifest.json"
+
+    def _load(path: Path) -> list:
+        return json.loads(path.read_text() or "[]") if path.is_file() else []
+
+    def _save(path: Path, entries: list) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entries, indent=2) + "\n")
+
+    async def executor(args: dict) -> dict:
+        args = args or {}
+        action = args.get("action")
+        try:
+            path = _path()
+            entries = _load(path)
+            if action == "list":
+                return {"manifest": entries, "count": len(entries)}
+            if action == "add":
+                tool = args.get("tool")
+                if not tool:
+                    return {"error": "add requires 'tool'"}
+                invoke_args = args.get("args") or {}
+                entries = [e for e in entries if e.get("tool") != tool]  # replace
+                entries.append({"tool": tool, "args": invoke_args})
+                _save(path, entries)
+                return {"ok": True, "added": {"tool": tool, "args": invoke_args}, "manifest": entries}
+            if action == "remove":
+                tool = args.get("tool")
+                if not tool:
+                    return {"error": "remove requires 'tool'"}
+                remaining = [e for e in entries if e.get("tool") != tool]
+                _save(path, remaining)
+                return {"ok": True, "removed": tool, "manifest": remaining}
+            return {"error": f"unknown action {action!r}; use add/remove/list"}
+        except Exception as e:
+            logger.exception("service_manifest failed")
+            return {"error": str(e)}
+
+    return executor
 
 
 def make_send_to_telegram_executor(
