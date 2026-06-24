@@ -248,6 +248,12 @@ class ResponseRenderer:
         ctx.last_edit_time = time.monotonic()
 
         init_progress_count = 0
+        # On re-attach the daemon emits AGENT_STATUS_CHANGED "idle" during the restore
+        # (the restored agent is idle BEFORE the user's turn runs). Treating that
+        # pre-turn idle as turn-complete makes the renderer exit before the real
+        # response is generated. Only honor done/idle once the turn has actually
+        # started ("active" status, or model output).
+        turn_started = False
         
         event_iter = event_stream.__aiter__()
         while True:
@@ -314,6 +320,9 @@ class ResponseRenderer:
                     # Don't use _edit_or_send - we want new messages, not edits
                 # Buffer model output for later display
                 elif source == "model" and mode in ("write", "append"):
+                    # Model output means the user's turn is underway — a backup to the
+                    # "active" status for gating the done/idle exit on re-attach.
+                    turn_started = True
                     # Process semantic markup tags first, then escape remaining HTML
                     rendered = render_semantic_markup(content)
                     if rendered != content:
@@ -401,17 +410,24 @@ class ResponseRenderer:
                 status = getattr(event, "status", "")
                 log.debug(f"Agent status changed: {status}")
 
-                if status in ("done", "idle"):
-                    # Main agent finished processing - flush and exit
-                    # "done" = agent completed all work
-                    # "idle" = agent waiting for next user input
-                    # Both mean the current response is complete
-                    log.debug(f"Agent finished with status={status}, flushing buffers and completing stream")
-                    self._flush_all_buffers(ctx)
-                    await self._edit_or_send(initial_message, ctx)
-                    ctx.content_sent = True
-                    break
-                # Ignore "active" status - that's the start signal
+                if status == "active":
+                    # The user's turn has started; a subsequent done/idle is real.
+                    turn_started = True
+                elif status in ("done", "idle"):
+                    if not turn_started:
+                        # Pre-turn idle emitted by a re-attach restore (the restored
+                        # agent is idle before the user's turn runs). Ignore it and
+                        # keep streaming — the real turn starts with "active" next.
+                        log.debug("Ignoring pre-turn status=%s (turn not started yet)", status)
+                    else:
+                        # Main agent finished processing - flush and exit
+                        # "done" = agent completed all work
+                        # "idle" = agent waiting for next user input
+                        log.debug(f"Agent finished with status={status}, flushing buffers and completing stream")
+                        self._flush_all_buffers(ctx)
+                        await self._edit_or_send(initial_message, ctx)
+                        ctx.content_sent = True
+                        break
 
             elif event_type == EventType.INIT_PROGRESS:
                 # Initialization progress - show to user with in-place updates
