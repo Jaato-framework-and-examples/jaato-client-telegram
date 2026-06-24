@@ -261,7 +261,11 @@ async def handle_host_tool_callback(query: CallbackQuery) -> None:
         logger.debug("host-tool callback answer failed", exc_info=True)
     note = f"✅ You chose: {chosen}" if matched else "⏱️ This request already expired."
     try:
-        base = (query.message.text or query.message.caption or "") if query.message else ""
+        # html_text (not text) preserves the arrival message's HTML formatting —
+        # <pre>/<code> code blocks, etc. — instead of flattening to plain text on the
+        # edit. The bot's default parse_mode is HTML, so re-rendering the html base
+        # restores the original look, with only the buttons removed + the choice noted.
+        base = (query.message.html_text or query.message.caption or "") if query.message else ""
         await query.message.edit_text(f"{base}\n\n{note}", reply_markup=None)
     except Exception:
         logger.debug("host-tool callback edit failed", exc_info=True)
