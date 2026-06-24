@@ -25,8 +25,8 @@ async def cmd_start(message: Message, pool: SessionPool) -> None:
     chat_id = message.chat.id
 
     try:
-        # Ensure client exists (triggers connection if needed)
-        await pool.get_client(chat_id)
+        # Ensure a session exists (creates/re-attaches + connects if needed)
+        await pool.get_or_create_session(chat_id)
 
         await message.answer(
             "✅ Connected to jaato!\n\n"
@@ -52,7 +52,10 @@ async def cmd_reset(message: Message, pool: SessionPool) -> None:
     """
     chat_id = message.chat.id
 
-    await pool.remove_client(chat_id)
+    # forget_session (not remove_client) so the persisted re-attach mapping is
+    # ALSO dropped — otherwise the next message would re-attach the same session
+    # and /reset wouldn't actually start fresh.
+    await pool.forget_session(chat_id)
 
     await message.answer(
         "🔄 Session reset.\n\n"
