@@ -113,9 +113,27 @@ class SessionPool:
     async def get_or_create_session(self, chat_id: int) -> str:
         async with self._lock:
             if chat_id in self._sessions:
-                self._sessions[chat_id].last_activity = datetime.now()
-                self._last_reattach[chat_id] = False
-                return self._sessions[chat_id].session_id
+                meta = self._sessions[chat_id]
+                # Only reuse the cached session if its daemon connection is alive.
+                # If the daemon dropped the WS, transport.connected flips to False
+                # (set in _receiver_loop's finally on ConnectionClosed), and reusing
+                # it would raise "Not connected" on every send — leaving the bot
+                # stuck until restart. Drop the dead session inline (we hold
+                # self._lock, so we can't call remove_client) and fall through to
+                # re-create/re-attach, so the bot auto-recovers on the next message.
+                if meta.transport.connected:
+                    meta.last_activity = datetime.now()
+                    self._last_reattach[chat_id] = False
+                    return meta.session_id
+                logger.info(
+                    "chat_id %d: cached session %s transport is dead — recreating",
+                    chat_id, meta.session_id,
+                )
+                self._sessions.pop(chat_id, None)
+                try:
+                    await meta.transport.disconnect()
+                except Exception:
+                    logger.debug("disconnect of dead transport failed", exc_info=True)
 
             if len(self._sessions) >= self._max_concurrent:
                 await self._evict_oldest()
