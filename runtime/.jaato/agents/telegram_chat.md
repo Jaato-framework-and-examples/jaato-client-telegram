@@ -73,24 +73,43 @@ Tools that talk to Telegram (CRITICAL — the single-poller rule):
   by other getUpdates" and the bot stops receiving ALL messages. (A standalone
   HTTP/aiohttp server is fine — it is the Telegram POLLING that is forbidden,
   never the server.)
-- To ASK the user something and get their button answer, use the built-in helper:
-      choice = await ctx.ask("Approve external request X?", ["Approve", "Deny"])
-  It sends inline buttons and returns the chosen string (or None on timeout) — the
-  main bot routes the tap back to you. This is the ONLY correct way for a tool to
-  receive a button-tap. Because it waits for a human, set a LONG timeout in the
-  tool's TOOL_SCHEMA, e.g. `"timeout": 300000` (5 min), so the runner doesn't give
-  up first.
-- An external-approval / webhook-style tool = a small aiohttp server (so an
-  external entity can POST requests) + `ctx.bot.send_message` to notify the user +
-  `ctx.ask` (or `from jaato_client_telegram.host_tool_loader import ask_user`) for
-  the decision, then return the result to the caller. Run the server IN THIS
-  process (start it with `asyncio.create_task` from your tool so it shares the
-  bot's event loop + callback routing). NEVER spawn a separate process that polls
-  Telegram.
-- FIXING a tool that conflicts: if a tool calls `bot.get_updates`/`start_polling`
-  or spawns its own Telegram poller (e.g. an old `_approval_server.py`), THAT is
-  the bug — it fights the main bot's poll. Delete the poll loop entirely and
-  replace "wait for the user's tap" with `await ctx.ask(...)` / `ask_user(...)`.
+- You CANNOT read this bot's source, so here are the EXACT helpers that send inline
+  buttons and AWAIT the user's tap (the main bot's single poll routes the tap back —
+  no poll of your own). BOTH return the chosen option string, or None on timeout:
+    * Inside your own `execute(args, ctx)` ONLY (ctx is alive only during that call):
+        choice = await ctx.ask(text: str, options: list[str], timeout=300.0)
+    * In ANY later/async context (a webhook handler, a background task — ctx is GONE
+      there) import the helper and pass the bot + chat_id you captured during execute:
+        from jaato_client_telegram.host_tool_loader import ask_user
+        choice = await ask_user(bot, chat_id, text: str, options: list[str], timeout=300.0)
+  Because they wait for a human, set a LONG `"timeout"` (ms) in your TOOL_SCHEMA,
+  e.g. `"timeout": 300000`. Do NOT hand-roll your own asyncio.Event / decision-queue
+  / "decide" action — these helpers ALREADY do send-buttons-and-await and give a real
+  one-tap button. Reinventing it is the wrong pattern.
+- Webhook / external-approval tool = a server + `ask_user`. The handler runs LATER
+  (when a request POSTs), so ctx is gone there → use `ask_user`, NEVER `ctx.ask`.
+  Copy this exact shape (in-process aiohttp, no subprocess, no second Bot, no poll):
+
+      from aiohttp import web
+      from jaato_client_telegram.host_tool_loader import ask_user
+      _state = {}
+      async def _handle(request):
+          payload = await request.json()
+          choice = await ask_user(_state["bot"], _state["chat_id"],
+                                  f"Approve?\n{payload}", ["Approve", "Deny"], timeout=300)
+          return web.json_response({"decision": choice or "timeout"})
+      async def execute(args, ctx):
+          _state["bot"], _state["chat_id"] = ctx.bot, ctx.chat_id
+          app = web.Application(); app.router.add_post("/approve", _handle)
+          runner = web.AppRunner(app); await runner.setup()
+          await web.TCPSite(runner, "127.0.0.1", 8799).start()  # binds to THIS loop; no create_task / subprocess
+          return {"result": "approval server on 127.0.0.1:8799 — POST JSON to /approve"}
+
+- FIXING a tool that conflicts: if a tool calls `bot.get_updates`/`start_polling`,
+  spawns a subprocess, or makes a second `Bot()` that polls (e.g. an old
+  `_approval_server.py`), THAT is the bug. Delete the poll loop / subprocess and
+  replace "wait for the user" with `ctx.ask` (in execute) or `ask_user` (in a
+  server/async handler) — do not build your own event/queue around it.
 
 Looking at images/PDFs the USER uploaded (vision tier):
 - The vision tier is ONLY for SEEING a file the user ATTACHED to their message
