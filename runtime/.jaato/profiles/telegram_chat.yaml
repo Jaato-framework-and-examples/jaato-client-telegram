@@ -20,7 +20,13 @@ apparmor: true
 # from the GPG `pass` store via the pass:// secret URI in plugin_configs below
 # (the daemon resolves it; the key is never inlined here).
 model_tiers:
-  executor: glm-5-turbo
+  # Pin the provider explicitly: switching BACK from a tier that set its own
+  # provider (vision -> openrouter) would otherwise inherit openrouter and try the
+  # non-existent openrouter/glm-5-turbo (404), failing enter_tier('executor') and
+  # hanging the turn. Each tier names its own provider, like vision does.
+  executor:
+    model: glm-5-turbo
+    provider: zhipuai
   vision:
     model: google/gemini-2.5-flash
     provider: openrouter
