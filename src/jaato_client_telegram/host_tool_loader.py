@@ -26,16 +26,78 @@ gate first. Files already in ``.jaato/host_tools/`` are trusted (bot-owned; the
 confined runner cannot write there) and are loaded at startup without re-prompt.
 """
 
+import asyncio
 import importlib.util
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+
+
+# --- Single-poller-safe user prompts -----------------------------------------
+# Pending ctx.ask()/ask_user() requests: request_id -> Future[int] (chosen option
+# index). This registry lives in the bot process, where the dynamic-tool executors
+# AND the main bot's callback_query router both run — so the ONE getUpdates poll
+# Telegram allows (owned by the main bot) can resolve a tool's await. A tool must
+# NEVER run its own poller (bot.get_updates / start_polling): two pollers on one
+# token => TelegramConflictError and the whole bot stops receiving messages.
+_HOST_CB_PREFIX = "host:"
+_PENDING_ASKS: "dict[str, asyncio.Future[int]]" = {}
+
+
+def resolve_host_ask(callback_data: str) -> bool:
+    """Resolve a pending ask from a ``host:<id>:<index>`` callback. Returns True
+    iff it matched a live request. Called by the main bot's callback_query router
+    (the single poller) — this is what lets a tool receive a button tap without
+    polling itself."""
+    if not callback_data or not callback_data.startswith(_HOST_CB_PREFIX):
+        return False
+    try:
+        _, req_id, idx = callback_data.split(":", 2)
+        index = int(idx)
+    except (ValueError, AttributeError):
+        return False
+    fut = _PENDING_ASKS.get(req_id)
+    if fut is not None and not fut.done():
+        fut.set_result(index)
+        return True
+    return False
+
+
+async def ask_user(
+    bot: Any, chat_id: int, text: str, options: list[str], timeout: float = 300.0,
+) -> "str | None":
+    """Send a single-choice question with inline buttons and AWAIT the answer —
+    WITHOUT polling. The main bot's single getUpdates poll routes the button tap
+    back here and resolves the await. Returns the chosen option string, or None on
+    timeout. Use this (or ``ctx.ask``) from a tool or from an in-process server a
+    tool starts. NEVER call ``bot.get_updates`` / start a second poller instead —
+    that conflicts with the main bot."""
+    if not options:
+        raise ValueError("ask_user requires at least one option")
+    req_id = uuid.uuid4().hex[:12]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(opt)[:60], callback_data=f"{_HOST_CB_PREFIX}{req_id}:{i}")]
+        for i, opt in enumerate(options)
+    ])
+    fut: "asyncio.Future[int]" = asyncio.get_running_loop().create_future()
+    _PENDING_ASKS[req_id] = fut
+    try:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+        index = await asyncio.wait_for(fut, timeout=timeout)
+        return options[index] if 0 <= index < len(options) else None
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        _PENDING_ASKS.pop(req_id, None)
 
 
 @dataclass
@@ -43,6 +105,14 @@ class ToolContext:
     """Runtime context handed to a dynamic tool's ``execute(args, ctx)``."""
     bot: Any
     chat_id: int
+
+    async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
+        """Ask the user a single-choice question (inline buttons) and await their
+        answer, routed through the main bot's single poll — NO polling of your own.
+        Returns the chosen option string, or None on timeout. Set a matching long
+        ``"timeout"`` (ms) in your tool's TOOL_SCHEMA so the runner waits for the
+        human rather than giving up at the 30s default."""
+        return await ask_user(self.bot, self.chat_id, text, options, timeout)
 
 
 def validate_name(name: str) -> None:

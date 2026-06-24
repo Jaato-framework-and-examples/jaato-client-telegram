@@ -13,6 +13,7 @@ from aiogram.types import CallbackQuery
 from jaato_client_telegram.permissions import PermissionHandler, format_tool_params
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.host_tool_loader import resolve_host_ask
 
 
 logger = logging.getLogger(__name__)
@@ -233,4 +234,35 @@ async def handle_permission_callback(
 
     # Remove pending permission
     permission_handler.remove_pending(chat_id)
+
+
+def _is_host_tool_callback(callback_query: CallbackQuery) -> bool:
+    """A dynamic host tool's ctx.ask()/ask_user() button (host:<id>:<index>)."""
+    return bool(callback_query.data) and callback_query.data.startswith("host:")
+
+
+@router.callback_query(_is_host_tool_callback)
+async def handle_host_tool_callback(query: CallbackQuery) -> None:
+    """Resolve a dynamic tool's ctx.ask()/ask_user() — the single-poller-safe way
+    for a tool to receive a user button-tap, instead of the tool running its own
+    getUpdates poll (which conflicts with the main bot's poll and stops it from
+    receiving any messages)."""
+    matched = resolve_host_ask(query.data or "")
+    # Find the tapped button's label to confirm the choice on the message.
+    chosen = None
+    if query.message and query.message.reply_markup:
+        for row in query.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == query.data:
+                    chosen = btn.text
+    try:
+        await query.answer("Got it" if matched else "Expired")
+    except Exception:
+        logger.debug("host-tool callback answer failed", exc_info=True)
+    note = f"✅ You chose: {chosen}" if matched else "⏱️ This request already expired."
+    try:
+        base = (query.message.text or query.message.caption or "") if query.message else ""
+        await query.message.edit_text(f"{base}\n\n{note}", reply_markup=None)
+    except Exception:
+        logger.debug("host-tool callback edit failed", exc_info=True)
 

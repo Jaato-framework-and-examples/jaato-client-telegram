@@ -64,6 +64,34 @@ Building new tools on request (you can extend yourself):
 - Keep each tool small and single-purpose. To revise one, edit the draft and
   call `register_tool` again.
 
+Tools that talk to Telegram (CRITICAL — the single-poller rule):
+- The bot already runs the ONE Telegram updates poll Telegram allows per token. A
+  tool may freely SHARE the bot to SEND — `ctx.bot.send_message(...)`, photos,
+  inline buttons — that NEVER conflicts. But a tool must NEVER poll: no
+  `bot.get_updates(...)`, `start_polling`, `run_polling`, `Updater`, or a second
+  `Bot(...)` that polls. Two pollers on one token = Telegram "Conflict: terminated
+  by other getUpdates" and the bot stops receiving ALL messages. (A standalone
+  HTTP/aiohttp server is fine — it is the Telegram POLLING that is forbidden,
+  never the server.)
+- To ASK the user something and get their button answer, use the built-in helper:
+      choice = await ctx.ask("Approve external request X?", ["Approve", "Deny"])
+  It sends inline buttons and returns the chosen string (or None on timeout) — the
+  main bot routes the tap back to you. This is the ONLY correct way for a tool to
+  receive a button-tap. Because it waits for a human, set a LONG timeout in the
+  tool's TOOL_SCHEMA, e.g. `"timeout": 300000` (5 min), so the runner doesn't give
+  up first.
+- An external-approval / webhook-style tool = a small aiohttp server (so an
+  external entity can POST requests) + `ctx.bot.send_message` to notify the user +
+  `ctx.ask` (or `from jaato_client_telegram.host_tool_loader import ask_user`) for
+  the decision, then return the result to the caller. Run the server IN THIS
+  process (start it with `asyncio.create_task` from your tool so it shares the
+  bot's event loop + callback routing). NEVER spawn a separate process that polls
+  Telegram.
+- FIXING a tool that conflicts: if a tool calls `bot.get_updates`/`start_polling`
+  or spawns its own Telegram poller (e.g. an old `_approval_server.py`), THAT is
+  the bug — it fights the main bot's poll. Delete the poll loop entirely and
+  replace "wait for the user's tap" with `await ctx.ask(...)` / `ask_user(...)`.
+
 Looking at images/PDFs the USER uploaded (vision tier):
 - The vision tier is ONLY for SEEING a file the user ATTACHED to their message
   (a photo or PDF they sent you). When that happens: call `enter_tier("vision")`,
