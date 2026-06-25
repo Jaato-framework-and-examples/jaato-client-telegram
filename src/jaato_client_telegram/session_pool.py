@@ -28,7 +28,10 @@ from jaato_sdk.events import (
 from jaato_client_telegram.host_tools import (
     TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors, make_service_manifest_executor,
 )
-from jaato_client_telegram.host_tool_loader import load_all_tools, make_executor, validate_name, load_tool_file
+from jaato_client_telegram.host_tool_loader import (
+    load_all_tools, make_executor, validate_name, load_tool_file,
+    mark_user_installed, USER_INSTALLED_TAG,
+)
 from jaato_client_telegram.transport import WSTransport
 from jaato_client_telegram.chat_session_store import ChatSessionStore
 
@@ -257,7 +260,10 @@ class SessionPool:
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
             for name, t in load_all_tools(tools_dir).items():
-                schemas.append(t["schema"])
+                # Fix B: tag dynamically-installed tools so the model never
+                # mistakes them for built-ins present at bootstrap (see
+                # mark_user_installed). Static host tools above stay unmarked.
+                schemas.append(mark_user_installed(t["schema"]))
                 executors[name] = make_executor(t["execute"], self._bot, chat_id)
         return schemas, executors
 
@@ -301,13 +307,23 @@ class SessionPool:
 
         meta = self._sessions.get(chat_id)
         if meta is None:
-            return {"result": f"Installed '{name}'; it will load on your next session."}
+            return {"result": (
+                f"Installed '{name}' as a user-installed tool (new — not a built-in); "
+                f"it will load on your next session."
+            )}
 
         schemas, executors = self._assemble_host_tools(chat_id)
         await meta.transport.register_host_tools(schemas, TOOL_CATEGORIES, force=True)
         meta.transport.set_session_tool_executors(meta.session_id, executors)
         logger.info("Installed + registered dynamic host tool %r for chat %d", name, chat_id)
-        return {"result": f"Installed '{name}'. Call it from your next message."}
+        # Fix A: state the temporal fact in the result the model reads, so it does
+        # not later confabulate this tool as a built-in present at session start.
+        return {"result": (
+            f"Installed '{name}' — a NEW tool you just created in THIS session; it "
+            f"did not exist before now. It is in your tool list (tagged "
+            f"'{USER_INSTALLED_TAG}'); call it on your next turn. Do not describe it "
+            f"as a built-in — you created it."
+        )}
 
     def on_session_info_event(self, event: SessionInfoEvent) -> None:
         if self._pending_session_future and not self._pending_session_future.done():

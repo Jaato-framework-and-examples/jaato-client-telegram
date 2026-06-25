@@ -172,6 +172,31 @@ def make_executor(
     return executor
 
 
+# Provenance marker for tools a user installed at runtime via register_tool.
+# The runner-tier model only reliably reads name/description/parameters from a
+# tool schema — category/timeout/auto_approve are stripped server-side and never
+# reach it. So a just-installed tool is indistinguishable in the flat tool array
+# from one present at bootstrap, and the model confabulates "built-in". Putting
+# provenance in the DESCRIPTION is the only channel the model sees every turn.
+USER_INSTALLED_TAG = "[user-installed]"
+
+
+def mark_user_installed(schema: dict) -> dict:
+    """Return a copy of ``schema`` whose description is prefixed with
+    ``USER_INSTALLED_TAG`` so the model can always tell a user-installed host tool
+    from a bootstrap/built-in one. Idempotent: a schema already tagged is returned
+    unchanged."""
+    desc = schema.get("description", "")
+    if desc.startswith(USER_INSTALLED_TAG):
+        return schema
+    marked = dict(schema)
+    marked["description"] = (
+        f"{USER_INSTALLED_TAG} (custom tool created at runtime via register_tool "
+        f"— not a built-in) {desc}".rstrip()
+    )
+    return marked
+
+
 def load_all_tools(host_tools_dir: Path) -> dict[str, dict]:
     """Load every ``*.py`` in ``host_tools_dir`` → ``{name: {schema, execute}}``.
 
