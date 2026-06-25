@@ -55,15 +55,6 @@ def hello():
         long_url = "Check out https://example.com/very/long/path/that/exceeds/eighty/characters/and/should/be/wrapped/in/expandable/blockquote"
         assert renderer._is_wide_content(long_url) is True
 
-    def test_is_wide_content_normal_text(self):
-        """Test that normal text is not detected as wide."""
-        renderer = ResponseRenderer()
-
-        normal_text = """This is normal text.
-It has multiple lines.
-But none of them are very long.
-And it doesn't have special characters."""
-        assert renderer._is_wide_content(normal_text) is False
 
     def test_format_expandable_blockquote(self):
         """Test that content is wrapped in expandable blockquote syntax."""

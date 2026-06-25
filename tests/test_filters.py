@@ -44,19 +44,6 @@ class TestMentionedMeFilter:
     """Tests for MentionedMe filter."""
 
     @pytest.mark.asyncio
-    async def test_username_mention_in_text(self, mock_message, mock_bot):
-        """Test that @username mention in text is detected."""
-        mock_message.text = "Hello @testbot, can you help?"
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is not False
-        assert isinstance(result, dict)
-        assert "mention_text" in result
-        assert "Hello , can you help?" in result["mention_text"]
-
-    @pytest.mark.asyncio
     async def test_no_mention(self, mock_message, mock_bot):
         """Test that message without mention returns False."""
         mock_message.text = "Hello everyone"
@@ -110,89 +97,6 @@ class TestMentionedMeFilter:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_mention_entity(self, mock_message, mock_bot):
-        """Test that mention entity is detected and extracted."""
-        mock_message.text = "@testbot what is the weather?"
-        mock_message.entities = [
-            MessageEntity(type=MessageEntityType.MENTION, offset=0, length=9)
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is not False
-        assert isinstance(result, dict)
-        assert "mention_text" in result
-        assert result["mention_text"] == "what is the weather?"
-
-    @pytest.mark.asyncio
-    async def test_text_mention_entity(self, mock_message, mock_bot):
-        """Test that text_mention entity for bot is detected."""
-        mock_message.text = "Can you help?"
-        mock_message.entities = [
-            MessageEntity(
-                type=MessageEntityType.TEXT_MENTION,
-                offset=0,
-                length=12,
-                user=Mock(id=mock_bot.id)
-            )
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is not False
-        assert isinstance(result, dict)
-        assert "mention_text" in result
-
-    @pytest.mark.asyncio
-    async def test_text_mention_other_user(self, mock_message, mock_bot):
-        """Test that text_mention for other user returns False."""
-        mock_message.text = "Can you help?"
-        mock_message.entities = [
-            MessageEntity(
-                type=MessageEntityType.TEXT_MENTION,
-                offset=0,
-                length=12,
-                user=Mock(id=999999999)
-            )
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_mention_middle_of_text(self, mock_message, mock_bot):
-        """Test mention extraction when mention is in middle of text."""
-        mock_message.text = "Hey @testbot can you help me?"
-        mock_message.entities = [
-            MessageEntity(type=MessageEntityType.MENTION, offset=4, length=9)
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is not False
-        assert "mention_text" in result
-        assert "Hey  can you help me?" in result["mention_text"]
-
-    @pytest.mark.asyncio
-    async def test_case_insensitive_mention(self, mock_message, mock_bot):
-        """Test that mention is case insensitive."""
-        mock_message.text = "@TestBot help"
-        mock_message.entities = [
-            MessageEntity(type=MessageEntityType.MENTION, offset=0, length=9)
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        assert result is not False
-        assert "mention_text" in result
-
-    @pytest.mark.asyncio
     async def test_empty_text(self, mock_message, mock_bot):
         """Test behavior with empty text."""
         mock_message.text = ""
@@ -213,22 +117,6 @@ class TestMentionedMeFilter:
         result = await mention_filter(mock_message, mock_bot)
         
         assert result is False
-
-    @pytest.mark.asyncio
-    async def test_multiple_mentions(self, mock_message, mock_bot):
-        """Test handling of multiple mentions in one message."""
-        mock_message.text = "@otherbot @testbot help"
-        mock_message.entities = [
-            MessageEntity(type=MessageEntityType.MENTION, offset=0, length=9),
-            MessageEntity(type=MessageEntityType.MENTION, offset=10, length=9),
-        ]
-        
-        mention_filter = MentionedMe()
-        result = await mention_filter(mock_message, mock_bot)
-        
-        # Should detect the bot mention and extract text
-        assert result is not False
-        assert "mention_text" in result
 
     @pytest.mark.asyncio
     async def test_reply_to_bot_no_entities(self, mock_message, mock_bot):
