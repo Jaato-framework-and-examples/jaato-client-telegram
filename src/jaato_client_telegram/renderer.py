@@ -187,10 +187,19 @@ _UNIT_TARGET_CHARS = 350
 
 
 def _fence_balanced(s: str) -> bool:
-    """True when ``` code fences in s are balanced (none left open). A boundary
-    is only legal where this holds — otherwise a split would crack a code block
-    into two unparseable halves."""
-    return s.count("```") % 2 == 0
+    """True when no code block is left open in s — neither a ``` markdown fence
+    NOR an HTML <pre>/<code> block. A boundary is only legal where this holds:
+    splitting an open block cracks it in two. The model emits code as
+    <pre><code>…</code></pre> (HTML), so a fence check alone let line-grouping
+    break the tags, Telegram's HTML parse then failed, and it fell back to
+    showing the raw tags as plain text."""
+    if s.count("```") % 2:
+        return False
+    if s.count("<pre") != s.count("</pre"):
+        return False
+    if s.count("<code") != s.count("</code"):
+        return False
+    return True
 
 
 def _group_lines(text: str, target: int, min_unit: int) -> tuple[list[str], str]:
@@ -237,9 +246,19 @@ def segment_stream_text(
 
     if flush:
         units, leftover = _group_lines(text, target, min_unit)
-        if leftover and (final or len(leftover) >= min_unit):
-            units.append(leftover)
-            leftover = ""
+        if leftover:
+            if len(leftover) >= min_unit:
+                units.append(leftover)
+                leftover = ""
+            elif final:
+                # Sub-min tail at the very end: never emit a lone tiny bubble (e.g.
+                # a stray "I"). Merge it into the previous unit if there is one;
+                # only stand alone when it is the turn's entire content.
+                if units:
+                    units[-1] = f"{units[-1]}\n{leftover}".rstrip()
+                else:
+                    units.append(leftover)
+                leftover = ""
         return units, leftover
 
     # Mid-stream: hold the in-progress (un-terminated) last line.
@@ -293,11 +312,16 @@ class ResponseRenderer:
         if ctx.text_buffer:
             combined = "".join(ctx.text_buffer)
             if combined.strip():  # Only add if non-whitespace
-                # Add blank line before first model output
+                # Add a blank line before the FIRST model output (to separate it
+                # from any prior system/init text). seen_model_output MUST be set
+                # on that first output regardless of whether the break was added —
+                # otherwise, now that we flush per-delta, the 2nd delta sees a
+                # non-empty accumulated_text with the flag still false and inserts
+                # a spurious break, splitting the first token ("No\n\n, the ...").
                 if not ctx.seen_model_output and ctx.accumulated_text:
                     if not ctx.accumulated_text.endswith("\n\n"):
                         ctx.accumulated_text += "\n\n"
-                    ctx.seen_model_output = True
+                ctx.seen_model_output = True
                 ctx.accumulated_text += combined
             ctx.text_buffer.clear()
 
@@ -337,8 +361,8 @@ class ResponseRenderer:
         ctx.accumulated_text = remainder
         if units:
             logging.getLogger(__name__).debug(
-                "stream emit: %d unit(s) flush=%s final=%s sizes=%s remainder=%dch",
-                len(units), flush, final, [len(u) for u in units], len(remainder),
+                "stream emit: flush=%s final=%s sizes=%s remainder=%dch",
+                flush, final, [len(u) for u in units], len(remainder),
             )
         for unit in units:
             await self._emit_one(initial_message, ctx, unit)

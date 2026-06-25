@@ -119,6 +119,22 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_first_token_not_split_off_per_delta_flush():
+    # Regression: per-delta flushing exposed a latent _flush_text_buffer bug that
+    # inserted a paragraph break after the first delta ("No\n\n, the ..."). The
+    # emitted message must contain the text contiguously, no break after token 1.
+    sent = await _run([
+        {"type": "agent.output", "source": "model", "mode": "write", "text": "No"},
+        {"type": "agent.output", "source": "model", "mode": "append",
+         "text": ", the approval server is not running. Want me to start it?"},
+        {"type": "agent.completed"},
+    ])
+    joined = "\n----\n".join(sent)
+    assert "No, the approval server" in joined, joined
+    assert "No\n" not in joined  # no stray break after "No"
+
+
+@pytest.mark.asyncio
 async def test_two_narrations_split_by_tool_emit_two_messages():
     # The core regression this feature fixes: narration → tool → narration must
     # stream as TWO messages, not one blob at the end.
@@ -136,6 +152,47 @@ async def test_two_narrations_split_by_tool_emit_two_messages():
     assert any("Fixed it" in s for s in narration)
     # The two narrations are in SEPARATE messages, not glued into one.
     assert not any("Looking at the tool source" in s and "Fixed it" in s for s in sent)
+
+
+def test_never_splits_html_pre_code_block():
+    # The model emits code as HTML <pre><code>…</code></pre> (not ``` markdown).
+    # A split there breaks the HTML and Telegram shows raw tags. The gate must
+    # keep the whole block in one unit even though it spans many lines.
+    text = (
+        "Here's the code — take a look:\n"
+        "<pre><code>   1 | import json, os\n"
+        "   2 | \n"
+        "   3 | TOOL_SCHEMA = {\n"
+        '   4 | "name": "shopping_list",\n'
+        "   5 | }\n"
+        "</code></pre>\n"
+        "That's the whole thing — want me to register it?"
+    )
+    units, rem = segment_stream_text(text, flush=True, final=True, target=80)
+    code_units = [u for u in units if "<pre><code>" in u]
+    assert len(code_units) == 1, units
+    u = code_units[0]
+    assert u.count("<pre") == u.count("</pre") == 1
+    assert u.count("<code") == u.count("</code") == 1
+    assert "shopping_list" in u  # whole block intact despite tiny target
+
+
+def test_submin_tail_never_lone_bubble():
+    # A stray sub-min tail at turn end must merge into the previous unit, not be
+    # emitted as its own 1-char message (the "I" hiccup).
+    units, rem = segment_stream_text(
+        "This first line is comfortably above the minimum unit size.\nI",
+        flush=True, final=True,
+    )
+    assert rem == ""
+    assert "I" not in units  # not a lone unit
+    assert units[-1].endswith("I")  # merged into the previous one
+
+
+def test_fence_gate_helper_covers_html():
+    assert not _fence_balanced("<pre><code>open")
+    assert _fence_balanced("<pre><code>x</code></pre>")
+    assert not _fence_balanced("<code>inline never closed")
 
 
 def test_multi_paragraph_all_complete():
