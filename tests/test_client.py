@@ -90,14 +90,15 @@ class TestEventStreaming:
 
     @pytest.mark.asyncio
     async def test_text_only_response_no_flush(self):
-        """Text-only responses should complete without flush signal."""
+        """Text-only responses (no flush signal) still get emitted at turn end."""
         from jaato_client_telegram.renderer import ResponseRenderer
         from unittest.mock import AsyncMock, MagicMock
 
         renderer = ResponseRenderer()
 
         mock_message = MagicMock()
-        mock_message.answer = AsyncMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
         mock_message.chat.id = 123
 
         # Text-only response (no tool calls, no flush)
@@ -113,9 +114,12 @@ class TestEventStreaming:
 
         ctx = await renderer.stream_response(mock_message, event_generator())
 
-        # Text should still be accumulated
-        assert "Hello!" in ctx.accumulated_text
-        assert "How can I help?" in ctx.accumulated_text
+        # The narration was emitted (buffer drained, not left accumulated).
+        sent = " ".join(str(c.args[0]) for c in mock_message.answer.call_args_list if c.args)
+        assert "Hello!" in sent
+        assert "How can I help?" in sent
+        assert ctx.produced_output
+        assert not ctx.accumulated_text
 
 
 class TestConfig:

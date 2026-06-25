@@ -170,6 +170,88 @@ def split_preserving_paragraphs(text: str, max_len: int) -> list[str]:
     return chunks
 
 
+# --- Human-paced streaming segmentation -------------------------------------
+# Model output arrives as a delta stream; rendering it in one blob at turn end
+# reads as "frozen, then a wall of text". We segment it into natural units and
+# emit each as it completes. The model already self-segments (one narration per
+# action), so the primary boundary is the text->tool transition; within a long
+# part we split on blank lines (\n\n), never inside a ``` code fence, and we
+# never emit a fragment shorter than _MIN_UNIT_CHARS alone (coalesce it forward)
+# to avoid single-word "stutter" bubbles. Validated against real session output.
+_MIN_UNIT_CHARS = 40
+# Target unit size. The model is inconsistent about paragraphing (sometimes \n\n,
+# often just single \n between lines), so we group LINES up to ~this size rather
+# than relying on blank-line paragraphs. Tuned for chat: big enough to keep a
+# short list together, small enough that a long explanation streams in pieces.
+_UNIT_TARGET_CHARS = 350
+
+
+def _fence_balanced(s: str) -> bool:
+    """True when ``` code fences in s are balanced (none left open). A boundary
+    is only legal where this holds — otherwise a split would crack a code block
+    into two unparseable halves."""
+    return s.count("```") % 2 == 0
+
+
+def _group_lines(text: str, target: int, min_unit: int) -> tuple[list[str], str]:
+    """Greedily group lines into ~``target``-sized units, breaking at blank lines
+    and at single newlines once a group reaches ``target``, never inside an open
+    ``` fence, and never closing a group below ``min_unit``. Returns
+    ``(units, leftover)`` where ``leftover`` is the last, not-yet-closed group."""
+    units: list[str] = []
+    cur = ""
+    for ln in text.split("\n"):
+        cand = f"{cur}\n{ln}" if cur else ln
+        if cur and not _fence_balanced(cur):
+            cur = cand  # inside a code fence: must not break
+            continue
+        is_blank = ln.strip() == ""
+        over = len(cand) > target
+        if (is_blank or over) and len(cur.strip()) >= min_unit and _fence_balanced(cur):
+            units.append(cur.strip())
+            cur = "" if is_blank else ln
+        else:
+            cur = cand
+    return units, cur.strip()
+
+
+def segment_stream_text(
+    text: str, *, flush: bool, final: bool = False,
+    min_unit: int = _MIN_UNIT_CHARS, target: int = _UNIT_TARGET_CHARS,
+) -> tuple[list[str], str]:
+    """Split accumulated model text into emit-ready, ~``target``-sized units at
+    line boundaries (blank-line OR single-newline), never cutting inside a ```
+    fence, never emitting below ``min_unit``.
+
+    Returns ``(units, remainder)``:
+    - ``flush=False`` (mid-stream) — only fully-terminated lines are considered;
+      the in-progress trailing line and the last not-yet-full group are held back.
+    - ``flush=True`` (tool boundary / turn pause) — the trailing group is emitted,
+      EXCEPT a sub-``min_unit`` tail is held to merge with what comes next…
+    - ``final=True`` (turn end) — …unless this is the end, where all is emitted.
+
+    Pure function: no I/O, fully unit-testable.
+    """
+    if not text or not text.strip():
+        return [], ""
+
+    if flush:
+        units, leftover = _group_lines(text, target, min_unit)
+        if leftover and (final or len(leftover) >= min_unit):
+            units.append(leftover)
+            leftover = ""
+        return units, leftover
+
+    # Mid-stream: hold the in-progress (un-terminated) last line.
+    nl = text.rfind("\n")
+    if nl == -1:
+        return [], text
+    committed, tail = text[:nl], text[nl + 1:]
+    units, leftover = _group_lines(committed, target, min_unit)
+    remainder = f"{leftover}\n{tail}" if leftover else tail
+    return units, remainder
+
+
 class ResponseRenderer:
     """
     Renders jaato events as Telegram messages.
@@ -222,6 +304,44 @@ class ResponseRenderer:
     def _flush_all_buffers(self, ctx: StreamingContext) -> None:
         """Flush all pending buffers."""
         self._flush_text_buffer(ctx)
+
+    async def _emit_one(self, initial_message: Message, ctx: StreamingContext, text: str) -> None:
+        """Send one segmented unit as its own Telegram message (splitting at 4096
+        if a single unit is huge, e.g. a giant code block)."""
+        for chunk in split_preserving_paragraphs(text, self._max_message_length):
+            if not chunk.strip():
+                continue
+            has_html = _has_telegram_html(chunk)
+            sent = await self._send_with_typing_indicator(
+                initial_message, chunk, parse_mode="HTML" if has_html else None,
+            )
+            if sent:
+                ctx.sent_message = sent
+            ctx.produced_output = True
+
+    async def _emit_segments(
+        self, initial_message: Message, ctx: StreamingContext,
+        *, flush: bool = True, final: bool = False,
+    ) -> None:
+        """Progressive streaming: flush buffered model text and emit each completed
+        segment as its own message (see segment_stream_text). The in-progress tail
+        is held back unless ``final``. This replaces the old "accumulate the whole
+        turn, send once" behaviour at every model/tool/turn boundary."""
+        self._flush_text_buffer(ctx)
+        if not ctx.accumulated_text.strip():
+            ctx.accumulated_text = ""
+            return
+        units, remainder = segment_stream_text(
+            ctx.accumulated_text, flush=flush, final=final,
+        )
+        ctx.accumulated_text = remainder
+        if units:
+            logging.getLogger(__name__).debug(
+                "stream emit: %d unit(s) flush=%s final=%s sizes=%s remainder=%dch",
+                len(units), flush, final, [len(u) for u in units], len(remainder),
+            )
+        for unit in units:
+            await self._emit_one(initial_message, ctx, unit)
 
     async def stream_response(
         self,
@@ -294,30 +414,9 @@ class ResponseRenderer:
                 # Handle flush signal FIRST - regardless of source
                 # The SDK emits flush as source="system" with mode="flush" and empty text
                 if mode == "flush":
-                    log.debug("Flush signal received (source=%s) - flushing text buffer and sending as new message", source)
-                    # Flush all accumulated text to display before tools start
-                    self._flush_text_buffer(ctx)
-                    
-                    # Send as a NEW message instead of editing
-                    # This ensures each flush creates a separate message in the chat
-                    display_text = ctx.accumulated_text[: self._max_message_length]
-                    if display_text:  # Only send if there's content
-                        has_html = _has_telegram_html(display_text)
-                        # Use the new helper that sends typing action before the message
-                        if has_html:
-                            sent_msg = await self._send_with_typing_indicator(initial_message, display_text, parse_mode="HTML")
-                        else:
-                            sent_msg = await self._send_with_typing_indicator(initial_message, display_text)
-                        
-                        # Mark that we've sent a message during this turn
-                        # This prevents the final _edit_or_send from duplicating it
-                        ctx.sent_message = sent_msg
-                    
-                    # Always clear accumulated text after flush, even if nothing was sent
-                    # This prevents old content from appearing in subsequent messages
-                    ctx.accumulated_text = ""
-                    
-                    # Don't use _edit_or_send - we want new messages, not edits
+                    log.debug("Flush signal received (source=%s) - emitting completed segments", source)
+                    # Emit completed paragraphs now (hold a sub-min / in-progress tail).
+                    await self._emit_segments(initial_message, ctx, flush=True, final=False)
                 # Buffer model output for later display
                 elif source == "model" and mode in ("write", "append"):
                     # Model output means the user's turn is underway — a backup to the
@@ -331,8 +430,15 @@ class ResponseRenderer:
                     else:
                         # No semantic tags; escape HTML as before
                         ctx.text_buffer.append(escape_html_content(content))
+                    # Progressive streaming: emit any paragraph(s) that just completed
+                    # (\n\n). A single-paragraph narration stays buffered until its
+                    # tool boundary; a multi-paragraph block streams as it goes.
+                    await self._emit_segments(initial_message, ctx, flush=False)
 
                 elif source == "tool":
+                    # Tool boundary: the model finished its narration before acting —
+                    # emit it as a unit now (the primary, validated boundary).
+                    await self._emit_segments(initial_message, ctx, flush=True, final=False)
                     # Tool output - format with tool name and parameters
                     tool_name = getattr(event, "tool_name", None)
                     tool_args = getattr(event, "tool_args", None)
@@ -364,40 +470,27 @@ class ResponseRenderer:
                     if source != "system" or content:  # Skip system flush events (already handled)
                         log.debug(f"Non-model output: source={source}, mode={mode}, buffering anyway")
 
+            elif event_type == "tool.call_start":
+                # THE primary boundary: the model finished its narration and is
+                # invoking a tool. Tool calls arrive as their own event type (NOT
+                # source="tool" agent output), so this is where a multi-step turn
+                # gets its natural per-step segmentation. Emit the narration now.
+                await self._emit_segments(initial_message, ctx, flush=True, final=False)
+
             elif event_type == EventType.AGENT_COMPLETED:
-                # Agent completed - flush all buffers before finishing
-                self._flush_all_buffers(ctx)
-                await self._edit_or_send(initial_message, ctx)
+                # Agent completed - emit everything remaining, including the tail.
+                await self._emit_segments(initial_message, ctx, flush=True, final=True)
                 ctx.content_sent = True
                 break
 
             elif event_type == EventType.TURN_COMPLETED:
-                # Turn completed - flush all buffers first
-                self._flush_all_buffers(ctx)
-
-
-                # Check for formatted text - this replaces the streaming text
-                formatted_text = getattr(event, "formatted_text", None)
-                if formatted_text:
-                    # formatted_text contains the full conversation including user input
-                    # We prefer to use only the accumulated streaming text (agent response only)
-                    # Delete the streaming message and send final response with accumulated text
-                    if ctx.sent_message:
-                        try:
-                            log.info(
-                                "RENDER delete streaming id=%s (TURN_COMPLETED formatted_text branch)",
-                                ctx.sent_message.message_id,
-                            )
-                            await ctx.sent_message.delete()
-                            ctx.sent_message = None
-                        except Exception:
-                            pass
-                    # Send final response using accumulated text (agent response only, no user message)
-                    await self.send_final_response(initial_message, ctx)
-                else:
-                    # No formatted_text provided, ensure we have the final response displayed
-                    await self._edit_or_send(initial_message, ctx)
-                    ctx.content_sent = True
+                # Emit completed paragraphs now, but HOLD the in-progress tail: in
+                # multi-turn agentic flows more turns follow, and the true final
+                # flush happens at AGENT_COMPLETED / status done|idle / post-loop.
+                # (The old formatted_text "delete streaming msg + resend" dance is
+                # gone — we stream discrete units, there is no single message to
+                # replace, and the code already preferred accumulated text anyway.)
+                await self._emit_segments(initial_message, ctx, flush=True, final=False)
 
                 # NOTE: Do NOT break on turn.completed!
                 # Multi-turn agentic flows have multiple turn.completed events
@@ -423,9 +516,8 @@ class ResponseRenderer:
                         # Main agent finished processing - flush and exit
                         # "done" = agent completed all work
                         # "idle" = agent waiting for next user input
-                        log.debug(f"Agent finished with status={status}, flushing buffers and completing stream")
-                        self._flush_all_buffers(ctx)
-                        await self._edit_or_send(initial_message, ctx)
+                        log.debug(f"Agent finished with status={status}, emitting remaining segments and completing stream")
+                        await self._emit_segments(initial_message, ctx, flush=True, final=True)
                         ctx.content_sent = True
                         break
 
@@ -543,16 +635,9 @@ class ResponseRenderer:
                 if self._permission_handler:
                     log.debug(f"Permission input mode: request_id={getattr(event, 'request_id', 'unknown')}")
                     
-                    # Flush text buffer first to show what the model said BEFORE the permission
-                    self._flush_text_buffer(ctx)
-                    
-                    # Update the message to show the flushed text (without any permission placeholder)
-                    await self._edit_or_send(initial_message, ctx)
-                    
-                    # Clear accumulated text after sending - the model's text has been displayed
-                    # and we don't want to repeat it after the permission is approved
-                    ctx.accumulated_text = ""
-                    
+                    # Emit the model's lead-in narration (fully) BEFORE the permission UI.
+                    await self._emit_segments(initial_message, ctx, flush=True, final=True)
+
                     # Mark that permission was sent - stop editing streaming message
                     ctx.permission_sent = True
                     
@@ -586,10 +671,8 @@ class ResponseRenderer:
                 if self._clarification_handler:
                     log.debug(f"Clarification batch: request_id={getattr(event, 'request_id', 'unknown')}")
 
-                    # Flush the model's lead-in text before showing questions
-                    self._flush_text_buffer(ctx)
-                    await self._edit_or_send(initial_message, ctx)
-                    ctx.accumulated_text = ""
+                    # Emit the model's lead-in narration before showing questions.
+                    await self._emit_segments(initial_message, ctx, flush=True, final=True)
                     ctx.permission_sent = True  # stop editing the streaming message
 
                     chat_id = initial_message.chat.id
@@ -619,15 +702,9 @@ class ResponseRenderer:
                 if self._file_handler:
                     log.debug(f"File generated: {getattr(event, 'path', 'unknown')}")
                     
-                    # Flush text buffer first to show any model output before the file
-                    self._flush_text_buffer(ctx)
-                    
-                    # Update the message to show the flushed text
-                    await self._edit_or_send(initial_message, ctx)
-                    
-                    # Clear accumulated text after sending
-                    ctx.accumulated_text = ""
-                    
+                    # Emit any model output before the file.
+                    await self._emit_segments(initial_message, ctx, flush=True, final=True)
+
                     # Handle file event
                     # Convert event to dict for FileHandler
                     event_dict = {
@@ -647,10 +724,10 @@ class ResponseRenderer:
                 else:
                     log.warning("File generated event received but no file_handler configured")
 
-        # Final edit with complete response
-        # Only if content hasn't already been sent by a terminal event
+        # Final flush: emit any remaining segments (incl. the in-progress tail) if
+        # no terminal event already did. Covers stream end via StopAsyncIteration.
         if not ctx.content_sent:
-            await self._edit_or_send(initial_message, ctx)
+            await self._emit_segments(initial_message, ctx, flush=True, final=True)
 
         # Empty-turn fallback: if the whole turn rendered NO visible content (e.g.
         # interrupted before any output), the empty-send guards spare us a Telegram
