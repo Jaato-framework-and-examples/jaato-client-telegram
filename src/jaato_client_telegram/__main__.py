@@ -236,7 +236,16 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
 
         # Cleanup based on mode
         if mode == "polling":
-            await dp.stop_polling()
+            # aiogram's start_polling installs its own SIGINT/SIGTERM handler and
+            # has usually ALREADY stopped polling by the time this finally runs,
+            # so an unconditional stop_polling() raises "Polling is not started",
+            # which propagated out as a fatal error and made the process exit
+            # 1/FAILURE on every `systemctl stop|restart`. It's benign at
+            # shutdown — swallow it so we exit cleanly (0).
+            try:
+                await dp.stop_polling()
+            except RuntimeError as e:
+                log.debug("stop_polling at shutdown (already stopped): %s", e)
         elif mode == "webhook":
             # Delete webhook on shutdown
             try:
