@@ -322,6 +322,14 @@ def segment_stream_text(
         return [], text
     committed, tail = text[:nl], text[nl + 1:]
     units, leftover = _group_lines(committed, target, min_unit)
+    if not units:
+        # Nothing crossed the target yet, so nothing is emitted this tick. Hold
+        # the WHOLE accumulated text VERBATIM rather than the strip/rejoin that
+        # _group_lines applies to its leftover — that normalisation collapses
+        # interior blank lines (a paragraph break between sections "\n\n") into a
+        # single "\n", or drops a trailing one entirely, as more deltas append to
+        # it. Lossless hold keeps the structure the model actually sent.
+        return [], text
     remainder = f"{leftover}\n{tail}" if leftover else tail
     return units, remainder
 
@@ -366,7 +374,14 @@ class ResponseRenderer:
         """
         if ctx.text_buffer:
             combined = "".join(ctx.text_buffer)
-            if combined.strip():  # Only add if non-whitespace
+            # Guard's ONLY job: don't lead the message with whitespace. Once any
+            # real model text has been emitted, append everything — INCLUDING a
+            # whitespace-only delta. Streaming tokenizers routinely emit a lone
+            # "\n" between list items or a lone " " after an em-dash as its own
+            # delta; because we now flush per-delta, "if combined.strip()" alone
+            # discarded those (and cleared the buffer), silently gluing
+            # "stats- Bookmark", "plan🛠️ Productivity", "Timer —25/5".
+            if combined.strip() or ctx.seen_model_output:
                 # Add a blank line before the FIRST model output (to separate it
                 # from any prior system/init text). seen_model_output MUST be set
                 # on that first output regardless of whether the break was added —

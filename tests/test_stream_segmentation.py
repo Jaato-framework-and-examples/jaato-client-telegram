@@ -141,6 +141,34 @@ async def test_first_token_not_split_off_per_delta_flush():
 
 
 @pytest.mark.asyncio
+async def test_whitespace_only_deltas_are_not_dropped():
+    # Regression: streaming tokenizers emit whitespace as its OWN delta (a lone
+    # "\n" between bullets, a lone " " after an em-dash). Per-delta flushing made
+    # `if combined.strip()` discard those, gluing "habits- Bookmark",
+    # "URLs🛠️ Productivity", "Timer —25/5". They must survive verbatim.
+    sent = await _run([
+        {"type": "agent.output", "source": "model", "mode": "write", "text": "- Habit Tracker"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": " — log habits"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "\n"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "- Bookmark Manager"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "\n\n"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "🛠️ Productivity"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "\n"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "- Pomodoro Timer —"},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": " "},
+        {"type": "agent.output", "source": "model", "mode": "append", "text": "25/5"},
+        {"type": "agent.completed"},
+    ])
+    joined = "\n".join(sent)
+    assert "log habits\n- Bookmark Manager" in joined  # the \n between bullets kept
+    assert "🛠️ Productivity" in joined and "Manager\n\n🛠️" in joined  # blank line kept
+    assert "Pomodoro Timer — 25/5" in joined  # the space after — kept
+    # None of the glued corruptions appear.
+    for bad in ("habits- Bookmark", "URLs🛠️", "Manager🛠️", "Timer —25/5"):
+        assert bad not in joined, bad
+
+
+@pytest.mark.asyncio
 async def test_two_narrations_split_by_tool_emit_two_messages():
     # The core regression this feature fixes: narration → tool → narration must
     # stream as TWO messages, not one blob at the end.
