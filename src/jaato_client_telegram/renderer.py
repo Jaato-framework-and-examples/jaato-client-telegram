@@ -203,22 +203,24 @@ def _fence_balanced(s: str) -> bool:
 
 
 def _group_lines(text: str, target: int, min_unit: int) -> tuple[list[str], str]:
-    """Greedily group lines into ~``target``-sized units, breaking at blank lines
-    and at single newlines once a group reaches ``target``, never inside an open
-    ``` fence, and never closing a group below ``min_unit``. Returns
-    ``(units, leftover)`` where ``leftover`` is the last, not-yet-closed group."""
+    """Greedily group lines into ~``target``-sized units, splitting at a line
+    boundary only once a group exceeds ``target`` — NOT at every blank line.
+    Blank lines (paragraph breaks) are kept inside the unit so short, multi-
+    paragraph answers stay a single message (splitting them produced spurious
+    extra messages whose boundaries glued together, e.g. "shampoo(Same as ...").
+    Never breaks inside an open ``` / <pre> / <code> block, never closes a group
+    below ``min_unit``. Returns ``(units, leftover)`` — the last open group."""
     units: list[str] = []
     cur = ""
     for ln in text.split("\n"):
         cand = f"{cur}\n{ln}" if cur else ln
         if cur and not _fence_balanced(cur):
-            cur = cand  # inside a code fence: must not break
+            cur = cand  # inside a code block: must not break
             continue
-        is_blank = ln.strip() == ""
         over = len(cand) > target
-        if (is_blank or over) and len(cur.strip()) >= min_unit and _fence_balanced(cur):
+        if over and len(cur.strip()) >= min_unit and _fence_balanced(cur):
             units.append(cur.strip())
-            cur = "" if is_blank else ln
+            cur = ln
         else:
             cur = cand
     return units, cur.strip()

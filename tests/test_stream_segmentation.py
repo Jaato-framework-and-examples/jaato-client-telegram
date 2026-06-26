@@ -20,16 +20,25 @@ def test_fence_balanced_helper():
     assert not _fence_balanced("```open fence")
 
 
-def test_midstream_holds_incomplete_trailing_paragraph():
-    # "A" is terminated by \n\n (complete, and >= min_unit); "B in progress" has
-    # no terminator, so it is held back as remainder.
+def test_midstream_holds_short_content_until_target():
+    # Under target, mid-stream emits NOTHING (no premature tiny messages); the
+    # whole thing is held as remainder.
     units, rem = segment_stream_text(
-        "First complete paragraph, definitely long enough to stand alone.\n\n"
-        "Second still being written",
-        flush=False,
+        "Short first line.\nSecond still being written", flush=False, target=350,
     )
-    assert units == ["First complete paragraph, definitely long enough to stand alone."]
-    assert rem == "Second still being written"
+    assert units == []
+    assert "Short first line." in rem and "Second still being written" in rem
+
+
+def test_midstream_emits_once_over_target():
+    # Once committed lines exceed target a unit is emitted; the in-progress
+    # trailing line is held back.
+    big = "X" * 200
+    units, rem = segment_stream_text(
+        f"{big}\n{big}\ntrailing in progress", flush=False, target=150,
+    )
+    assert units, "something should have been emitted past target"
+    assert "trailing in progress" in rem
 
 
 def test_flush_emits_trailing_at_tool_boundary():
@@ -57,16 +66,13 @@ def test_never_splits_inside_code_fence():
         "**What was wrong:** STORE_PATH used Path(__file__).parent.\n\n"
         "**The fix:** changed it to an absolute workspace path."
     )
-    units, rem = segment_stream_text(final_summary, flush=True, final=True)
-    # The json block stays intact as exactly one unit.
+    # Small target forces splitting — but the fence must still never be cut.
+    units, rem = segment_stream_text(final_summary, flush=True, final=True, target=60)
     json_units = [u for u in units if "```json" in u]
     assert len(json_units) == 1
     assert json_units[0].count("```") == 2  # fence opened AND closed in one unit
     assert "id" in json_units[0] and "r1" in json_units[0]
-    # And it split into the expected 4 natural pieces.
-    assert len(units) == 4
-    assert units[0].startswith("**Persistence is now working.**")
-    assert units[-1].startswith("**The fix:**")
+    assert len(units) >= 2  # it DID split (at the small target), just not in the fence
     assert rem == ""
 
 
@@ -177,6 +183,20 @@ def test_never_splits_html_pre_code_block():
     assert "shopping_list" in u  # whole block intact despite tiny target
 
 
+def test_short_multiparagraph_stays_one_unit():
+    # Regression: a short answer with a blank-line break (list + a trailing
+    # comment) must stay ONE message — splitting it produced "shampoo(Same..."
+    # gluing across message boundaries.
+    text = (
+        "🛒 **Shopping list (3 items):**\n  1. iogurt\n  2. lettuce\n  3. shampoo\n\n"
+        "(Same as before — nothing changed since you last checked.)"
+    )
+    units, rem = segment_stream_text(text, flush=True, final=True)
+    assert len(units) == 1, units
+    assert "shampoo" in units[0] and "Same as before" in units[0]
+    assert "\n\n" in units[0]  # the paragraph break is preserved inside the unit
+
+
 def test_submin_tail_never_lone_bubble():
     # A stray sub-min tail at turn end must merge into the previous unit, not be
     # emitted as its own 1-char message (the "I" hiccup).
@@ -195,11 +215,15 @@ def test_fence_gate_helper_covers_html():
     assert not _fence_balanced("<code>inline never closed")
 
 
-def test_multi_paragraph_all_complete():
+def test_short_paragraphs_stay_together_under_target():
+    # Short multi-paragraph content stays ONE unit (blank line preserved inside),
+    # rather than one message per paragraph.
     text = (
-        "Paragraph one is long enough to be its own unit here.\n\n"
-        "Paragraph two is also long enough to be its own unit.\n\n"
+        "Paragraph one here.\n\n"
+        "Paragraph two here."
     )
-    units, rem = segment_stream_text(text, flush=False)
-    assert len(units) == 2
+    units, rem = segment_stream_text(text, flush=True, final=True, target=350)
+    assert len(units) == 1
+    assert "Paragraph one" in units[0] and "Paragraph two" in units[0]
+    assert "\n\n" in units[0]
     assert rem == ""
