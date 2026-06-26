@@ -87,6 +87,59 @@ def escape_html_content(text: str) -> str:
 _STALL_TIMEOUT_SECS = 120.0
 
 
+# --- Markdown -> Telegram HTML --------------------------------------------------
+# The model is told the client supports markdown (presentation context), so it
+# emits **bold**, *italic*, `code`, ```blocks```, [text](url) — but the bot sends
+# parse_mode=HTML, which never rendered them (they showed literally). We convert
+# the common, unambiguous markdown to Telegram's HTML subset at EMIT time, on the
+# already-escaped, fully-assembled unit (so multi-delta spans are whole).
+#
+# DELIBERATELY conservative: no single-`_`/`__` emphasis (would mangle
+# snake_case / file_paths), and code regions are protected so markdown inside
+# them is left literal.
+_MD_FENCE = re.compile(r"```[^\n`]*\n?(.*?)```", re.DOTALL)
+_MD_INLINE_CODE = re.compile(r"`([^`\n]+?)`")
+_HTML_PRE = re.compile(r"<pre\b.*?</pre>", re.DOTALL | re.IGNORECASE)
+_HTML_CODE = re.compile(r"<code\b.*?</code>", re.DOTALL | re.IGNORECASE)
+_MD_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.DOTALL)
+_MD_ITALIC = re.compile(r"(?<!\w)\*(?=\S)([^*\n]+?)(?<=\S)\*(?!\w)")
+_MD_STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~", re.DOTALL)
+_MD_LINK = re.compile(r"\[([^\]\n]+?)\]\((https?://[^\s)]+)\)")
+_PLACEHOLDER = "\x00%d\x00"
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert common markdown in ``text`` to Telegram's HTML subset. Runs on the
+    already-HTML-escaped, fully-assembled message (markdown markers aren't escaped
+    by escape_html_content, so they survive intact). Code regions — existing
+    <pre>/<code> and markdown ``` / `…` — are protected so their contents are not
+    treated as markdown."""
+    if not text or ("*" not in text and "`" not in text and "[" not in text and "~" not in text and "<pre" not in text):
+        return text
+
+    stash: list[str] = []
+
+    def _stash(s: str) -> str:
+        stash.append(s)
+        return _PLACEHOLDER % (len(stash) - 1)
+
+    # Protect code regions FIRST (markdown inside them must stay literal).
+    text = _HTML_PRE.sub(lambda m: _stash(m.group(0)), text)
+    text = _HTML_CODE.sub(lambda m: _stash(m.group(0)), text)
+    text = _MD_FENCE.sub(lambda m: _stash(f"<pre>{m.group(1).rstrip(chr(10))}</pre>"), text)
+    text = _MD_INLINE_CODE.sub(lambda m: _stash(f"<code>{m.group(1)}</code>"), text)
+
+    # Inline emphasis on what's left (bold before italic so ** isn't eaten by *).
+    text = _MD_BOLD.sub(r"<b>\1</b>", text)
+    text = _MD_ITALIC.sub(r"<i>\1</i>", text)
+    text = _MD_STRIKE.sub(r"<s>\1</s>", text)
+    text = _MD_LINK.sub(r'<a href="\2">\1</a>', text)
+
+    for i, s in enumerate(stash):
+        text = text.replace(_PLACEHOLDER % i, s, 1)
+    return text
+
+
 @dataclass
 class StreamingContext:
     """State for edit-in-place streaming of responses."""
@@ -337,6 +390,10 @@ class ResponseRenderer:
         for chunk in split_preserving_paragraphs(text, self._max_message_length):
             if not chunk.strip():
                 continue
+            # Render the model's markdown (**bold**, `code`, links, …) into
+            # Telegram HTML on the whole, assembled chunk — per-delta rendering
+            # could never see a marker that spanned two deltas.
+            chunk = markdown_to_telegram_html(chunk)
             has_html = _has_telegram_html(chunk)
             sent = await self._send_with_typing_indicator(
                 initial_message, chunk, parse_mode="HTML" if has_html else None,
