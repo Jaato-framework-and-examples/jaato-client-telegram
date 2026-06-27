@@ -1,0 +1,135 @@
+# jaato-client-telegram Configuration
+
+# Telegram Bot Configuration
+telegram:
+  # Get your bot token from @BotFather on Telegram
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+
+  # Mode: "polling" (default) or "webhook"
+  # Polling is simpler for development, webhook is better for production
+  mode: "polling"
+
+  # Webhook configuration (only used if mode: "webhook")
+  # webhook:
+  #   url: "https://your-domain.com/tg-webhook"
+  #   port: 8443
+  #   cert_path: "/path/to/cert.pem"
+
+  # Access control
+  access:
+    # List of allowed chat IDs (empty = allow all)
+    # Get your chat ID from @userinfobot on Telegram
+    allowed_chat_ids: []
+
+    # List of admin user IDs (can use /reset, /status)
+    admin_user_ids: []
+
+  # Group chat behavior
+  group:
+    # Only respond when @mentioned or replied to
+    require_mention: false  # Changed to false to allow trigger_prefix
+
+    # Optional prefix to trigger bot in groups (e.g., "!ask")
+    trigger_prefix: "!ask"  # Use !ask instead of @mention
+
+# jaato Server Connection (WebSocket)
+jaato_ws:
+  url: "wss://localhost:8089"
+  tls:
+    enabled: true
+    ca_cert_path: null
+    cert_path: null
+    key_path: null
+  secret_token: "${JAATO_WS_TOKEN}"
+  keycloak_base_url: ""
+  keycloak_realm: "jaato"
+  keycloak_client_id: ""
+  keycloak_client_secret: ""
+  # Profile + agent for each chat session (in .jaato/profiles and .jaato/agents).
+  profile: "telegram_chat"
+  agent: "telegram_chat"
+  # Server-side path to this workspace (declared via set_workspace on connect) so
+  # the WS server finds the profile/agent above under <workspace>/.jaato/.
+  # The workspace is a gitignored ./runtime subfolder: the agent runs each session
+  # there, so ALL runtime state + the agent's own file outputs stay out of the repo,
+  # while the tracked profile/agent live under runtime/.jaato/ (see .gitignore).
+  workspace: "/home/apanoia/Sources/Jaato-framework-and-examples/jaato-client-telegram/runtime"
+  # Where the bot installs user-approved dynamic host tools (`register_tool`).
+  # MUST be OUTSIDE `workspace` so the AppArmor-confined runner can't write or
+  # tamper with installed tool code. Empty = dynamic-tool installs disabled.
+  host_tools_dir: "/home/apanoia/.local/share/jaato_client_telegram/host_tools"
+
+# Session Pool Configuration
+session:
+  # Maximum concurrent SDK clients
+  max_concurrent: 50
+
+  # Disconnect idle sessions after N minutes
+  idle_timeout_minutes: 60
+
+  # Use SDK's built-in reconnection on error
+  reconnect_on_error: true
+
+  # Persist chat_id -> session_id here so the bot RE-ATTACHES to the same daemon
+  # session after a restart (instead of starting a fresh conversation). The
+  # daemon loads the session from disk if needed. Keep it OUTSIDE the workspace
+  # and repo; empty disables re-attachment.
+  session_store_path: "/home/apanoia/.local/share/jaato_client_telegram/chat_sessions.json"
+
+  # Post this one-line notice to a chat the instant its session is dropped by idle
+  # cleanup (~idle_timeout_minutes), so the later "Resuming…" is expected. Empty
+  # disables it. Suppressed during the quiet-hours window so it never pings at night.
+  idle_notice_text: "💤 I've paused our session after a while of inactivity — just message me and I'll pick up right where we left off."
+  idle_notice_quiet_hours: "23:00-08:00"
+
+# Response Rendering
+rendering:
+  # Telegram's message length limit
+  max_message_length: 4096
+
+  # Edit-in-place streaming as events arrive
+  stream_edits: true
+
+  # Show "typing..." indicator while waiting for response
+  typing_indicator: true
+
+  # Throttle edits to respect rate limits (milliseconds)
+  edit_throttle_ms: 500
+
+# Permission Request UI
+permissions:
+  # Action types to filter from inline keyboard (comma or pipe separated)
+  # These require complex UI (text input, modals) that Telegram doesn't support
+  # Example: "comment,edit,idle,turn,all" or "comment|edit|idle|turn|all"
+  unsupported_actions: "allow_session,allow_turn,allow_until_idle,allow_once,deny_session,allow_all,comment,edit"
+
+# Rate Limiting
+rate_limiting:
+  # Enable rate limiting to prevent abuse
+  enabled: true
+
+  # Maximum messages per user per minute
+  messages_per_minute: 30
+
+  # Maximum messages per user per hour
+  messages_per_hour: 200
+
+  # Cooldown period after hitting limits (seconds)
+  cooldown_seconds: 60
+
+  # Allow admin users to bypass rate limits
+  admin_bypass: true
+
+  # How often to clean up old user states (minutes)
+  cleanup_interval_minutes: 60
+
+  # Maximum age of user state before cleanup (hours)
+  cleanup_max_age_hours: 24
+
+# Logging
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+
+  # Format: "structured" (JSON) or "text"
+  format: "structured"

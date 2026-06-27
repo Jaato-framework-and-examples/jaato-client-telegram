@@ -143,6 +143,9 @@ cython_debug/
 # Project-specific
 *.yaml
 !config.example.yaml
+# The live config holds NO literal secrets (bot_token/secret_token are ${ENV}
+# substitutions) — only host-specific absolute paths — so it is tracked.
+!jaato-client-telegram.yaml
 *.sock
 # bot runtime workspace (jaato_ws.workspace = ./runtime): the bot runs each chat
 # session inside ./runtime, so ALL runtime state (sessions, logs, memories,
