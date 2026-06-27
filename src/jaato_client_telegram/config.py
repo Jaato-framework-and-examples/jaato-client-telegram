@@ -98,6 +98,17 @@ class SessionConfig(BaseModel):
     # are per-process and lost on restart). No hardcoded default.
     session_store_path: str = ""
 
+    # When non-empty, the bot posts this one-line notice to a chat the instant its
+    # session is dropped by idle cleanup, so the later "Resuming…" is expected.
+    # Empty disables it (opt-in; no hardcoded default). Dedup is inherent: idle
+    # cleanup removes the session, so a chat is notified at most once per idle
+    # period (it can't be dropped again until the next message recreates it).
+    idle_notice_text: str = ""
+    # Local-time window "HH:MM-HH:MM" during which the idle notice is SUPPRESSED
+    # (e.g. "23:00-08:00" so it never pings overnight). Wrap-around windows are
+    # honored. Empty = never suppress (notify whenever idle_notice_text is set).
+    idle_notice_quiet_hours: str = ""
+
 
 class PermissionConfig(BaseModel):
     """Permission request UI configuration."""

@@ -93,6 +93,14 @@ session:
   # Use SDK's built-in reconnection on error
   reconnect_on_error: true
 
+  # Optional: post this one-line notice to a chat the instant its session is
+  # dropped by idle cleanup (so the later "Resuming…" is expected). Empty disables
+  # it. Dedup is inherent (one notice per idle period).
+  idle_notice_text: ""
+  # Local-time window "HH:MM-HH:MM" during which the notice is suppressed (e.g.
+  # "23:00-08:00" so it never pings overnight; spans midnight). Empty = never suppress.
+  idle_notice_quiet_hours: ""
+
 # Response Rendering
 rendering:
   # Telegram's message length limit

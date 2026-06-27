@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, time as dtime
 
 import structlog
 
@@ -105,14 +106,52 @@ def _configure_logging(config) -> None:
         logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
-async def _idle_session_cleanup_task(pool, interval_minutes: int):
-    """Background task to cleanup idle sessions periodically."""
+def _in_quiet_hours(window: str, now: dtime | None = None) -> bool:
+    """True when local 'now' falls in the "HH:MM-HH:MM" window (wrap-around aware,
+    so "23:00-08:00" spans midnight). Empty/invalid window → never quiet.
+    ``now`` is injectable for tests; defaults to the current local time."""
+    if not window:
+        return False
+    try:
+        start_s, end_s = window.split("-")
+        sh, sm = (int(x) for x in start_s.split(":"))
+        eh, em = (int(x) for x in end_s.split(":"))
+        start, end = dtime(sh, sm), dtime(eh, em)
+    except ValueError:
+        logging.warning("Invalid idle_notice_quiet_hours %r — ignoring", window)
+        return False
+    if now is None:
+        now = datetime.now().time()
+    if start <= end:
+        return start <= now < end
+    return now >= start or now < end  # overnight wrap-around
+
+
+async def _notify_idle_dropped(bot, chat_ids: list[int], text: str) -> None:
+    """Post the idle-drop notice to each dropped chat. Best-effort: a chat that
+    blocked the bot / is unreachable is logged and skipped, never raises."""
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            logging.warning("Failed to send idle notice to chat %s", chat_id, exc_info=True)
+
+
+async def _idle_session_cleanup_task(
+    pool, bot, interval_minutes: int, notice_text: str, quiet_hours: str,
+):
+    """Background task to cleanup idle sessions periodically. When notice_text is
+    set, proactively tells each dropped chat its session was paused (so the later
+    "Resuming…" is expected) — suppressed during quiet_hours so it never pings at
+    night. Disabled when notice_text is empty (opt-in)."""
     while True:
         try:
             await asyncio.sleep(interval_minutes * 60)
-            cleaned = await pool.cleanup_idle(max_idle_minutes=interval_minutes * 2)
-            if cleaned > 0:
-                logging.info(f"Cleaned up {cleaned} idle sessions")
+            dropped = await pool.cleanup_idle(max_idle_minutes=interval_minutes * 2)
+            if dropped:
+                logging.info(f"Cleaned up {len(dropped)} idle sessions")
+                if notice_text and not _in_quiet_hours(quiet_hours):
+                    await _notify_idle_dropped(bot, dropped, notice_text)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -162,7 +201,11 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
 
     # Start background idle session cleanup
     cleanup_task = asyncio.create_task(
-        _idle_session_cleanup_task(pool, interval_minutes=30)
+        _idle_session_cleanup_task(
+            pool, bot, interval_minutes=30,
+            notice_text=config.session.idle_notice_text,
+            quiet_hours=config.session.idle_notice_quiet_hours,
+        )
     )
 
     # Shutdown handler

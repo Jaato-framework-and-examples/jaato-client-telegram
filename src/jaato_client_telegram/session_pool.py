@@ -435,7 +435,10 @@ class SessionPool:
         )
         await self.remove_client(oldest)
 
-    async def cleanup_idle(self, max_idle_minutes: int = 60) -> int:
+    async def cleanup_idle(self, max_idle_minutes: int = 60) -> list[int]:
+        """Disconnect sessions idle past the threshold; return the dropped chat_ids
+        (so the caller can notify them). Removal is the dedup: a chat won't appear
+        again until its next message recreates the session."""
         now = datetime.now()
         to_remove = []
         async with self._lock:
@@ -444,7 +447,7 @@ class SessionPool:
                     to_remove.append(chat_id)
         for chat_id in to_remove:
             await self.remove_client(chat_id)
-        return len(to_remove)
+        return to_remove
 
     async def shutdown(self) -> None:
         async with self._lock:

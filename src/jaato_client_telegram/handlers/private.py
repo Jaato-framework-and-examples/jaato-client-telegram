@@ -132,7 +132,7 @@ async def handle_private_message(
 
             if pool.took_reattach(chat_id):
                 await message.answer(
-                    "🔄 Resumed your previous conversation.", parse_mode=None
+                    "⏳ Resuming your previous conversation…", parse_mode=None
                 )
 
             logger.debug(f"User {chat_id}: session_id = {session_id}")
@@ -293,7 +293,7 @@ async def handle_private_media(
             session_id = await pool.get_or_create_session(chat_id)
             if pool.took_reattach(chat_id):
                 await message.answer(
-                    "🔄 Resumed your previous conversation.", parse_mode=None
+                    "⏳ Resuming your previous conversation…", parse_mode=None
                 )
             await pool.send_message(session_id, caption, attachments=attachments)
             ctx = await renderer.stream_response(
