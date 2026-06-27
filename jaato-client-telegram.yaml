@@ -53,11 +53,11 @@ jaato_ws:
   # The workspace is a gitignored ./runtime subfolder: the agent runs each session
   # there, so ALL runtime state + the agent's own file outputs stay out of the repo,
   # while the tracked profile/agent live under runtime/.jaato/ (see .gitignore).
-  workspace: "/home/apanoia/Sources/Jaato-framework-and-examples/jaato-client-telegram/runtime"
+  workspace: "${JAATO_TG_WORKSPACE}"
   # Where the bot installs user-approved dynamic host tools (`register_tool`).
   # MUST be OUTSIDE `workspace` so the AppArmor-confined runner can't write or
   # tamper with installed tool code. Empty = dynamic-tool installs disabled.
-  host_tools_dir: "/home/apanoia/.local/share/jaato_client_telegram/host_tools"
+  host_tools_dir: "${JAATO_TG_HOST_TOOLS_DIR}"
 
 # Session Pool Configuration
 session:
@@ -74,7 +74,7 @@ session:
   # session after a restart (instead of starting a fresh conversation). The
   # daemon loads the session from disk if needed. Keep it OUTSIDE the workspace
   # and repo; empty disables re-attachment.
-  session_store_path: "/home/apanoia/.local/share/jaato_client_telegram/chat_sessions.json"
+  session_store_path: "${JAATO_TG_SESSION_STORE}"
 
   # Post this one-line notice to a chat the instant its session is dropped by idle
   # cleanup (~idle_timeout_minutes), so the later "Resuming…" is expected. Empty

@@ -79,8 +79,12 @@ jaato_ws:
   agent: "telegram_chat"
   # Absolute path to this workspace on the SERVER's filesystem, declared via
   # set_workspace on connect so the WS server discovers the profile/agent above.
-  # Required when profile/agent name workspace-local definitions.
-  # workspace: "/abs/path/to/jaato-client-telegram"
+  # Required when profile/agent name workspace-local definitions. Must be absolute
+  # because the shared server daemon resolves it in its own process, not the bot's.
+  # Prefer an env var over a literal path (any ${VAR} is substituted at load) so
+  # the config stays host-portable — e.g. set JAATO_TG_WORKSPACE in your env/
+  # systemd EnvironmentFile alongside the tokens:
+  # workspace: "${JAATO_TG_WORKSPACE}"
 
 # Session Pool Configuration
 session:
