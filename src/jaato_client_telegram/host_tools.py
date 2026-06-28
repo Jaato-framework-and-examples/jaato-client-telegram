@@ -149,33 +149,6 @@ TOOL_SCHEMAS = [
         # tools) — not new executable code — so no per-call approval needed.
         "auto_approve": True,
     },
-    {
-        "name": "open_thread",
-        "description": (
-            "Start a NEW Telegram thread for a distinct topic of conversation. "
-            "Provide a short 'title' — it is sent as the thread's first (root) "
-            "message, and EVERYTHING you and your tools send afterwards stays in "
-            "that thread until the user moves to another or you open a new one. "
-            "Use it ONLY when the conversation clearly shifts to a new subject — "
-            "NOT for normal back-and-forth: you already follow the user's current "
-            "thread automatically, so you do not need this to stay in the existing "
-            "conversation."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Short title for the new thread; sent as its first message.",
-                },
-            },
-            "required": ["title"],
-        },
-        "category": "telegram",
-        "timeout": 30000,
-        # Sends one chat message + updates bot-owned thread state — benign.
-        "auto_approve": True,
-    },
 ]
 
 TOOL_CATEGORIES = {

@@ -19,16 +19,6 @@ def test_sync_inbound_sets_current_and_known():
     assert s.current(1) is None
 
 
-def test_open_new_mints_distinct_id():
-    s = ChatThreadStore()
-    s.sync_inbound(1, 5)
-    a = s.open_new(1)
-    assert a != 5 and a == s.current(1)
-    b = s.open_new(1)
-    assert b not in (5, a)  # distinct from every id seen
-    assert s.current(1) == b
-
-
 def test_distinct_across_chats():
     s = ChatThreadStore()
     s.sync_inbound(1, 7)
@@ -40,15 +30,12 @@ def test_persistence_round_trip(tmp_path):
     p = str(tmp_path / "threads.json")
     s = ChatThreadStore(p)
     s.sync_inbound(1, 10)
-    s.open_new(1)
     cur = s.current(1)
     # reload from disk
     s2 = ChatThreadStore(p)
     assert s2.current(1) == cur
-    # known persisted -> next mint still distinct
-    assert s2.open_new(1) != cur
     on_disk = json.loads((tmp_path / "threads.json").read_text())
-    assert "1" in on_disk and "known" in on_disk["1"]
+    assert "1" in on_disk and "known" in on_disk["1"] and 10 in on_disk["1"]["known"]
 
 
 def test_inmemory_when_no_path():
@@ -119,38 +106,26 @@ def test_non_send_attribute_passes_through():
     assert tb.id == 12345
 
 
-# ── open_thread executor ─────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
-async def test_open_thread_adopts_root_message_id_as_current():
-    from unittest.mock import MagicMock, AsyncMock
-    from jaato_client_telegram.session_pool import SessionPool
+async def test_proxy_retries_without_thread_on_thread_not_found():
+    from aiogram.exceptions import TelegramBadRequest
 
-    bot = MagicMock()
-    sent = MagicMock(); sent.message_id = 4321
-    bot.send_message = AsyncMock(return_value=sent)
-    pool = SessionPool(ws_config=MagicMock(), bot=bot, file_config=None, session_store_path="")
+    class _FlakyBot:
+        def __init__(self): self.calls = []
+        async def send_message(self, **kwargs):
+            self.calls.append(kwargs)
+            if "message_thread_id" in kwargs:   # first try (with injected thread) fails
+                raise TelegramBadRequest(method="x", message="Bad Request: message thread not found")
+            return "ok"
 
-    res = await pool._make_open_thread_executor(chat_id=7)({"title": "Groceries"})
-    assert res["status"] == "ok" and res["thread_id"] == 4321
-    assert pool.current_thread(7) == 4321
-    # the root title goes via the RAW bot with NO message_thread_id (must not thread
-    # into the OLD thread)
-    bot.send_message.assert_awaited_once()
-    assert "message_thread_id" not in bot.send_message.call_args.kwargs
-
-
-@pytest.mark.asyncio
-async def test_open_thread_requires_title():
-    from unittest.mock import MagicMock
-    from jaato_client_telegram.session_pool import SessionPool
-
-    pool = SessionPool(ws_config=MagicMock(), bot=MagicMock(), file_config=None, session_store_path="")
-    res = await pool._make_open_thread_executor(7)({"title": "  "})
-    assert "error" in res
+    bot = _FlakyBot()
+    tb = ThreadAwareBot(bot, chat_id=1, thread_getter=lambda: 555)
+    assert await tb.send_message(chat_id=1, text="hi") == "ok"   # didn't raise
+    assert len(bot.calls) == 2                                    # injected, then retried without
+    assert "message_thread_id" not in bot.calls[1]
 
 
-# ── renderer follows the current thread (open_thread override) ────────────────
+# ── renderer follows the store's current thread (+ stale-thread guard) ────────
 
 def _msg_mock(inbound_thread):
     from unittest.mock import AsyncMock, MagicMock
@@ -182,10 +157,10 @@ async def _stream_one(msg, thread_getter):
 
 
 @pytest.mark.asyncio
-async def test_renderer_overrides_thread_after_open_thread():
-    # current thread (555) != the inbound message's thread (100) → open_thread
-    # branched, so the model narration must go via bot.send_message(thread=555),
-    # NOT Message.answer() (which would stick to the inbound thread).
+async def test_renderer_sends_explicitly_when_thread_differs_from_inbound():
+    # When the store's current thread differs from the inbound message's thread,
+    # the renderer sends via bot.send_message(message_thread_id=…) (Message.answer()
+    # can't be told the thread).
     msg = _msg_mock(inbound_thread=100)
     await _stream_one(msg, thread_getter=lambda: 555)
     assert msg.bot.send_message.await_count >= 1
@@ -201,3 +176,17 @@ async def test_renderer_keeps_answer_when_thread_matches_inbound():
     await _stream_one(msg, thread_getter=lambda: 100)
     msg.answer.assert_awaited()
     assert msg.bot.send_message.await_count == 0  # text didn't go via send_message
+
+
+@pytest.mark.asyncio
+async def test_renderer_recovers_from_invalid_thread_instead_of_crashing():
+    # A stale/invalid thread id (the bot can't create threads in a private chat)
+    # must NOT crash the turn — the renderer drops the thread and delivers.
+    from aiogram.exceptions import TelegramBadRequest
+    msg = _msg_mock(inbound_thread=100)
+    msg.bot.send_message = __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(
+        side_effect=TelegramBadRequest(method="x", message="Bad Request: message thread not found")
+    )
+    await _stream_one(msg, thread_getter=lambda: 555)   # 555 invalid
+    msg.bot.send_message.assert_awaited()               # tried the thread
+    msg.answer.assert_awaited()                          # fell back to plain answer()

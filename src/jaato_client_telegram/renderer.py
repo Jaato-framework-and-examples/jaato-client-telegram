@@ -935,22 +935,34 @@ class ResponseRenderer:
         inbound = target.message_thread_id if getattr(target, "is_topic_message", False) else None
         override = message_thread_id is not None and message_thread_id != inbound
 
-        async def _send(pm: str | None):
-            if override:
+        async def _send(pm: str | None, use_override: bool):
+            if use_override:
                 return await target.bot.send_message(
                     chat_id=target.chat.id, text=text,
                     message_thread_id=message_thread_id, parse_mode=pm, **kwargs,
                 )
             return await target.answer(text, parse_mode=pm, **kwargs)
 
+        async def _send_resilient(pm: str | None):
+            try:
+                return await _send(pm, override)
+            except TelegramBadRequest as e:
+                # A stale/invalid thread id must NEVER crash the turn — deliver to
+                # the message's own thread instead. (Private chats give the bot no
+                # way to CREATE a thread, so a bot-side thread id can be bogus.)
+                if override and "thread not found" in str(e).lower():
+                    log.warning("message_thread_id %s not found — delivering without it", message_thread_id)
+                    return await _send(pm, False)
+                raise
+
         if not parse_mode:
-            m = await _send(None)
+            m = await _send_resilient(None)
         else:
             try:
-                m = await _send(parse_mode)
+                m = await _send_resilient(parse_mode)
             except TelegramBadRequest as e:
                 if self._is_html_parse_error(e):
-                    m = await _send(None)  # real plain text
+                    m = await _send_resilient(None)  # real plain text
                 else:
                     raise
         log.info(

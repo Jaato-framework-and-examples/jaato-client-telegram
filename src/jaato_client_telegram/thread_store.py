@@ -2,9 +2,9 @@
 
 The bot follows whichever thread the user is writing in: each inbound message's
 ``message_thread_id`` is synced here, and every bot send for that chat (the
-renderer's model output AND host-tool messages) goes into ``current``. The model
-can branch to a NEW thread via the ``open_thread`` host tool, which mints an id
-distinct from every thread seen so far (``known``) and makes it current.
+renderer's model output AND host-tool messages) goes into ``current``. The bot
+can only FOLLOW threads, not create them — in a private chat the Bot API gives no
+way to start one (only the user's client can), so there is no "open thread".
 
 Persisted to JSON when a path is given (continuity survives restarts); in-memory
 only otherwise — there is no hardcoded default path (repo convention: an empty
@@ -66,24 +66,3 @@ class ChatThreadStore:
             self._known.setdefault(chat_id, set()).add(thread_id)
         self._save()
 
-    def open_new(self, chat_id: int) -> int:
-        """Mint a thread id distinct from every id seen in this chat, make it the
-        current send thread, and return it. The ``open_thread`` tool sends its
-        titled root message with this id."""
-        known = self._known.setdefault(chat_id, set())
-        candidates = set(known)
-        cur = self._current.get(chat_id)
-        if cur:
-            candidates.add(cur)
-        new_id = (max(candidates) if candidates else 0) + 1
-        known.add(new_id)
-        self._current[chat_id] = new_id
-        self._save()
-        return new_id
-
-    def set_current(self, chat_id: int, thread_id: int | None) -> None:
-        """Force the current thread (e.g. back to main with ``None``)."""
-        self._current[chat_id] = thread_id
-        if thread_id is not None:
-            self._known.setdefault(chat_id, set()).add(thread_id)
-        self._save()

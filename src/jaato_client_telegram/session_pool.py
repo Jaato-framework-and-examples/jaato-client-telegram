@@ -274,7 +274,6 @@ class SessionPool:
         executors = create_tool_executors(tbot, chat_id, self._file_config)
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
         executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
-        executors["open_thread"] = self._make_open_thread_executor(chat_id)
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
             for name, t in load_all_tools(tools_dir).items():
@@ -284,36 +283,6 @@ class SessionPool:
                 schemas.append(mark_user_installed(t["schema"]))
                 executors[name] = make_executor(t["execute"], tbot, chat_id)
         return schemas, executors
-
-    def _make_open_thread_executor(self, chat_id: int):
-        """``open_thread`` built-in: the model branches the conversation into a new
-        Telegram thread. Telegram thread ids ARE message ids (verified: inbound
-        threads carry message_thread_id == a real message's id), so we send the
-        title as a fresh root message via the RAW bot (NOT the ThreadAwareBot
-        proxy — we must NOT thread the root into the OLD thread) and adopt its
-        message_id as the new current thread. Host-tool sends then follow it via
-        the proxy reading the store live."""
-        async def executor(args: dict) -> dict:
-            title = (args or {}).get("title", "").strip()
-            if not title:
-                return {"error": "Provide a short 'title' for the new thread."}
-            try:
-                sent = await self._bot.send_message(chat_id=chat_id, text=title)
-                new_tid = sent.message_id
-                self._thread_store.set_current(chat_id, new_tid)
-                logger.info(
-                    "open_thread: chat=%s new thread_id=%s title=%r",
-                    chat_id, new_tid, title,
-                )
-                return {
-                    "status": "ok",
-                    "thread_id": new_tid,
-                    "message": f"Opened new thread '{title}'. Subsequent messages stay in it.",
-                }
-            except Exception as e:  # noqa: BLE001 — tool boundary
-                logger.exception("open_thread failed")
-                return {"error": str(e)}
-        return executor
 
     # --- Telegram thread continuity -----------------------------------------
     def sync_thread(self, chat_id: int, thread_id: "int | None") -> None:

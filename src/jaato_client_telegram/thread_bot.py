@@ -34,13 +34,24 @@ class ThreadAwareBot:
         if not (name.startswith("send_") and callable(attr)):
             return attr
 
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            injected = False
             if "message_thread_id" not in kwargs:
                 cid = kwargs.get("chat_id", args[0] if args else None)
                 if cid == self._chat_id:
                     tid = self._thread_getter()
                     if tid is not None:
                         kwargs["message_thread_id"] = tid
-            return attr(*args, **kwargs)
+                        injected = True
+            try:
+                return await attr(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 — only swallow the thread case
+                # A stale/invalid thread id we injected must not break a host-tool
+                # send (private chats give the bot no way to create a thread) —
+                # retry without it. Anything else propagates.
+                if injected and "thread not found" in str(e).lower():
+                    kwargs.pop("message_thread_id", None)
+                    return await attr(*args, **kwargs)
+                raise
 
         return wrapped
