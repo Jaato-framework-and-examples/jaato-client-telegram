@@ -86,6 +86,12 @@ def escape_html_content(text: str) -> str:
 # inside this, and any active turn keeps emitting events that reset the timer.
 _STALL_TIMEOUT_SECS = 120.0
 
+# While a permission/clarification prompt is pending, the server is BLOCKED on the
+# user's answer, so NO events is expected — the 120s stall timer must not fire (it
+# would falsely "reset" the session the answer is for). Use a far more generous cap
+# so a slow human answer is fine, while a truly abandoned prompt still recovers.
+_AWAIT_USER_TIMEOUT_SECS = 1800.0  # 30 min
+
 
 # --- Markdown -> Telegram HTML --------------------------------------------------
 # The model is told the client supports markdown (presentation context), so it
@@ -485,15 +491,26 @@ class ResponseRenderer:
         turn_started = False
         
         event_iter = event_stream.__aiter__()
+        chat_id = initial_message.chat.id
         while True:
+            # A pending permission/clarification means the server is waiting on the
+            # USER, so silence is expected — don't treat it as a stall (use the long
+            # await-user cap instead of the 120s runner-stall timeout).
+            awaiting_user = (
+                (self._permission_handler is not None
+                 and self._permission_handler.get_pending(chat_id) is not None)
+                or (self._clarification_handler is not None
+                    and self._clarification_handler.get_pending(chat_id) is not None)
+            )
+            timeout = _AWAIT_USER_TIMEOUT_SECS if awaiting_user else _STALL_TIMEOUT_SECS
             try:
                 event = await asyncio.wait_for(
-                    event_iter.__anext__(), timeout=_STALL_TIMEOUT_SECS
+                    event_iter.__anext__(), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "stream_response: no event for %.0fs — treating session as stalled",
-                    _STALL_TIMEOUT_SECS,
+                    "stream_response: no event for %.0fs (awaiting_user=%s) — treating session as stalled",
+                    timeout, awaiting_user,
                 )
                 ctx.stalled = True
                 break
