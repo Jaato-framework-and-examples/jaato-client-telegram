@@ -128,6 +128,16 @@ async def handle_private_message(
                 # Returning user: quick typing indicator
                 await message.bot.send_chat_action(chat_id=chat_id, action="typing")
 
+            # Follow the user's Telegram thread: host-tool sends (and, later, the
+            # renderer) go into whatever thread this message is in. Logged so we
+            # can see what inbound messages actually carry (forum vs reply-thread).
+            logger.info(
+                "inbound thread: chat=%s message_thread_id=%s is_topic_message=%s",
+                chat_id, message.message_thread_id,
+                getattr(message, "is_topic_message", None),
+            )
+            pool.sync_thread(chat_id, message.message_thread_id)
+
             session_id = await pool.get_or_create_session(chat_id)
 
             if pool.took_reattach(chat_id):
@@ -289,6 +299,13 @@ async def handle_private_media(
             buf = await message.bot.download_file(tg_file_info.file_path)
             data = buf.read()
             attachments = _build_image_attachments(data, mime_type, name)
+
+            logger.info(
+                "inbound thread (media): chat=%s message_thread_id=%s is_topic_message=%s",
+                chat_id, message.message_thread_id,
+                getattr(message, "is_topic_message", None),
+            )
+            pool.sync_thread(chat_id, message.message_thread_id)
 
             session_id = await pool.get_or_create_session(chat_id)
             if pool.took_reattach(chat_id):

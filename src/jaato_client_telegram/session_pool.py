@@ -34,6 +34,8 @@ from jaato_client_telegram.host_tool_loader import (
 )
 from jaato_client_telegram.transport import WSTransport
 from jaato_client_telegram.chat_session_store import ChatSessionStore
+from jaato_client_telegram.thread_store import ChatThreadStore
+from jaato_client_telegram.thread_bot import ThreadAwareBot
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -88,6 +90,14 @@ class SessionPool:
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
+        # Per-chat Telegram thread continuity: the bot follows the user's thread
+        # and host-tool sends stay in it (see thread_store / ThreadAwareBot).
+        # Persisted next to the session store; in-memory when that's unconfigured.
+        thread_store_path = (
+            str(Path(session_store_path).with_name("chat_threads.json"))
+            if session_store_path else ""
+        )
+        self._thread_store = ChatThreadStore(thread_store_path)
         # Whether the most recent get_or_create_session for a chat RE-ATTACHED to
         # a persisted session (vs created fresh / reused in-memory) — so the
         # handler can show a "Resumed" cue. Read via took_reattach().
@@ -254,9 +264,17 @@ class SessionPool:
         show_image, register_tool) + any user-installed dynamic tools. Loaded fresh
         so a just-installed tool is picked up on the next registration."""
         schemas = list(TOOL_SCHEMAS)
-        executors = create_tool_executors(self._bot, chat_id, self._file_config)
+        # Wrap the bot so every host-tool send (built-in AND dynamic ctx.bot) is
+        # injected with this chat's current message_thread_id at send time, keeping
+        # tool messages in the same thread as the conversation. Reads the thread
+        # store live, so a thread switch is reflected immediately.
+        tbot = ThreadAwareBot(
+            self._bot, chat_id, lambda cid=chat_id: self._thread_store.current(cid)
+        )
+        executors = create_tool_executors(tbot, chat_id, self._file_config)
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
         executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
+        executors["open_thread"] = self._make_open_thread_executor(chat_id)
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
             for name, t in load_all_tools(tools_dir).items():
@@ -264,8 +282,48 @@ class SessionPool:
                 # mistakes them for built-ins present at bootstrap (see
                 # mark_user_installed). Static host tools above stay unmarked.
                 schemas.append(mark_user_installed(t["schema"]))
-                executors[name] = make_executor(t["execute"], self._bot, chat_id)
+                executors[name] = make_executor(t["execute"], tbot, chat_id)
         return schemas, executors
+
+    def _make_open_thread_executor(self, chat_id: int):
+        """``open_thread`` built-in: the model branches the conversation into a new
+        Telegram thread. Telegram thread ids ARE message ids (verified: inbound
+        threads carry message_thread_id == a real message's id), so we send the
+        title as a fresh root message via the RAW bot (NOT the ThreadAwareBot
+        proxy — we must NOT thread the root into the OLD thread) and adopt its
+        message_id as the new current thread. Host-tool sends then follow it via
+        the proxy reading the store live."""
+        async def executor(args: dict) -> dict:
+            title = (args or {}).get("title", "").strip()
+            if not title:
+                return {"error": "Provide a short 'title' for the new thread."}
+            try:
+                sent = await self._bot.send_message(chat_id=chat_id, text=title)
+                new_tid = sent.message_id
+                self._thread_store.set_current(chat_id, new_tid)
+                logger.info(
+                    "open_thread: chat=%s new thread_id=%s title=%r",
+                    chat_id, new_tid, title,
+                )
+                return {
+                    "status": "ok",
+                    "thread_id": new_tid,
+                    "message": f"Opened new thread '{title}'. Subsequent messages stay in it.",
+                }
+            except Exception as e:  # noqa: BLE001 — tool boundary
+                logger.exception("open_thread failed")
+                return {"error": str(e)}
+        return executor
+
+    # --- Telegram thread continuity -----------------------------------------
+    def sync_thread(self, chat_id: int, thread_id: "int | None") -> None:
+        """Record the thread the user's latest message was in, so bot replies +
+        host-tool sends follow it. Called by the message handlers on each turn."""
+        self._thread_store.sync_inbound(chat_id, thread_id)
+
+    def current_thread(self, chat_id: int) -> "int | None":
+        """The message_thread_id the bot should currently send into for this chat."""
+        return self._thread_store.current(chat_id)
 
     def _make_register_tool_executor(self, chat_id: int):
         async def executor(args: dict) -> dict:
