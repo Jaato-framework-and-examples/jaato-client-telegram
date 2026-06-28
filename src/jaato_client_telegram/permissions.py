@@ -116,6 +116,26 @@ class PermissionHandler:
     _PARAM_EXPAND_MAX = 2800    # longer value up to this → in-message expandable
     _PARAM_MSG_BUDGET = 3400    # total expandable chars per message before overflow→file
 
+    # Name the overflow attachment after the REAL file the code writes: the
+    # documented tool_drafts/<name> draft convention first, then any
+    # open("<file>", "w"/"x"/"a") target. Grounded in the draft convention, not a
+    # blind guess; falls back to {param}.{ext} when the code writes no such file.
+    _DRAFT_PATH_RE = re.compile(r"tool_drafts/([\w.\-]+\.[A-Za-z0-9]+)")
+    _WRITE_TARGET_RE = re.compile(
+        r"""open\(\s*['"]([^'"]+\.[A-Za-z0-9]+)['"]\s*,\s*['"][wax]b?['"]"""
+    )
+
+    def _overflow_filename(self, key: str, value: str, ext: str) -> str:
+        """Meaningful name for an oversized param sent as a file: the real file the
+        code writes (so a tool-creating cell → e.g. moon_phase.py), else
+        {param}.{ext} (no tool-name prefix, no double extension)."""
+        m = self._DRAFT_PATH_RE.search(value) or self._WRITE_TARGET_RE.search(value)
+        if m:
+            name = m.group(1).rsplit("/", 1)[-1].strip()
+            if name and "/" not in name and ".." not in name:
+                return name
+        return f"{key}.{ext}"
+
     def __init__(
         self,
         unsupported_actions_str: str | None = None,
@@ -220,7 +240,7 @@ class PermissionHandler:
                     or self._ext_map.get(str(tool_name).lower())
                     or "txt"
                 )
-                fname = f"{tool_name}.{key}.{ext}"
+                fname = self._overflow_filename(str(key), s, ext)
                 files.append((fname, s))
                 preview = html.escape(s[:180], quote=False)
                 lines.append(

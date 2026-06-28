@@ -51,32 +51,43 @@ def test_long_multiline_param_is_full_and_expandable():
 
 def test_huge_param_overflows_to_file_with_preview():
     h = PermissionHandler()  # default code_extensions = notebook_execute:py
-    big = "x = 1\n" * 2000                  # > _PARAM_EXPAND_MAX → file
+    big = "x = 1\n" * 2000                  # > _PARAM_EXPAND_MAX, no file written → file
     text, _, files = h.create_permission_ui(_event({"code": big}, _ALL_OPTIONS), 1)
     assert len(files) == 1
     fname, content = files[0]
-    assert fname == "notebook_execute.code.py"   # Python code → .py (opens an IDE)
-    assert content == big                  # the WHOLE thing travels as a file
-    assert "full value sent as" in text    # prompt tells the user where it went
-    assert len(text) < 4096                # prompt itself stays within Telegram's limit
+    assert fname == "code.py"               # no real filename in code → {param}.{ext}, no tool prefix
+    assert content == big                   # the WHOLE thing travels as a file
+    assert "full value sent as" in text     # prompt tells the user where it went
+    assert len(text) < 4096                 # prompt itself stays within Telegram's limit
 
 
-def test_overflow_extension_map_falls_back_to_txt_for_unknown_tool():
+def test_overflow_uses_real_filename_from_draft_write():
+    # Tool-creating cell writes tool_drafts/<name>.py → name the attachment after it.
+    # The code STRING itself must be big enough to overflow (a long literal body).
+    h = PermissionHandler()
+    code = (
+        'with open("tool_drafts/moon_phase.py", "w") as f:\n    f.write("""\n'
+        + ("# moon phase logic line\n" * 300)  # ~7k chars of code text
+        + '""")\n'
+    )
+    _, _, files = h.create_permission_ui(_event({"code": code}, _ALL_OPTIONS), 1)
+    assert files[0][0] == "moon_phase.py"
+
+
+def test_overflow_uses_open_write_target_when_no_draft_path():
+    h = PermissionHandler()
+    code = 'open("report.csv", "w").write("""\n' + ("row,value\n" * 500) + '""")\n'
+    _, _, files = h.create_permission_ui(_event({"code": code}, _ALL_OPTIONS), 1)
+    assert files[0][0] == "report.csv"
+
+
+def test_overflow_fallback_for_unknown_tool_drops_tool_name():
     h = PermissionHandler(code_extensions_str="notebook_execute:py")
-    big = "data\n" * 2000
+    big = "data\n" * 2000                    # no file write → {param}.{ext}
     ev = _event({"blob": big}, _ALL_OPTIONS)
     ev.tool_name = "some_other_tool"
     _, _, files = h.create_permission_ui(ev, 1)
-    assert files[0][0] == "some_other_tool.blob.txt"
-
-
-def test_overflow_extension_supports_tool_dot_param_keys():
-    h = PermissionHandler(code_extensions_str="myrunner.script:js")
-    big = "const x = 1;\n" * 2000
-    ev = _event({"script": big}, _ALL_OPTIONS)
-    ev.tool_name = "myrunner"
-    _, _, files = h.create_permission_ui(ev, 1)
-    assert files[0][0] == "myrunner.script.js"
+    assert files[0][0] == "blob.txt"
 
 
 # ── button declutter ─────────────────────────────────────────────────────────
