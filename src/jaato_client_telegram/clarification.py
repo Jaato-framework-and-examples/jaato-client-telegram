@@ -105,15 +105,16 @@ class ClarificationHandler:
         lines.append(html.escape(question.get("text", ""), quote=False))
 
         choices = question.get("choices") or []
-        if choices:
+        keyboard: InlineKeyboardMarkup | None = None
+        if qtype == "single_choice" and choices:
+            # The options ARE the tappable buttons — don't also list them as prose
+            # (that rendered every option twice: once in the text, once as a button).
+            keyboard = self._build_choice_keyboard(pending.request_id, pending.current, choices)
+        elif qtype == "multiple_choice" and choices:
+            # No buttons here — the user types the numbers, so they must see them.
             lines.append("")
             for j, choice in enumerate(choices, 1):
                 lines.append(f"  {j}. {html.escape(choice.get('text', ''), quote=False)}")
-
-        keyboard: InlineKeyboardMarkup | None = None
-        if qtype == "single_choice" and choices:
-            keyboard = self._build_choice_keyboard(pending.request_id, pending.current, choices)
-        elif qtype == "multiple_choice":
             lines += ["", "<i>Reply with the option numbers, comma-separated (e.g. 1,3).</i>"]
         else:  # free_text (or single_choice with no choices — treat as text)
             lines += ["", "<i>Reply with your answer.</i>"]
