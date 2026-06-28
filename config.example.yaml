@@ -140,6 +140,11 @@ permissions:
   #   unsupported_actions: "allow_session,allow_turn,allow_until_idle,allow_once,deny_session,allow_all,comment,edit"
   unsupported_actions: "comment,edit"
 
+  # Buttons to SHOW on a permission prompt, by label — declutters the prompt to
+  # the essentials (the server offers many duration variants: turn/idle/once/all).
+  # Comma/pipe separated; empty = show every option the server sends.
+  primary_actions: "yes,no,always,never"
+
 # File Sharing Configuration
 file_sharing:
   # Enable/disable file sharing (default: true)

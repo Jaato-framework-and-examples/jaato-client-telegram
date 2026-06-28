@@ -117,6 +117,12 @@ class PermissionConfig(BaseModel):
     # Example: "comment,edit,idle,turn,all" or use pipe: "comment|edit|idle|turn|all"
     unsupported_actions: str = "comment,edit,modify,custom,input"
 
+    # Inline-keyboard buttons to SHOW on a permission prompt, by their label. The
+    # server offers many duration variants (turn/idle/once/all/comment) that
+    # clutter the prompt; only options whose label matches are shown. Comma/pipe
+    # separated. Empty => show all (legacy). Default keeps the essential four.
+    primary_actions: str = "yes,no,always,never"
+
 
 class RenderingConfig(BaseModel):
     """Response rendering configuration."""

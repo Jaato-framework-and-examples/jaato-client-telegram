@@ -751,15 +751,30 @@ class ResponseRenderer:
                     ctx.permission_sent = True
                     
                     # Show the permission UI as a separate message with choices
-                    text, keyboard = self._permission_handler.create_permission_ui(
+                    text, keyboard, overflow_files = self._permission_handler.create_permission_ui(
                         event,
                         initial_message.chat.id,
                     )
-                    
+
                     # Send permission request message with typing indicator
                     await initial_message.bot.send_chat_action(chat_id=initial_message.chat.id, action="typing")
                     await asyncio.sleep(0.1)
-                    perm_message = await initial_message.answer(text, reply_markup=keyboard)
+                    # Oversized params (e.g. a whole tool's code) go as files FIRST,
+                    # so the user can actually review them before deciding.
+                    for fname, content in overflow_files:
+                        try:
+                            from aiogram.types import BufferedInputFile
+                            await initial_message.answer_document(
+                                BufferedInputFile(content.encode("utf-8"), filename=fname),
+                                caption=f"📄 {fname} — full value for the permission request below",
+                            )
+                        except Exception:
+                            log.warning("failed to send permission overflow file %s", fname, exc_info=True)
+                    # Route through _safe_answer so a bad-HTML edge case degrades to
+                    # plain text (keeps the keyboard) instead of raising.
+                    perm_message = await self._safe_answer(
+                        initial_message, text, reply_markup=keyboard,
+                    )
                     
                     # Store pending permission
                     self._permission_handler.store_pending(

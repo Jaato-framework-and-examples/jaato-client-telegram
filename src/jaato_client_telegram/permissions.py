@@ -111,11 +111,22 @@ class PermissionHandler:
         "input",        # Requires text input field
     }
 
-    def __init__(self, unsupported_actions_str: str | None = None):
+    # Param-rendering thresholds (so the user can REVIEW what they approve).
+    _PARAM_INLINE_MAX = 80      # single-line value up to this → inline
+    _PARAM_EXPAND_MAX = 2800    # longer value up to this → in-message expandable
+    _PARAM_MSG_BUDGET = 3400    # total expandable chars per message before overflow→file
+
+    def __init__(
+        self,
+        unsupported_actions_str: str | None = None,
+        primary_actions_str: str | None = "yes,no,always,never",
+    ):
         """
         Initialize permission handler.
 
         Args:
+            primary_actions_str: Comma/pipe-separated labels to SHOW as buttons
+                (declutter). Empty => show all (legacy denylist behavior).
             unsupported_actions_str: Comma or pipe-separated list of unsupported
                                      action types (e.g., "comment,edit" or "comment|edit")
                                      If None, uses default set
@@ -128,6 +139,12 @@ class PermissionHandler:
 
         # Parse unsupported actions from config or use defaults
         self._unsupported_actions = self._parse_unsupported_actions(unsupported_actions_str)
+        # Labels to show as buttons (declutter). Empty => show all (legacy).
+        self._primary_labels = {
+            a.strip().lower()
+            for a in (primary_actions_str or "").replace("|", ",").split(",")
+            if a.strip()
+        }
         logger.info(
             f"PermissionHandler initialized with unsupported actions: "
             f"{sorted(self._unsupported_actions)}"
@@ -165,11 +182,45 @@ class PermissionHandler:
 
         return actions_set
 
+    def _render_params(
+        self, tool_name: str, tool_args: dict[str, Any],
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """Render tool params so the user can REVIEW what they're approving.
+
+        Short scalars stay inline; long/multi-line values (e.g. ``code``) go in a
+        collapsed-by-default ``<blockquote expandable>`` — full content on one tap,
+        without a wall of text in the prompt. Anything too large for a Telegram
+        message is sent as a file (and previewed). Returns ``(lines, files)`` where
+        ``files = [(filename, content)]`` for the caller to send BEFORE the prompt.
+        """
+        lines: list[str] = ["<b>Parameters:</b>"]
+        files: list[tuple[str, str]] = []
+        budget = self._PARAM_MSG_BUDGET
+        for key, value in (tool_args or {}).items():
+            s = strip_ansi_codes(str(value))
+            k = html.escape(str(key), quote=False)
+            if "\n" not in s and len(s) <= self._PARAM_INLINE_MAX:
+                lines.append(f"  • <code>{k}</code>: {html.escape(s, quote=False)}")
+            elif len(s) <= self._PARAM_EXPAND_MAX and len(s) <= budget:
+                budget -= len(s)
+                lines.append(f"  • <code>{k}</code>:")
+                lines.append(f"<blockquote expandable>{html.escape(s, quote=False)}</blockquote>")
+            else:
+                fname = f"{tool_name}.{key}.txt"
+                files.append((fname, s))
+                preview = html.escape(s[:180], quote=False)
+                lines.append(
+                    f"  • <code>{k}</code>: <i>({len(s)} chars — full value sent "
+                    f"as {html.escape(fname)} ⬆️)</i>"
+                )
+                lines.append(f"<blockquote expandable>{preview}…</blockquote>")
+        return lines, files
+
     def create_permission_ui(
         self,
         event: PermissionRequestedEvent,
         chat_id: int,
-    ) -> tuple[str, InlineKeyboardMarkup]:
+    ) -> tuple[str, InlineKeyboardMarkup, list[tuple[str, str]]]:
         """
         Create permission request UI from event.
 
@@ -178,18 +229,19 @@ class PermissionHandler:
             chat_id: Telegram chat ID
 
         Returns:
-            Tuple of (message_text, inline_keyboard)
+            (message_text, inline_keyboard, overflow_files) — overflow_files are
+            oversized param values to send as documents before the prompt.
         """
         # Build message text
         lines = ["🔐 <b>Permission Request</b>\n"]
 
         # Tool name and description
-        lines.append(f"<b>Tool:</b> <code>{event.tool_name}</code>\n")
+        lines.append(f"<b>Tool:</b> <code>{html.escape(str(event.tool_name), quote=False)}</code>\n")
 
-        # Tool arguments (if any) - one per line, ellipsized
+        # Tool arguments rendered for review (full content / expandable / file).
+        overflow_files: list[tuple[str, str]] = []
         if event.tool_args:
-            lines.append("<b>Parameters:</b>")
-            param_lines = format_tool_params(event.tool_args, max_width=40)
+            param_lines, overflow_files = self._render_params(event.tool_name, event.tool_args)
             lines.extend(param_lines)
             lines.append("")
 
@@ -223,7 +275,7 @@ class PermissionHandler:
             event.request_id
         )
 
-        return message_text, keyboard
+        return message_text, keyboard, overflow_files
 
     def _create_keyboard(
         self,
@@ -252,13 +304,23 @@ class PermissionHandler:
         )
         logger.debug(f"Filtering unsupported actions: {sorted(self._unsupported_actions)}")
 
-        # Filter out unsupported action types. Current PermissionResponseOption
-        # schema is {key, label, action, description}; `action` may be absent on
-        # the wire (the simple y/n/a/t options carry only key/label/description).
-        filtered_options = [
-            opt for opt in options
-            if opt.get("action", "") not in self._unsupported_actions
-        ]
+        # Show only the PRIMARY actions, by LABEL. The server offers many duration
+        # variants (turn/idle/once/all/comment) that clutter the prompt — and the
+        # old filter keyed off `action`, which is ABSENT on the wire (options carry
+        # only key/label), so it filtered nothing. label/key ARE present, so we
+        # filter on those. Empty _primary_labels => legacy (drop unsupported-action
+        # options only). The default-yes/no fallback below covers an empty result.
+        if self._primary_labels:
+            filtered_options = [
+                opt for opt in options
+                if (opt.get("label") or opt.get("key", "")).strip().lower()
+                in self._primary_labels
+            ]
+        else:
+            filtered_options = [
+                opt for opt in options
+                if opt.get("action", "") not in self._unsupported_actions
+            ]
 
         logger.debug(f"After filtering: {len(filtered_options)} options remain")
 

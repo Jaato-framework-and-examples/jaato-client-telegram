@@ -103,6 +103,10 @@ permissions:
   # Example: "comment,edit,idle,turn,all" or "comment|edit|idle|turn|all"
   unsupported_actions: "allow_session,allow_turn,allow_until_idle,allow_once,deny_session,allow_all,comment,edit"
 
+  # Buttons to SHOW on a permission prompt, by label (declutter — the server
+  # offers many duration variants that clutter the prompt). Empty = show all.
+  primary_actions: "yes,no,always,never"
+
 # Rate Limiting
 rate_limiting:
   # Enable rate limiting to prevent abuse

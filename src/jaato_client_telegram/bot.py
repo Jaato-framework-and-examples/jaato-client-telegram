@@ -93,7 +93,10 @@ def create_bot_and_dispatcher(
     # Create shared dependencies
     pool = _create_session_pool(config)
     pool.set_bot(bot, getattr(config, "file_sharing", None))
-    permission_handler = PermissionHandler(config.permissions.unsupported_actions)
+    permission_handler = PermissionHandler(
+        config.permissions.unsupported_actions,
+        config.permissions.primary_actions,
+    )
     clarification_handler = ClarificationHandler()
     file_handler = FileHandler(config.file_sharing)
 
