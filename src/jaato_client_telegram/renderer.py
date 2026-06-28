@@ -11,7 +11,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from jaato_client_telegram.semantic_markup import render_semantic_markup
 
@@ -157,6 +157,11 @@ class StreamingContext:
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
+
+    # Returns the message_thread_id the bot should currently send into for this
+    # chat (read live so an open_thread mid-turn is reflected). None => follow the
+    # incoming message's thread via Message.answer() as before.
+    thread_id_getter: "Callable[[], int | None] | None" = None
 
 
 def _has_telegram_html(text: str) -> bool:
@@ -402,6 +407,7 @@ class ResponseRenderer:
     async def _emit_one(self, initial_message: Message, ctx: StreamingContext, text: str) -> None:
         """Send one segmented unit as its own Telegram message (splitting at 4096
         if a single unit is huge, e.g. a giant code block)."""
+        tid = ctx.thread_id_getter() if ctx.thread_id_getter else None
         for chunk in split_preserving_paragraphs(text, self._max_message_length):
             if not chunk.strip():
                 continue
@@ -412,6 +418,7 @@ class ResponseRenderer:
             has_html = _has_telegram_html(chunk)
             sent = await self._send_with_typing_indicator(
                 initial_message, chunk, parse_mode="HTML" if has_html else None,
+                message_thread_id=tid,
             )
             if sent:
                 ctx.sent_message = sent
@@ -445,6 +452,7 @@ class ResponseRenderer:
         self,
         initial_message: Message,
         event_stream,  # AsyncIterator[Event] from SDK
+        thread_id_getter: "Callable[[], int | None] | None" = None,
     ) -> StreamingContext:
         """
         Stream events progressively, editing the message in place.
@@ -455,6 +463,8 @@ class ResponseRenderer:
         Args:
             initial_message: The user's message (for context)
             event_stream: Async iterator of events from SDK
+            thread_id_getter: Optional callable returning the chat's current
+                message_thread_id (so model output follows an open_thread branch).
 
         Returns:
             StreamingContext with final accumulated text
@@ -463,6 +473,7 @@ class ResponseRenderer:
         log = logging.getLogger(__name__)
 
         ctx = StreamingContext()
+        ctx.thread_id_getter = thread_id_getter
         ctx.last_edit_time = time.monotonic()
 
         init_progress_count = 0
@@ -845,6 +856,7 @@ class ResponseRenderer:
         initial_message: Message,
         text: str,
         parse_mode: str | None = None,
+        message_thread_id: int | None = None,
     ) -> Message:
         """
         Send a message with a typing indicator action right before.
@@ -860,20 +872,22 @@ class ResponseRenderer:
         Returns:
             The sent message
         """
-        # Send typing action immediately before the message
+        # Send typing action immediately before the message (in the same thread)
         await initial_message.bot.send_chat_action(
             chat_id=initial_message.chat.id,
-            action="typing"
+            action="typing",
+            message_thread_id=message_thread_id,
         )
 
         # Small delay to ensure the typing indicator is seen
         await asyncio.sleep(0.1)
 
-        # Send the actual message
-        if parse_mode:
-            return await self._safe_answer(initial_message, text, parse_mode=parse_mode)
-        else:
-            return await initial_message.answer(text, parse_mode=None)
+        # Send the actual message — route BOTH paths through _safe_answer so the
+        # current-thread override (open_thread) applies whether or not it's HTML.
+        return await self._safe_answer(
+            initial_message, text, parse_mode=parse_mode or None,
+            message_thread_id=message_thread_id,
+        )
 
     @staticmethod
     def _is_html_parse_error(exc: TelegramBadRequest) -> bool:
@@ -883,24 +897,45 @@ class ResponseRenderer:
         s = str(exc).lower()
         return "parse entities" in s or "can't parse" in s or "unsupported start tag" in s or "tag" in s
 
-    async def _safe_answer(self, target: Message, text: str, parse_mode: str | None = "HTML", **kwargs):
+    async def _safe_answer(
+        self, target: Message, text: str, parse_mode: str | None = "HTML",
+        message_thread_id: int | None = None, **kwargs,
+    ):
         """answer() that falls back to plain text if Telegram rejects the HTML.
 
         NOTE: the bot is configured with default parse_mode=HTML, so the
         plain-text paths MUST pass parse_mode=None explicitly — otherwise the
         "fallback" re-sends as HTML, hits the same parse error, and (unwrapped)
         raises out to the caller.
+
+        ``message_thread_id``: the thread the bot is currently sending into. When
+        it differs from the thread the incoming message is in (i.e. open_thread
+        branched), we must send EXPLICITLY via bot.send_message — Message.answer()
+        derives the thread from is_topic_message and can't be overridden. When it
+        matches (the common case), answer() already follows it, so we keep using
+        it (no behaviour change, no test churn).
         """
         if not (text and text.strip()):
             return None  # Telegram rejects empty text ("message text is empty")
+        inbound = target.message_thread_id if getattr(target, "is_topic_message", False) else None
+        override = message_thread_id is not None and message_thread_id != inbound
+
+        async def _send(pm: str | None):
+            if override:
+                return await target.bot.send_message(
+                    chat_id=target.chat.id, text=text,
+                    message_thread_id=message_thread_id, parse_mode=pm, **kwargs,
+                )
+            return await target.answer(text, parse_mode=pm, **kwargs)
+
         if not parse_mode:
-            m = await target.answer(text, parse_mode=None, **kwargs)
+            m = await _send(None)
         else:
             try:
-                m = await target.answer(text, parse_mode=parse_mode, **kwargs)
+                m = await _send(parse_mode)
             except TelegramBadRequest as e:
                 if self._is_html_parse_error(e):
-                    m = await target.answer(text, parse_mode=None, **kwargs)  # real plain text
+                    m = await _send(None)  # real plain text
                 else:
                     raise
         log.info(

@@ -148,3 +148,56 @@ async def test_open_thread_requires_title():
     pool = SessionPool(ws_config=MagicMock(), bot=MagicMock(), file_config=None, session_store_path="")
     res = await pool._make_open_thread_executor(7)({"title": "  "})
     assert "error" in res
+
+
+# ── renderer follows the current thread (open_thread override) ────────────────
+
+def _msg_mock(inbound_thread):
+    from unittest.mock import AsyncMock, MagicMock
+    m = MagicMock()
+    m.chat.id = 1
+    m.message_thread_id = inbound_thread
+    m.is_topic_message = inbound_thread is not None
+    m.answer = AsyncMock(return_value=MagicMock())
+    m.bot.send_message = AsyncMock(return_value=MagicMock(message_id=999))
+    m.bot.send_chat_action = AsyncMock()
+    return m
+
+
+async def _stream_one(msg, thread_getter):
+    from jaato_client_telegram.renderer import ResponseRenderer
+
+    class Ev:
+        def __init__(self, **k): self.__dict__.update(k)
+
+    async def gen():
+        for e in (
+            {"type": "agent.output", "source": "model", "mode": "write",
+             "text": "Starting a fresh topic over here, nice and long enough."},
+            {"type": "agent.completed"},
+        ):
+            yield Ev(**e)
+
+    await ResponseRenderer().stream_response(msg, gen(), thread_id_getter=thread_getter)
+
+
+@pytest.mark.asyncio
+async def test_renderer_overrides_thread_after_open_thread():
+    # current thread (555) != the inbound message's thread (100) → open_thread
+    # branched, so the model narration must go via bot.send_message(thread=555),
+    # NOT Message.answer() (which would stick to the inbound thread).
+    msg = _msg_mock(inbound_thread=100)
+    await _stream_one(msg, thread_getter=lambda: 555)
+    assert msg.bot.send_message.await_count >= 1
+    assert msg.bot.send_message.call_args.kwargs.get("message_thread_id") == 555
+    msg.answer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_renderer_keeps_answer_when_thread_matches_inbound():
+    # current thread == inbound → answer() already follows it; no override, no
+    # behaviour change (this is the common path that keeps existing tests green).
+    msg = _msg_mock(inbound_thread=100)
+    await _stream_one(msg, thread_getter=lambda: 100)
+    msg.answer.assert_awaited()
+    assert msg.bot.send_message.await_count == 0  # text didn't go via send_message

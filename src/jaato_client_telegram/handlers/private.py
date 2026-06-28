@@ -154,6 +154,7 @@ async def handle_private_message(
             ctx = await renderer.stream_response(
                 initial_message=message,
                 event_stream=await pool.events(session_id),
+                thread_id_getter=lambda cid=chat_id: pool.current_thread(cid),
             )
             if ctx.stalled:
                 # The runner went silent (e.g. a broken/stuck re-attach). Tell the
@@ -316,6 +317,7 @@ async def handle_private_media(
             ctx = await renderer.stream_response(
                 initial_message=message,
                 event_stream=await pool.events(session_id),
+                thread_id_getter=lambda cid=chat_id: pool.current_thread(cid),
             )
             if ctx.stalled:
                 # The runner went silent (e.g. a broken/stuck re-attach). Tell the
