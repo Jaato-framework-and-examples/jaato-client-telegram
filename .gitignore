@@ -192,3 +192,7 @@ logs/
 
 .jdtls/
 nohup.out
+
+# Downloaded astronomy ephemeris kernels (e.g. skyfield/jplephem de421.bsp,
+# pulled at runtime by a tool) — large binaries, never source.
+*.bsp
