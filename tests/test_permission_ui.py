@@ -50,15 +50,33 @@ def test_long_multiline_param_is_full_and_expandable():
 
 
 def test_huge_param_overflows_to_file_with_preview():
-    h = PermissionHandler()
+    h = PermissionHandler()  # default code_extensions = notebook_execute:py
     big = "x = 1\n" * 2000                  # > _PARAM_EXPAND_MAX → file
     text, _, files = h.create_permission_ui(_event({"code": big}, _ALL_OPTIONS), 1)
     assert len(files) == 1
     fname, content = files[0]
-    assert fname == "notebook_execute.code.txt"
+    assert fname == "notebook_execute.code.py"   # Python code → .py (opens an IDE)
     assert content == big                  # the WHOLE thing travels as a file
     assert "full value sent as" in text    # prompt tells the user where it went
     assert len(text) < 4096                # prompt itself stays within Telegram's limit
+
+
+def test_overflow_extension_map_falls_back_to_txt_for_unknown_tool():
+    h = PermissionHandler(code_extensions_str="notebook_execute:py")
+    big = "data\n" * 2000
+    ev = _event({"blob": big}, _ALL_OPTIONS)
+    ev.tool_name = "some_other_tool"
+    _, _, files = h.create_permission_ui(ev, 1)
+    assert files[0][0] == "some_other_tool.blob.txt"
+
+
+def test_overflow_extension_supports_tool_dot_param_keys():
+    h = PermissionHandler(code_extensions_str="myrunner.script:js")
+    big = "const x = 1;\n" * 2000
+    ev = _event({"script": big}, _ALL_OPTIONS)
+    ev.tool_name = "myrunner"
+    _, _, files = h.create_permission_ui(ev, 1)
+    assert files[0][0] == "myrunner.script.js"
 
 
 # ── button declutter ─────────────────────────────────────────────────────────

@@ -145,6 +145,10 @@ permissions:
   # Comma/pipe separated; empty = show every option the server sends.
   primary_actions: "yes,no,always,never"
 
+  # Extension for an oversized param sent as a file, by tool (or tool.param),
+  # e.g. notebook_execute Python code -> .py. `name:ext` pairs; default -> txt.
+  code_extensions: "notebook_execute:py"
+
 # File Sharing Configuration
 file_sharing:
   # Enable/disable file sharing (default: true)

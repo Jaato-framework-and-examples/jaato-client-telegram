@@ -123,6 +123,12 @@ class PermissionConfig(BaseModel):
     # separated. Empty => show all (legacy). Default keeps the essential four.
     primary_actions: str = "yes,no,always,never"
 
+    # File extension for an oversized param sent as a document, by tool (or
+    # tool.param), so e.g. notebook_execute's Python code arrives as .py (opens an
+    # IDE) not .txt. Comma/pipe-separated `name:ext` pairs; deterministic (the
+    # tool dictates the language — notebook_execute runs Python). Default → txt.
+    code_extensions: str = "notebook_execute:py"
+
 
 class RenderingConfig(BaseModel):
     """Response rendering configuration."""

@@ -107,6 +107,10 @@ permissions:
   # offers many duration variants that clutter the prompt). Empty = show all.
   primary_actions: "yes,no,always,never"
 
+  # Extension for an oversized param sent as a file, by tool (or tool.param)
+  # so notebook_execute Python code arrives as .py (opens your IDE), not .txt.
+  code_extensions: "notebook_execute:py"
+
 # Rate Limiting
 rate_limiting:
   # Enable rate limiting to prevent abuse

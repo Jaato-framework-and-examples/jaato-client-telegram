@@ -96,6 +96,7 @@ def create_bot_and_dispatcher(
     permission_handler = PermissionHandler(
         config.permissions.unsupported_actions,
         config.permissions.primary_actions,
+        config.permissions.code_extensions,
     )
     clarification_handler = ClarificationHandler()
     file_handler = FileHandler(config.file_sharing)

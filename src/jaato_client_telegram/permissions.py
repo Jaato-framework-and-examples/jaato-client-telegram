@@ -120,6 +120,7 @@ class PermissionHandler:
         self,
         unsupported_actions_str: str | None = None,
         primary_actions_str: str | None = "yes,no,always,never",
+        code_extensions_str: str | None = "notebook_execute:py",
     ):
         """
         Initialize permission handler.
@@ -145,6 +146,12 @@ class PermissionHandler:
             for a in (primary_actions_str or "").replace("|", ",").split(",")
             if a.strip()
         }
+        # Overflow-file extension by tool or tool.param (e.g. notebook_execute:py).
+        self._ext_map: dict[str, str] = {}
+        for pair in (code_extensions_str or "").replace("|", ",").split(","):
+            name, _, ext = pair.strip().partition(":")
+            if name and ext:
+                self._ext_map[name.strip().lower()] = ext.strip().lstrip(".").lower()
         logger.info(
             f"PermissionHandler initialized with unsupported actions: "
             f"{sorted(self._unsupported_actions)}"
@@ -206,7 +213,14 @@ class PermissionHandler:
                 lines.append(f"  • <code>{k}</code>:")
                 lines.append(f"<blockquote expandable>{html.escape(s, quote=False)}</blockquote>")
             else:
-                fname = f"{tool_name}.{key}.txt"
+                # Extension by tool.param, then tool, else txt — so notebook_execute's
+                # Python code lands as .py (opens an IDE) instead of .txt.
+                ext = (
+                    self._ext_map.get(f"{tool_name}.{key}".lower())
+                    or self._ext_map.get(str(tool_name).lower())
+                    or "txt"
+                )
+                fname = f"{tool_name}.{key}.{ext}"
                 files.append((fname, s))
                 preview = html.escape(s[:180], quote=False)
                 lines.append(
