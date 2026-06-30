@@ -1,44 +1,50 @@
-"""Session pool for managing per-user jaato sessions via WebSocket transport.
+"""Session pool for managing per-user jaato sessions via the SDK facade WS client.
 
-Each Telegram user (chat_id) gets its own isolated WebSocket connection
-and session on the jaato server.  This matches the server's 1-client-1-session
-model and avoids the multi-tenancy routing issues of a single shared WS.
+Each Telegram user (chat_id) gets its own ``WSRecoveryClient`` (a recoverable
+WebSocket connection) and one jaato session on the server. This matches the
+server's 1-client-1-session model and avoids the multi-tenancy routing issues of
+a single shared connection.
+
+The client is the SDK's facade WS client (``jaato_sdk.WSRecoveryClient``): it
+owns the connect/handshake (which sends our presentation context + workspace +
+client config), auto-reconnect, host-tool dispatch (``register_client_tools`` with
+a ``handler`` per tool), and the typed event stream (``events()``). This module
+keeps only the per-chat orchestration: connect, set_workspace, re-attach-or-create,
+and the public surface the handlers/renderer call.
 """
 
 import asyncio
 import logging
+import ssl
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from jaato_sdk.events import (
-    SendMessageRequest,
-    PermissionResponseRequest,
-    ClarificationBatchResponseEvent,
-    ClientConfigRequest,
-    CommandRequest,
-    StopRequest,
-    SessionInfoEvent,
-    StageFilesEvent,
-    StagedFileSpec,
-)
+from jaato_sdk import WSRecoveryClient
+from jaato_sdk.events import ClientType, EventType
 
-from jaato_client_telegram.host_tools import (
-    TOOL_SCHEMAS, TOOL_CATEGORIES, create_tool_executors, make_service_manifest_executor,
-)
-from jaato_client_telegram.host_tool_loader import (
-    load_all_tools, make_executor, validate_name, load_tool_file,
-    mark_user_installed, USER_INSTALLED_TAG,
-)
-from jaato_client_telegram.transport import WSTransport
 from jaato_client_telegram.chat_session_store import ChatSessionStore
-from jaato_client_telegram.thread_store import ChatThreadStore
+from jaato_client_telegram.host_tool_loader import (
+    USER_INSTALLED_TAG,
+    load_all_tools,
+    load_tool_file,
+    make_executor,
+    mark_user_installed,
+    validate_name,
+)
+from jaato_client_telegram.host_tools import (
+    TOOL_SCHEMAS,
+    create_tool_executors,
+    make_service_manifest_executor,
+)
 from jaato_client_telegram.thread_bot import ThreadAwareBot
+from jaato_client_telegram.thread_store import ChatThreadStore
 
 if TYPE_CHECKING:
     from aiogram import Bot
+
     from jaato_client_telegram.config import FileSharingConfig, JaatoWSConfig
 
 
@@ -50,10 +56,13 @@ class SessionMetadata:
     session_id: str
     created_at: datetime
     last_activity: datetime
-    transport: WSTransport
+    client: WSRecoveryClient
 
 
 def create_telegram_presentation_context() -> dict:
+    """Display capabilities sent to the server (via the client's ``presentation=``
+    override) so the model adapts its output to Telegram. A plain dict is accepted
+    verbatim by the SDK client."""
     return {
         "content_width": 45,
         "content_height": None,
@@ -70,7 +79,7 @@ def create_telegram_presentation_context() -> dict:
 
 
 class SessionPool:
-    """Manages per-user sessions, each with its own WebSocket connection."""
+    """Manages per-user sessions, each with its own recoverable WS client."""
 
     def __init__(
         self,
@@ -86,7 +95,6 @@ class SessionPool:
         self._max_concurrent = max_concurrent
         self._sessions: dict[int, SessionMetadata] = {}
         self._lock = asyncio.Lock()
-        self._pending_session_future: asyncio.Future | None = None
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
@@ -102,6 +110,15 @@ class SessionPool:
         # a persisted session (vs created fresh / reused in-memory) — so the
         # handler can show a "Resumed" cue. Read via took_reattach().
         self._last_reattach: dict[int, bool] = {}
+        if self._ws_config.keycloak_client_id:
+            # The facade WS client authenticates with a static token= (query/Bearer),
+            # not the Keycloak client-credentials JWT flow the old transport did.
+            # Fail loud rather than silently connect anonymously.
+            raise RuntimeError(
+                "Keycloak auth (keycloak_client_id) is not supported on the facade "
+                "WS client; use jaato_ws.secret_token, or leave both empty for an "
+                "anonymous (local/VPN) connection."
+            )
         if self._session_store:
             logger.info("Session re-attachment enabled (store=%s)", session_store_path)
 
@@ -114,101 +131,113 @@ class SessionPool:
         to a persisted session (vs created fresh / reused in-memory)."""
         return self._last_reattach.get(chat_id, False)
 
-    def _make_transport(self) -> WSTransport:
-        return WSTransport(
-            url=self._ws_config.url,
-            tls_config=self._ws_config.tls,
-            keycloak_base_url=self._ws_config.keycloak_base_url,
-            keycloak_realm=self._ws_config.keycloak_realm,
-            keycloak_client_id=self._ws_config.keycloak_client_id,
-            keycloak_client_secret=self._ws_config.keycloak_client_secret,
-            secret_token=self._ws_config.secret_token,
+    def _build_ssl_context(self) -> ssl.SSLContext | None:
+        """SSLContext for wss:// — passed to the client's ``ssl=`` (which forwards
+        it to websockets.connect). None for plain ws:// or when TLS is disabled."""
+        tls = self._ws_config.tls
+        if not tls or not tls.enabled:
+            return None
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if tls.ca_cert_path:
+            ctx.load_verify_locations(tls.ca_cert_path)
+        else:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        if tls.cert_path and tls.key_path:
+            ctx.load_cert_chain(tls.cert_path, tls.key_path)
+        return ctx
+
+    def _make_client(self) -> WSRecoveryClient:
+        workspace = self._ws_config.workspace
+        # config_root wires the daemon's framework-config search (profiles, agents,
+        # file_edit backup dir); working_dir/workspace_path gates the runner-tier
+        # sandbox root. Both ride the client's connect-time ClientConfigRequest.
+        return WSRecoveryClient(
+            self._ws_config.url,
+            token=self._ws_config.secret_token or None,
+            client_type=ClientType.CHAT,
+            ssl=self._build_ssl_context(),
+            workspace_path=workspace or None,
+            config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
+            presentation=create_telegram_presentation_context(),
         )
+
+    async def _list_session_ids(self, client: WSRecoveryClient) -> list[str]:
+        """Session ids the daemon currently knows (in-memory AND on disk). The
+        client's list_sessions() is fire-and-forget (reply via SESSION_LIST on the
+        background drain), so subscribe once and await it."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _on_list(event) -> None:
+            if not future.done():
+                future.set_result([s.get("id") for s in event.sessions if s.get("id")])
+
+        unsub = client.subscribe_once(EventType.SESSION_LIST, _on_list)
+        try:
+            await client.list_sessions()
+            return await asyncio.wait_for(future, timeout=15.0)
+        finally:
+            unsub()
 
     async def get_or_create_session(self, chat_id: int) -> str:
         async with self._lock:
             if chat_id in self._sessions:
                 meta = self._sessions[chat_id]
-                # Only reuse the cached session if its daemon connection is alive.
-                # If the daemon dropped the WS, transport.connected flips to False
-                # (set in _receiver_loop's finally on ConnectionClosed), and reusing
-                # it would raise "Not connected" on every send — leaving the bot
-                # stuck until restart. Drop the dead session inline (we hold
-                # self._lock, so we can't call remove_client) and fall through to
-                # re-create/re-attach, so the bot auto-recovers on the next message.
-                if meta.transport.connected:
+                # Reuse the cached client unless it has fully given up. The
+                # recovery client reconnects transient WS drops on its own
+                # (is_reconnecting), so we keep it rather than throwing away a
+                # warm session; only a closed/failed client is recreated.
+                if meta.client.is_connected or meta.client.is_reconnecting:
                     meta.last_activity = datetime.now()
                     self._last_reattach[chat_id] = False
                     return meta.session_id
                 logger.info(
-                    "chat_id %d: cached session %s transport is dead — recreating",
+                    "chat_id %d: cached client for session %s is down — recreating",
                     chat_id, meta.session_id,
                 )
                 self._sessions.pop(chat_id, None)
                 try:
-                    await meta.transport.disconnect()
+                    await meta.client.disconnect()
                 except Exception:
-                    logger.debug("disconnect of dead transport failed", exc_info=True)
+                    logger.debug("disconnect of dead client failed", exc_info=True)
 
             if len(self._sessions) >= self._max_concurrent:
                 await self._evict_oldest()
 
             try:
-                transport = self._make_transport()
-                await transport.connect()
+                client = self._make_client()
+                if not await client.connect():
+                    raise RuntimeError("WSRecoveryClient.connect() returned False")
+                logger.info("Connected facade WS client for chat_id %d", chat_id)
 
-                presentation_ctx = create_telegram_presentation_context()
-                # working_dir wires the server's self._workspace_path, which gates
-                # set_workspace_root() — the ContextVar that runner-tier PATH tools
-                # (filesystem_query/cli/notebook) read for their sandbox root.
-                # config_root wires registry.set_config_root() before expose_all,
-                # which file_edit needs to resolve its backup dir
-                # (<config_root>/sessions/<id>/backups) — without it file_edit
-                # fails to initialize and is not exposed at all.
-                # Both mirror what the SDK IPCClient sends from workspace_path/
-                # config_root; the hand-rolled WS transport must send them too.
-                # (set_workspace below is a SEPARATE wire that drives profile
-                # discovery — all three are needed today.)
-                workspace = self._ws_config.workspace
-                config_event = ClientConfigRequest(
-                    presentation=presentation_ctx,
-                    working_dir=workspace or None,
-                    config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
-                )
-                await transport.send(config_event)
-                logger.info("Sent presentation + working_dir + config_root for chat_id %d", chat_id)
+                # No manual set_workspace: the client's _handshake already sends a
+                # set_workspace CommandRequest (from workspace_path) AND the
+                # ClientConfigRequest on connect — and re-sends both on every
+                # reconnect — so workspace-local profile/agent discovery
+                # (.jaato/profiles, .jaato/agents) is wired without us.
 
-                # Tell the server where this client's workspace is, so session.new
-                # can discover workspace-local profiles/agents (.jaato/...).
-                if self._ws_config.workspace:
-                    await transport.send(CommandRequest(
-                        command="set_workspace", args=[self._ws_config.workspace],
-                    ))
-
-                # Assemble host tools = static (send_to_telegram, show_image,
-                # register_tool) + any dynamic tools the user has installed in
-                # .jaato/host_tools/. Register SCHEMAS BEFORE session.new so they
-                # ride the bootstrap envelope into the runner (server PR
-                # #349/#350); registering after only updates the daemon registry.
-                host_executors: dict | None = None
+                # Assemble host tools (static + user-installed dynamic) and register
+                # them BEFORE create/attach so the schemas ride the bootstrap into
+                # the runner-tier model (server PR #349/#350). Each entry carries a
+                # "handler" the client dispatches on tool.execute_request.
+                client_tools: list[dict] | None = None
                 if self._bot and self._file_config:
-                    host_schemas, host_executors = self._assemble_host_tools(chat_id)
-                    await transport.register_host_tools(host_schemas, TOOL_CATEGORIES)
+                    client_tools = self._assemble_host_tools(chat_id)
+                    await client.register_client_tools(client_tools)
+                    logger.info(
+                        "Registered %d host tools for chat_id %d", len(client_tools), chat_id,
+                    )
 
-                # Re-attach to this chat's persisted session if one exists and is
-                # still known to the daemon (session.list reports the unified
-                # in-memory + on-disk view, so this survives a daemon restart).
-                # Otherwise create a fresh session and remember it.
+                # Re-attach to this chat's persisted session if it still exists on
+                # the daemon (session.list = unified in-memory + on-disk view, so it
+                # survives a daemon restart); otherwise create a fresh one.
                 session_id: str | None = None
                 if self._session_store:
                     persisted = self._session_store.get(chat_id)
                     if persisted:
-                        if persisted in await transport.list_sessions():
-                            # No replay drain needed: server PR #372 gates
-                            # _emit_conversation_replay on client_type — CHAT
-                            # clients (this bot) don't get the conversation
-                            # replayed on attach, so nothing to strip.
-                            await transport.attach_session(persisted)
+                        if persisted in await self._list_session_ids(client):
+                            await client.attach_session(persisted)
                             session_id = persisted
                             self._last_reattach[chat_id] = True
                             logger.info("Re-attached chat_id %d to session %s", chat_id, session_id)
@@ -219,32 +248,22 @@ class SessionPool:
                             )
 
                 if session_id is None:
-                    session_args: list[str] = []
-                    if self._ws_config.profile:
-                        session_args += ["--profile", self._ws_config.profile]
-                    if self._ws_config.agent:
-                        session_args += ["--agent", self._ws_config.agent]
-                    session_id = await transport.create_session(session_args)
+                    session_id = await client.create_session(
+                        profile=self._ws_config.profile or None,
+                        agent=self._ws_config.agent or None,
+                    )
+                    if not session_id:
+                        raise RuntimeError("create_session returned no session id")
                     if self._session_store:
                         self._session_store.set(chat_id, session_id)
                     self._last_reattach[chat_id] = False
                     logger.info("Created session %s for chat_id %d", session_id, chat_id)
 
-                transport.register_session(session_id)
-
-                # Executor routing is local to the transport and needs session_id.
-                if host_executors is not None:
-                    transport.set_session_tool_executors(session_id, host_executors)
-                    logger.info(
-                        "Wired %d host-tool executors for session %s",
-                        len(host_executors), session_id,
-                    )
-
                 self._sessions[chat_id] = SessionMetadata(
                     session_id=session_id,
                     created_at=datetime.now(),
                     last_activity=datetime.now(),
-                    transport=transport,
+                    client=client,
                 )
                 return session_id
             except Exception as e:
@@ -259,11 +278,11 @@ class SessionPool:
         d = self._ws_config.host_tools_dir
         return Path(d).expanduser() if d else None
 
-    def _assemble_host_tools(self, chat_id: int) -> tuple[list[dict], dict]:
-        """(schemas, executors) for the transport: static tools (send_to_telegram,
-        show_image, register_tool) + any user-installed dynamic tools. Loaded fresh
-        so a just-installed tool is picked up on the next registration."""
-        schemas = list(TOOL_SCHEMAS)
+    def _assemble_host_tools(self, chat_id: int) -> list[dict]:
+        """client_tools for register_client_tools: static tools (send_to_telegram,
+        show_image, register_tool, service_manifest) + any user-installed dynamic
+        tools, each as ``{**schema, "handler": executor}``. Loaded fresh so a
+        just-installed tool is picked up on the next registration."""
         # Wrap the bot so every host-tool send (built-in AND dynamic ctx.bot) is
         # injected with this chat's current message_thread_id at send time, keeping
         # tool messages in the same thread as the conversation. Reads the thread
@@ -274,15 +293,19 @@ class SessionPool:
         executors = create_tool_executors(tbot, chat_id, self._file_config)
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
         executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
+
+        tools: list[dict] = [
+            {**schema, "handler": executors[schema["name"]]} for schema in TOOL_SCHEMAS
+        ]
+
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
             for name, t in load_all_tools(tools_dir).items():
-                # Fix B: tag dynamically-installed tools so the model never
-                # mistakes them for built-ins present at bootstrap (see
-                # mark_user_installed). Static host tools above stay unmarked.
-                schemas.append(mark_user_installed(t["schema"]))
-                executors[name] = make_executor(t["execute"], tbot, chat_id)
-        return schemas, executors
+                # Tag dynamically-installed tools so the model never mistakes them
+                # for built-ins present at bootstrap (see mark_user_installed).
+                schema = mark_user_installed(t["schema"])
+                tools.append({**schema, "handler": make_executor(t["execute"], tbot, chat_id)})
+        return tools
 
     # --- Telegram thread continuity -----------------------------------------
     def sync_thread(self, chat_id: int, thread_id: "int | None") -> None:
@@ -309,13 +332,15 @@ class SessionPool:
 
         The agent (confined runner) wrote the draft to tool_drafts/<name>.py in
         the workspace. The bot (this process — UNCONFINED) copies it into the
-        bot-owned .jaato/host_tools/, validates it by loading, and re-registers
-        host tools so the runner sees it next turn. Runs only AFTER the user
-        approves register_tool (auto_approve=False)."""
+        bot-owned host_tools_dir, validates it by loading, and re-registers host
+        tools so the runner sees it next turn. Runs only AFTER the user approves
+        register_tool (auto_approve=False)."""
         validate_name(name)
         tools_dir = self._host_tools_dir()
         if tools_dir is None:
-            return {"error": "Dynamic tools are disabled (set jaato_ws.host_tools_dir in the bot config)."}
+            return {"error": (
+                "Dynamic tools are disabled (set jaato_ws.host_tools_dir in the bot config)."
+            )}
         workspace = Path(self._ws_config.workspace)
         draft = workspace / "tool_drafts" / f"{name}.py"
         if not draft.is_file():
@@ -339,12 +364,13 @@ class SessionPool:
                 f"it will load on your next session."
             )}
 
-        schemas, executors = self._assemble_host_tools(chat_id)
-        await meta.transport.register_host_tools(schemas, TOOL_CATEGORIES, force=True)
-        meta.transport.set_session_tool_executors(meta.session_id, executors)
+        # Re-register the full set on the live session; register_client_tools
+        # refreshes the daemon runtime tool list and re-glues schemas onto the
+        # runner-tier model.
+        await meta.client.register_client_tools(self._assemble_host_tools(chat_id))
         logger.info("Installed + registered dynamic host tool %r for chat %d", name, chat_id)
-        # Fix A: state the temporal fact in the result the model reads, so it does
-        # not later confabulate this tool as a built-in present at session start.
+        # State the temporal fact in the result the model reads, so it does not
+        # later confabulate this tool as a built-in present at session start.
         return {"result": (
             f"Installed '{name}' — a NEW tool you just created in THIS session; it "
             f"did not exist before now. It is in your tool list (tagged "
@@ -352,96 +378,63 @@ class SessionPool:
             f"as a built-in — you created it."
         )}
 
-    def on_session_info_event(self, event: SessionInfoEvent) -> None:
-        if self._pending_session_future and not self._pending_session_future.done():
-            self._pending_session_future.set_result(event.session_id)
-
     async def send_message(
         self, session_id: str, text: str, attachments: list | None = None,
     ) -> None:
         """Send a user message, optionally with multimodal attachments.
 
         Each attachment is a dict {mime_type, data, display_name} where `data`
-        is base64-encoded bytes (the canonical WS wire contract for
-        user-message images, e.g. a photo for a vision tier). The framework
-        ferries these to the runner-tier model.
-        """
-        transport = self._find_transport(session_id)
-        request = SendMessageRequest(text=text, attachments=attachments or [])
-        await transport.send(request)
+        is base64-encoded bytes (the canonical wire contract for user-message
+        images, e.g. a photo for a vision tier). The framework ferries these to
+        the runner-tier model."""
+        client = self._find_client(session_id)
+        await client.send_message(text, attachments=attachments or [])
 
     async def respond_to_permission(
         self, session_id: str, request_id: str,
         response: str, edited_arguments: dict | None = None,
     ) -> None:
-        transport = self._find_transport(session_id)
-        request = PermissionResponseRequest(
-            request_id=request_id, response=response,
-            edited_arguments=edited_arguments,
+        client = self._find_client(session_id)
+        await client.respond_to_permission(
+            request_id, response, edited_arguments=edited_arguments,
         )
-        await transport.send(request)
 
     async def respond_to_clarification(
         self, session_id: str, request_id: str, answers: list[str],
     ) -> None:
         """Answer a clarification request with one string per question, in order.
 
-        WS clients receive all questions at once (ClarificationBatchEvent) and
-        reply in one batch; the server feeds each answer into the channel queue
+        WS/chat clients receive all questions at once (ClarificationBatchRequested)
+        and reply in one batch; the server feeds each answer into the channel queue
         sequentially. Single/multiple-choice answers are 1-based ordinals
-        ("2", "1,3"); free-text answers are the literal text.
-        """
-        transport = self._find_transport(session_id)
-        request = ClarificationBatchResponseEvent(
-            request_id=request_id, answers=answers,
-        )
-        await transport.send(request)
+        ("2", "1,3"); free-text answers are the literal text."""
+        client = self._find_client(session_id)
+        await client.respond_to_clarification_batch(request_id, answers)
 
     async def events(self, session_id: str) -> AsyncIterator:
-        return self._find_transport(session_id).events(session_id)
+        return self._find_client(session_id).events()
 
     async def stop(self, session_id: str) -> None:
-        transport = self._find_transport(session_id)
-        request = StopRequest()
-        await transport.send(request)
-
-    async def stage_files(
-        self,
-        chat_id: int,
-        files: list[tuple[str, bytes, str | None]],
-    ) -> StageFilesEvent:
-        if chat_id not in self._sessions:
-            raise RuntimeError(f"No session for chat_id {chat_id}")
-        transport = self._sessions[chat_id].transport
-        specs = [
-            StagedFileSpec(name=name, size=len(data), content_type=ct)
-            for name, data, ct in files
-        ]
-        payloads = [data for _, data, _ in files]
-        return await transport.stage_files(
-            workspace_id="",
-            specs=specs,
-            payloads=payloads,
-        )
+        await self._find_client(session_id).stop()
 
     def get_session_id(self, chat_id: int) -> str | None:
         session = self._sessions.get(chat_id)
         return session.session_id if session else None
 
-    def _find_transport(self, session_id: str) -> WSTransport:
+    def _find_client(self, session_id: str) -> WSRecoveryClient:
         for meta in self._sessions.values():
             if meta.session_id == session_id:
-                return meta.transport
-        raise RuntimeError(f"No transport for session_id {session_id}")
+                return meta.client
+        raise RuntimeError(f"No client for session_id {session_id}")
 
     async def remove_client(self, chat_id: int) -> None:
         async with self._lock:
             session = self._sessions.pop(chat_id, None)
             if session:
                 try:
-                    await session.transport.disconnect()
+                    await session.client.disconnect()
                 except Exception:
-                    logger.exception("Error disconnecting transport for chat_id %d", chat_id)
+                    logger.exception("Error disconnecting client for chat_id %d", chat_id)
 
     async def forget_session(self, chat_id: int) -> None:
         """Drop a chat's session entirely: disconnect + remove from the pool AND

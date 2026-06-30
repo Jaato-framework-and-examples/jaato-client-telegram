@@ -6,13 +6,14 @@ and wires up dependencies (SessionPool, ResponseRenderer).
 """
 
 import logging
-from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from jaato_client_telegram.abuse_protection import AbuseProtector
+from jaato_client_telegram.clarification import ClarificationHandler
 from jaato_client_telegram.config import Config
 from jaato_client_telegram.file_handler import FileHandler
 from jaato_client_telegram.handlers import (
@@ -24,15 +25,11 @@ from jaato_client_telegram.handlers import (
     private_router,
 )
 from jaato_client_telegram.permissions import PermissionHandler
-from jaato_client_telegram.clarification import ClarificationHandler
 from jaato_client_telegram.rate_limiter import RateLimiter
-from jaato_client_telegram.abuse_protection import AbuseProtector
-from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.whitelist import WhitelistManager
-from jaato_client_telegram.transport import WSTransport  # noqa: F401 (used by tests)
-
 
 logger = logging.getLogger(__name__)
 

@@ -449,8 +449,9 @@ def register_host_tools(
 ) -> dict[str, object]:
     """Build the tool name → executor map for a session.
 
-    Call this when a new session is created, then pass the result
-    to ``WSTransport.set_tool_executor`` for each entry.
+    Call this when a new session is created; ``SessionPool._assemble_host_tools``
+    attaches each executor as the ``handler`` on the matching tool schema and
+    passes the list to ``WSRecoveryClient.register_client_tools``.
     """
     return {
         "send_to_telegram": make_send_to_telegram_executor(bot, chat_id, file_config),

@@ -4,7 +4,7 @@ Exercises the pure logic against the real SDK events (no Telegram I/O):
 - batch event -> per-question UI (single_choice keyboard / text prompt)
 - callback data round-trip
 - record/advance across multiple questions -> done
-- session_pool.respond_to_clarification builds a ClarificationBatchResponseEvent
+- session_pool.respond_to_clarification calls the client's respond_to_clarification_batch
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from jaato_sdk.events import ClarificationBatchEvent, ClarificationBatchResponseEvent
+from jaato_sdk.events import ClarificationBatchEvent
 
 from jaato_client_telegram.clarification import ClarificationHandler
 
@@ -87,24 +87,20 @@ def test_respond_to_clarification_builds_batch_response():
     from jaato_client_telegram.session_pool import SessionPool, SessionMetadata
     from datetime import datetime
 
-    sent = []
+    calls = []
 
-    class _FakeTransport:
-        async def send(self, event):
-            sent.append(event)
+    class _FakeClient:
+        async def respond_to_clarification_batch(self, request_id, answers):
+            calls.append((request_id, answers))
 
     pool = SessionPool.__new__(SessionPool)  # bypass __init__ (needs config)
     pool._sessions = {7: SessionMetadata(
         session_id="sess-1", created_at=datetime.now(),
-        last_activity=datetime.now(), transport=_FakeTransport(),
+        last_activity=datetime.now(), client=_FakeClient(),
     )}
 
     asyncio.run(pool.respond_to_clarification("sess-1", "req-1", ["1", "hello"]))
-    assert len(sent) == 1
-    ev = sent[0]
-    assert isinstance(ev, ClarificationBatchResponseEvent)
-    assert ev.request_id == "req-1"
-    assert ev.answers == ["1", "hello"]
+    assert calls == [("req-1", ["1", "hello"])]
 
 
 if __name__ == "__main__":
