@@ -21,39 +21,40 @@ session re-attach mechanism (see `docs/design/session-lifecycle.md`).
   memories but never sees them again, and greets every session as a "fresh
   start". That is the gap this feature closes.
 
-## The deterministic curation reactor
+## Client-side deterministic curation (on `tool.call_end`)
 
 The reference design drains raw → curated with an LLM `memory-advisor` agent
 spawned on every completion — overkill and a per-turn LLM cost for a single-user
-chat bot. Instead we use a **deterministic reactor**:
+chat bot. **Earlier** this bot used a premium daemon **reactor** to drain
+deterministically; that coupled the deployment to premium's reactor engine. It
+now drains **client-side** instead, removing the premium dependency:
 
-- `runtime/.jaato/reactors.json` — fires on `agent.completed` where
-  `source_agent == 'telegram_chat'`. (The bot starts sessions with
-  `--agent telegram_chat`, so its completion event carries that id, **not** the
-  default `"main"` the reference assumes — matching `'main'` would never fire.)
-- `runtime/.jaato/reactors/on_memory_curate.py` — promotes every raw memory to
-  `validated` via the plugin's own transition (`MemoryStore.update`: a raw
-  memory marked validated moves into the curated store). Runs in the unconfined
-  daemon reactor engine, so it can write `curated.jsonl`. **No LLM, no spawned
-  session, no per-turn cost**, and no loop-guard needed (it never creates a
-  session). The next session's enrichment then surfaces the memories.
+- `SessionPool` subscribes to `EventType.TOOL_CALL_END`. When a memory-write tool
+  (`store_memory` / `memory` / `update_memory`) completes **successfully**, it
+  runs the exact same deterministic transition the reactor did — `MemoryStore`
+  `list_raw()` → promote each to `validated` (`MemoryStore.update`), which moves
+  it into the curated store. **No LLM, no spawned session, no per-turn cost.**
+  The next session's enrichment then surfaces the memories.
+- The drain logic is server-core (`shared.plugins.memory`), imported lazily and
+  guarded, so the bot degrades gracefully (skips curation) if the package or
+  workspace is absent. The subscription rides the recovery client's registry, so
+  it survives reconnects.
 
-Trade-off: it promotes raw memories without quality judgment. Acceptable here —
-the agent only stores what it deems worth remembering. If LLM-grade curation
-(promote good / dismiss junk) is ever wanted, swap in the `memory-advisor`
-reactor (`jaato-knowledge-manager/.jaato.example/`), at the per-turn LLM cost.
+Scope: this drains the **workspace** store (`<workspace>/.jaato/memories`), which
+is exactly what the old reactor covered. Trade-off (unchanged): it promotes raw
+memories without quality judgment — acceptable here, since the agent only stores
+what it deems worth remembering.
 
-## One-time backfill
-
-Existing raw memories predating the reactor were promoted once with the same
-transition (`MemoryStore.update(..., validated)`), so continuity worked
-immediately rather than only for memories created after wiring.
+> **Known design question (with Advisor):** `store_memory(scope=universal)` writes
+> raw memories directly into the **HOME** store (`~/.jaato/memories/raw/`), which
+> this drain deliberately does **not** touch — raw-in-home is considered wrong
+> (the home/global tier should be curated-only; promotion to home should be a
+> deliberate curation decision, not a raw write). Pending Advisor's analysis of
+> the memory-plugin scope/tiering.
 
 ## Prerequisites / notes
 
-- The daemon must run the **premium reactor engine** with workspace-tier reactor
-  discovery (the shared daemon already composes a `premium-reactor` AppArmor
-  fragment for active sessions). Workspace reactors are read at session spawn, so
-  a newly added reactor takes effect on the next freshly-spawned session.
-- `curated.jsonl` and `memories/raw/` are **transient state** and stay gitignored;
-  only the reactor config (`reactors.json`, `reactors/`) is versioned.
+- No premium reactor engine required — curation is client-side. The memory plugin
+  itself (server-core) provides the raw/curated stores and the `MemoryStore`
+  transition.
+- `curated.jsonl` and `memories/raw/` are **transient state** and stay gitignored.
