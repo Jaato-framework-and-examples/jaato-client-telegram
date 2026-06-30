@@ -238,20 +238,15 @@ async def handle_private_media(
     pool: SessionPool,
     renderer: ResponseRenderer,
 ) -> None:
-    """Handle an inbound photo, image, or PDF: download it from Telegram and
-    deliver it to the agent as a user-message attachment so the profile's vision
-    tier (OpenRouter gemini-2.5-flash) can describe an image or read a PDF.
-    Validated e2e for both (the #353 ferry + #355 cross-provider tier).
+    """Handle an inbound photo or document.
+
+    Images and PDFs go to the profile's vision tier as user-message attachments
+    (the #353 ferry + #355 cross-provider tier, validated e2e). Any OTHER document
+    (shell script, JSON, text, archive, …) is saved into the workspace's
+    ``uploads/`` dir so the agent can read it with its file tools — no vision tier
+    needed.
     """
     chat_id = message.chat.id
-
-    if not _VISION_ENABLED:
-        await message.answer(
-            "📷 Got your file — but image/PDF understanding isn't enabled yet. "
-            "(It needs a vision-capable model; coming soon.) Send me text in the "
-            "meantime."
-        )
-        return
 
     # Resolve the Telegram file + its MIME type.
     if message.photo:
@@ -264,15 +259,19 @@ async def handle_private_media(
         mime_type = (doc.mime_type or "application/octet-stream")
         name = doc.file_name or "file"
 
-    if not _is_vision_input(mime_type):
+    is_vision = _is_vision_input(mime_type)
+    is_pdf = mime_type == "application/pdf"
+    kind = "PDF" if is_pdf else "image" if is_vision else "file"
+
+    # The vision-disabled notice applies only to the vision path; non-vision
+    # documents are staged to the workspace and don't need a vision model.
+    if is_vision and not _VISION_ENABLED:
         await message.answer(
-            "📎 I can look at images and PDFs. Send a photo or a PDF and ask "
-            "what you'd like to know about it."
+            "📷 Got your file — but image/PDF understanding isn't enabled yet. "
+            "(It needs a vision-capable model; coming soon.) Send me text in the "
+            "meantime."
         )
         return
-
-    is_pdf = mime_type == "application/pdf"
-    kind = "PDF" if is_pdf else "image"
 
     # Pre-check size against Telegram's 20 MB bot-download cap using the size
     # Telegram sends BEFORE download, so the user gets a clear reason rather than
@@ -280,17 +279,10 @@ async def handle_private_media(
     size = getattr(tg_file, "file_size", None)
     if size and size > _MAX_DOWNLOAD_BYTES:
         await message.answer(
-            f"📄 That {kind} is {size / 1024 / 1024:.0f} MB — I can only read "
-            f"files up to 20 MB. "
-            + ("Try splitting it or sending a smaller PDF."
-               if is_pdf else "Try sending a smaller image.")
+            f"📄 That {kind} is {size / 1024 / 1024:.0f} MB — I can only handle "
+            f"files up to 20 MB."
         )
         return
-
-    # Default ask depends on the kind of file (a PDF is read, not "seen").
-    caption = (message.caption or "").strip() or (
-        "Summarize this document." if is_pdf else "Describe what you see in this image."
-    )
 
     user_lock = _get_user_lock(chat_id)
     async with user_lock:
@@ -299,12 +291,37 @@ async def handle_private_media(
             tg_file_info = await message.bot.get_file(tg_file.file_id)
             buf = await message.bot.download_file(tg_file_info.file_path)
             data = buf.read()
-            attachments = _build_image_attachments(data, mime_type, name)
+
+            if is_vision:
+                # Image / PDF → vision-tier attachment (a PDF is read, not "seen").
+                attachments = _build_image_attachments(data, mime_type, name)
+                caption = (message.caption or "").strip() or (
+                    "Summarize this document." if is_pdf
+                    else "Describe what you see in this image."
+                )
+            else:
+                # Any other document → stage into the workspace; the agent reads
+                # it with its file tools (handles text AND binary, no context bloat).
+                rel_path = pool.stage_upload(name, data)
+                if rel_path is None:
+                    await message.answer(
+                        "📎 I can't save files right now — no workspace is "
+                        "configured for this bot."
+                    )
+                    return
+                attachments = None
+                user_q = (message.caption or "").strip()
+                note = (
+                    f"📎 The user attached a file, saved to your workspace as "
+                    f"`{rel_path}`. Read it with your file tools to help."
+                )
+                caption = f"{user_q}\n\n{note}" if user_q else note
 
             logger.info(
-                "inbound thread (media): chat=%s message_thread_id=%s is_topic_message=%s",
+                "inbound thread (media): chat=%s message_thread_id=%s "
+                "is_topic_message=%s vision=%s",
                 chat_id, message.message_thread_id,
-                getattr(message, "is_topic_message", None),
+                getattr(message, "is_topic_message", None), is_vision,
             )
             pool.sync_thread(chat_id, message.message_thread_id)
 

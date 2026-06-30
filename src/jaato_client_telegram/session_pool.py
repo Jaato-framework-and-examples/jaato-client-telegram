@@ -317,6 +317,27 @@ class SessionPool:
         """The message_thread_id the bot should currently send into for this chat."""
         return self._thread_store.current(chat_id)
 
+    def stage_upload(self, name: str, data: bytes) -> str | None:
+        """Write a user-attached file into the workspace's ``uploads/`` dir so the
+        agent can read it with its file tools (any type — text or binary — with no
+        context bloat). Returns the workspace-relative path (e.g.
+        ``uploads/script.sh``), or ``None`` if no workspace is configured.
+
+        The filename is reduced to its basename (it comes from Telegram / the
+        user) so a crafted name cannot escape ``uploads/``. The workspace is the
+        confined runner's read-write sandbox root, so files written here are
+        readable by the agent at the returned relative path."""
+        workspace = self._ws_config.workspace
+        if not workspace:
+            return None
+        safe = Path(name).name
+        if safe in ("", ".", ".."):
+            safe = "file"
+        dest_dir = Path(workspace) / "uploads"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / safe).write_bytes(data)
+        return f"uploads/{safe}"
+
     def _make_register_tool_executor(self, chat_id: int):
         async def executor(args: dict) -> dict:
             name = (args or {}).get("name", "")

@@ -133,6 +133,47 @@ def test_reuse_live_cached_client():
     assert len(client.calls) == n  # nothing new happened
 
 
+def _pool_with_workspace(ws):
+    pool = SessionPool.__new__(SessionPool)
+    pool._ws_config = SimpleNamespace(workspace=str(ws) if ws else "")
+    return pool
+
+
+def test_stage_upload_writes_and_returns_relpath(tmp_path):
+    pool = _pool_with_workspace(tmp_path)
+    rel = pool.stage_upload("deploy.sh", b"#!/bin/sh\necho hi\n")
+    assert rel == "uploads/deploy.sh"
+    written = tmp_path / "uploads" / "deploy.sh"
+    assert written.read_bytes() == b"#!/bin/sh\necho hi\n"
+
+
+def test_stage_upload_sanitizes_path_traversal(tmp_path):
+    pool = _pool_with_workspace(tmp_path)
+    rel = pool.stage_upload("../../etc/passwd", b"x")
+    assert rel == "uploads/passwd"                       # basename only — no escape
+    assert (tmp_path / "uploads" / "passwd").exists()
+    assert not (tmp_path.parent / "etc" / "passwd").exists()
+
+
+def test_stage_upload_rejects_dotdot_name(tmp_path):
+    pool = _pool_with_workspace(tmp_path)
+    rel = pool.stage_upload("..", b"x")
+    assert rel == "uploads/file"
+
+
+def test_stage_upload_binary_ok(tmp_path):
+    pool = _pool_with_workspace(tmp_path)
+    blob = bytes(range(256))
+    rel = pool.stage_upload("data.bin", blob)
+    assert rel == "uploads/data.bin"
+    assert (tmp_path / "uploads" / "data.bin").read_bytes() == blob
+
+
+def test_stage_upload_none_without_workspace():
+    pool = _pool_with_workspace("")
+    assert pool.stage_upload("x.txt", b"x") is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
