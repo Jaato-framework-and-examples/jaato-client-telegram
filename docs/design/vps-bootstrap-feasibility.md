@@ -23,7 +23,7 @@ three premium couplings; all are now eliminated:
 - `pass://` OpenRouter key resolver → the bootstrap renders the profile with
   `${OPENROUTER_API_KEY}` (env) instead.
 
-⇒ **One deployment, premium-free: 3 public repos, env secrets.** (A future
+⇒ **One deployment, premium-free: 2 public repos (3 packages), env secrets.** (A future
 `allowed_scopes: ["project"]` memory-plugin knob — pending Advisor — keeps all
 memories project-scoped so the home tier is never touched; not required for
 premium-free, just tidies memory tiering.)
