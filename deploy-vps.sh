@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+#
+# deploy-vps.sh — one-shot bootstrap for the jaato Telegram bot + its server.
+#
+# Premium-free stack: clones 2 public repos (the jaato monorepo = sdk+server,
+# and this bot), installs them in a venv, asks the operator for the Telegram
+# token + provider/model/key(s), customizes the agent profile, wires two systemd
+# --user services (server + bot over ws://localhost, polling), and runs a layered
+# health check (scaffold validate -> jaato-doctor -> live provider ping).
+#
+# Provider selection AND the per-provider key env-var name are discovered from
+# `jaato-scaffold explain` — nothing about providers is hardcoded here.
+#
+# Idempotent: safe to re-run (upgrade = pull + reinstall + restart).
+# Teardown:  ./deploy-vps.sh --uninstall
+#
+# Override anything via env, e.g.:
+#   JAATO_REF=<sha> BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
+#
+set -euo pipefail
+
+# ── Config (override via env) ────────────────────────────────────────────────
+INSTALL_DIR="${JAATO_INSTALL_DIR:-$HOME/jaato-stack}"
+JAATO_REPO="${JAATO_REPO:-https://github.com/Jaato-framework-and-examples/jaato.git}"
+BOT_REPO="${BOT_REPO:-https://github.com/Jaato-framework-and-examples/jaato-client-telegram.git}"
+# No git tags exist upstream — pin a SHA for reproducibility (these track main/master).
+JAATO_REF="${JAATO_REF:-main}"
+BOT_REF="${BOT_REF:-master}"
+WS_PORT="${JAATO_WS_PORT:-8080}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# ── Derived paths ────────────────────────────────────────────────────────────
+VENV="$INSTALL_DIR/venv"; PYV="$VENV/bin/python"
+JAATO_DIR="$INSTALL_DIR/jaato"; BOT_DIR="$INSTALL_DIR/jaato-client-telegram"
+WORKSPACE="$BOT_DIR/runtime"
+PROFILE_DIR="$WORKSPACE/.jaato/profiles"; PROFILE_FILE="$PROFILE_DIR/telegram_chat.yaml"
+STATE_DIR="$HOME/.local/share/jaato-tg"
+HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.json"
+CFG_DIR="$HOME/.config/jaato-tg"
+SERVER_ENV="$CFG_DIR/server.env"; BOT_ENV="$CFG_DIR/bot.env"
+WS_TOKEN_FILE="$CFG_DIR/ws.token"; BOT_CONFIG="$CFG_DIR/jaato-client-telegram.yaml"
+UNIT_DIR="$HOME/.config/systemd/user"
+
+# ── Pretty output ────────────────────────────────────────────────────────────
+if [ -t 1 ]; then C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_B=$'\e[1m'; C_0=$'\e[0m'
+else C_G=; C_Y=; C_R=; C_B=; C_0=; fi
+info(){ printf '%s\n' "${C_G}${C_B}▶${C_0} $*"; }
+warn(){ printf '%s\n' "${C_Y}⚠ $*${C_0}" >&2; }
+die(){  printf '%s\n' "${C_R}✗ $*${C_0}" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "  $p [$d]: " a; printf '%s' "${a:-$d}"
+       else read -rp "  $p: " a; printf '%s' "$a"; fi; }
+ask_secret(){ local p="$1" a; read -rsp "  $p: " a; printf '\n' >&2; printf '%s' "$a"; }
+confirm(){ local a; read -rp "  $1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]; }
+scaffold(){ "$PYV" -m shared.scaffold "$@"; }   # available after install()
+
+# ── 1. Preflight ─────────────────────────────────────────────────────────────
+preflight(){
+  info "Preflight"
+  have git || die "git not found"
+  have "$PYTHON_BIN" || die "$PYTHON_BIN not found (need Python >= 3.10)"
+  local v; v=$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')
+  "$PYTHON_BIN" -c 'import sys;sys.exit(0 if sys.version_info[:2]>=(3,10) else 1)' \
+    || die "Python >= 3.10 required (found $v)"
+  if have apparmor_parser && { aa-enabled >/dev/null 2>&1 || true; }; then
+    info "  AppArmor present — runner confinement available."
+  else
+    warn "AppArmor not available — the server will run the runner UNCONFINED (fine for a single-tenant VPS)."
+  fi
+  printf '  Python %s, git OK. Install dir: %s\n' "$v" "$INSTALL_DIR"
+}
+
+# ── 2. Fetch (clone/update at pinned refs) ───────────────────────────────────
+_clone_at(){ local repo="$1" dir="$2" ref="$3"
+  if [ -d "$dir/.git" ]; then git -C "$dir" fetch --quiet origin
+  else git clone --quiet "$repo" "$dir"; fi
+  git -C "$dir" checkout --quiet "$ref"
+  git -C "$dir" pull --quiet --ff-only origin "$ref" 2>/dev/null || true
+  printf '  %s @ %s\n' "$(basename "$dir")" "$(git -C "$dir" rev-parse --short HEAD)"
+}
+fetch(){ info "Fetch repos (pinned: jaato=$JAATO_REF bot=$BOT_REF)"
+  mkdir -p "$INSTALL_DIR"
+  _clone_at "$JAATO_REPO" "$JAATO_DIR" "$JAATO_REF"
+  _clone_at "$BOT_REPO"  "$BOT_DIR"  "$BOT_REF"
+}
+
+# ── 3. Install (venv + editable installs; no premium) ────────────────────────
+install(){ info "Install (venv + editable packages)"
+  [ -x "$PYV" ] || "$PYTHON_BIN" -m venv "$VENV"
+  "$PYV" -m pip install --quiet --upgrade pip wheel
+  "$PYV" -m pip install --quiet -e "$JAATO_DIR/jaato-sdk"
+  "$PYV" -m pip install --quiet -e "$JAATO_DIR/jaato-server"
+  "$PYV" -m pip install --quiet -e "$BOT_DIR"
+  printf '  installed: jaato-sdk, jaato-server, jaato-client-telegram (no premium)\n'
+}
+
+# ── Provider picking, driven entirely by `scaffold explain` ──────────────────
+# Echoes "PROVIDER|MODEL|ENVVAR|KEYVALUE" (ENVVAR/KEYVALUE empty for keyless/local).
+_pick_provider(){ local role="$1"
+  local provs; provs=$(scaffold explain providers --json 2>/dev/null \
+    | "$PYV" -c 'import json,sys;print("\n".join(sorted(json.load(sys.stdin))))')
+  [ -n "$provs" ] || die "scaffold explain returned no providers"
+  printf '\n  %sChoose the %s provider:%s\n' "$C_B" "$role" "$C_0" >&2
+  printf '%s\n' "$provs" | nl -w3 -s'. ' >&2
+  local n; n=$(ask "provider number")
+  local provider; provider=$(printf '%s\n' "$provs" | sed -n "${n}p")
+  [ -n "$provider" ] || die "invalid selection"
+  # Vision hint from capabilities (handy for the vision tier).
+  scaffold explain provider "$provider" --json 2>/dev/null | "$PYV" -c '
+import json,sys
+d=json.load(sys.stdin); c=d.get("capabilities",{})
+print("  images=%s pdf=%s"%(c.get("user_message_images"),c.get("pdf_input")))' >&2 || true
+  local model; model=$(ask "model id for $provider")
+  [ -n "$model" ] || die "model is required"
+  # The provider's key env-var, discovered from `scaffold explain env`.
+  local envvar; envvar=$(scaffold explain env --json 2>/dev/null | "$PYV" -c '
+import json,sys
+d=json.load(sys.stdin); pv=d.get("provider:'"$provider"'",{})
+# auth-relevant vars, prefer a JAATO_*_API_KEY, then *_API_KEY, then *AUTH*/_TOKEN
+cands=[k for k in pv if any(t in k for t in ("API_KEY","AUTH_TOKEN")) or k.endswith("_TOKEN")]
+def rank(k): return (0 if k.startswith("JAATO_") and k.endswith("API_KEY")
+  else 1 if k.endswith("API_KEY") else 2)
+cands.sort(key=rank)
+print(cands[0] if cands else "")')
+  local keyval=""
+  if [ -n "$envvar" ]; then keyval=$(ask_secret "API key/token for $provider (-> \$$envvar)")
+  else warn "  $provider exposes no API-key env var (local/keyless) — set host/endpoint env vars yourself if needed."; fi
+  printf '%s|%s|%s|%s' "$provider" "$model" "$envvar" "$keyval"
+}
+
+# ── 4. Collect operator input ────────────────────────────────────────────────
+collect(){ info "Configuration"
+  TG_TOKEN=$(ask_secret "Telegram bot token (from @BotFather)")
+  [ -n "$TG_TOKEN" ] || die "Telegram token is required"
+
+  printf '\n  %sMain (text) tier%s\n' "$C_B" "$C_0"
+  IFS='|' read -r EXEC_PROVIDER EXEC_MODEL EXEC_ENVVAR EXEC_KEY < <(_pick_provider "main/text")
+
+  VISION_PROVIDER=""; VISION_MODEL=""; VISION_ENVVAR=""; VISION_KEY=""
+  if confirm "Enable image/PDF understanding (vision tier)?"; then
+    IFS='|' read -r VISION_PROVIDER VISION_MODEL VISION_ENVVAR VISION_KEY < <(_pick_provider "vision")
+  else warn "  Vision disabled — the bot does text + tools; images/PDFs won't be understood."; fi
+
+  WS_TOKEN=$("$PYV" -c 'import secrets;print(secrets.token_urlsafe(32))')
+}
+
+# ── 5. Write env files + token (chmod 600) ───────────────────────────────────
+write_env(){ info "Write secrets (chmod 600)"
+  mkdir -p "$CFG_DIR" "$STATE_DIR" "$HOST_TOOLS_DIR"
+  umask 077
+  printf '%s' "$WS_TOKEN" > "$WS_TOKEN_FILE"
+  { printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
+    [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$EXEC_KEY"
+    [ -n "$VISION_ENVVAR" ] && [ "$VISION_ENVVAR" != "$EXEC_ENVVAR" ] \
+        && printf '%s=%s\n' "$VISION_ENVVAR" "$VISION_KEY"
+  } > "$SERVER_ENV"
+  { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TG_TOKEN"
+    printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
+    printf 'JAATO_TG_WORKSPACE=%s\n' "$WORKSPACE"
+    printf 'JAATO_TG_HOST_TOOLS_DIR=%s\n' "$HOST_TOOLS_DIR"
+    printf 'JAATO_TG_SESSION_STORE=%s\n' "$SESSION_STORE"
+  } > "$BOT_ENV"
+  chmod 600 "$WS_TOKEN_FILE" "$SERVER_ENV" "$BOT_ENV"
+}
+
+# ── 6. Customize the agent profile (env-resolved keys; no secret inlined) ─────
+write_profile(){ info "Customize profile -> $PROFILE_FILE"
+  mkdir -p "$PROFILE_DIR"
+  local apparmor=false
+  have apparmor_parser && aa-enabled >/dev/null 2>&1 && apparmor=true
+  local tiers="  executor:
+    model: \"$EXEC_MODEL\"
+    provider: \"$EXEC_PROVIDER\""
+  if [ -n "$VISION_PROVIDER" ]; then
+    tiers="$tiers
+  vision:
+    model: \"$VISION_MODEL\"
+    provider: \"$VISION_PROVIDER\""
+  fi
+  cat > "$PROFILE_FILE" <<YAML
+# Generated by deploy-vps.sh — provider/model are operator-chosen; provider keys
+# resolve from env vars (server.env), so no secret is inlined here.
+name: telegram_chat
+description: Conversational assistant for the Telegram bot client.
+provider: "$EXEC_PROVIDER"
+model: "$EXEC_MODEL"
+apparmor: $apparmor
+model_tiers:
+$tiers
+  initial: executor
+  fallback: executor
+plugins:
+  - clarification
+  - web_search
+  - web_fetch
+  - references
+  - result_grep
+  - memory
+  - waypoint
+  - file_edit
+  - filesystem_query
+  - ast_search
+  - lsp
+  - cli
+  - interactive_shell
+  - notebook
+  - subagent
+  - flow_tools
+  - template
+  - prompt_library
+  - environment
+max_turns: 12
+plugin_configs:
+  memory:
+    # Single shared workspace => "project" scope already spans all of a user's
+    # chats; keeps memories off the HOME/global tier (server PR #468).
+    allowed_scopes: ["project"]
+YAML
+  printf '  provider=%s model=%s vision=%s apparmor=%s\n' \
+    "$EXEC_PROVIDER" "$EXEC_MODEL" "${VISION_PROVIDER:-off}" "$apparmor"
+}
+
+# ── 7. Bot config (ws://localhost, polling, no TLS/servers.json) ─────────────
+write_bot_config(){ info "Write bot config -> $BOT_CONFIG"
+  cat > "$BOT_CONFIG" <<YAML
+telegram:
+  bot_token: "\${TELEGRAM_BOT_TOKEN}"
+  mode: "polling"
+jaato_ws:
+  url: "ws://localhost:$WS_PORT"
+  tls:
+    enabled: false
+  secret_token: "\${JAATO_WS_TOKEN}"
+  profile: "telegram_chat"
+  agent: "telegram_chat"
+  workspace: "\${JAATO_TG_WORKSPACE}"
+  host_tools_dir: "\${JAATO_TG_HOST_TOOLS_DIR}"
+session:
+  max_concurrent: 50
+  session_store_path: "\${JAATO_TG_SESSION_STORE}"
+YAML
+}
+
+# ── 8. systemd --user units (server + bot) ───────────────────────────────────
+install_units(){ info "Install systemd --user units"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/jaato-server.service" <<UNIT
+[Unit]
+Description=jaato server (WebSocket daemon for the Telegram bot)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+EnvironmentFile=$SERVER_ENV
+ExecStart=$PYV -m server --web-socket :$WS_PORT --ws-token-file $WS_TOKEN_FILE
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=default.target
+UNIT
+  cat > "$UNIT_DIR/jaato-tg.service" <<UNIT
+[Unit]
+Description=jaato Telegram bot client
+After=jaato-server.service
+Requires=jaato-server.service
+[Service]
+Type=simple
+EnvironmentFile=$BOT_ENV
+ExecStart=$VENV/bin/jaato-tg --config $BOT_CONFIG
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=default.target
+UNIT
+  systemctl --user daemon-reload
+  # Survive logout / start at boot.
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || warn "could not enable linger (services won't start at boot without it)"
+  systemctl --user enable jaato-server.service jaato-tg.service >/dev/null 2>&1 || true
+}
+
+# ── 9. Start + layered health check ──────────────────────────────────────────
+_live_ping(){   # SDK facade end-to-end: connect -> session(profile) -> ask
+  # shellcheck disable=SC1090
+  set -a; . "$SERVER_ENV"; set +a
+  "$PYV" - "$WS_PORT" "$WS_TOKEN" "$WORKSPACE" <<'PY'
+import asyncio,sys
+port,token,ws = sys.argv[1],sys.argv[2],sys.argv[3]
+import jaato
+async def main():
+    try:
+        from jaato_sdk.events import ClientType
+        async with jaato.session(mode="ws", url=f"ws://localhost:{port}", token=token,
+                                  client_type=ClientType.CHAT, workspace_path=ws,
+                                  config_root=f"{ws}/.jaato", profile="telegram_chat",
+                                  agent="telegram_chat") as s:
+            ans = await s.ask("Reply with exactly: OK")
+            print("LIVE_OK:", (ans or "").strip()[:60]); return 0
+    except Exception as e:
+        print("LIVE_FAIL:", type(e).__name__, str(e)[:200]); return 1
+sys.exit(asyncio.run(main()))
+PY
+}
+start_and_check(){ info "Start server + health check"
+  systemctl --user restart jaato-server.service
+  for _ in $(seq 1 30); do "$PYV" -m server --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
+
+  info "  validate profile (jaato-scaffold validate)"
+  scaffold validate --workspace "$WORKSPACE" || die "profile validation failed — fix the profile and re-run"
+
+  info "  preflight WS/auth (jaato-doctor)"
+  "$PYV" -m jaato_sdk.doctor --web-socket ":$WS_PORT" --ws-token-file "$WS_TOKEN_FILE" --no-auto-start \
+    || warn "jaato-doctor reported issues (continuing to the live check)"
+
+  info "  live provider check (connect + ask)"
+  local out; out=$(_live_ping || true)
+  printf '  %s\n' "$out"
+  case "$out" in
+    *LIVE_OK:*) info "  provider + model + key OK ✓" ;;
+    *) die "live provider check failed — verify the provider/model/key, then re-run. ($out)" ;;
+  esac
+
+  info "Start the bot"
+  systemctl --user restart jaato-tg.service
+  sleep 3
+  if systemctl --user is-active --quiet jaato-tg.service; then
+    info "Bot is running. Message it on Telegram to begin."
+  else
+    die "bot failed to start — check: journalctl --user -u jaato-tg -e"
+  fi
+}
+
+# ── Uninstall ────────────────────────────────────────────────────────────────
+uninstall(){ info "Uninstall"
+  systemctl --user disable --now jaato-tg.service jaato-server.service 2>/dev/null || true
+  rm -f "$UNIT_DIR/jaato-tg.service" "$UNIT_DIR/jaato-server.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  warn "Left in place (delete manually if wanted): $INSTALL_DIR, $CFG_DIR, $STATE_DIR"
+  info "Services removed."
+}
+
+main(){
+  case "${1:-}" in
+    --uninstall) uninstall; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+  esac
+  printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
+  preflight; fetch; install; collect; write_env; write_profile; write_bot_config
+  install_units; start_and_check
+  printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
+}
+main "$@"
