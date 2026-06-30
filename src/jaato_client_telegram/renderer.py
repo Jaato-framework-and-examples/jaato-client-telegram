@@ -92,6 +92,15 @@ _STALL_TIMEOUT_SECS = 120.0
 # so a slow human answer is fine, while a truly abandoned prompt still recovers.
 _AWAIT_USER_TIMEOUT_SECS = 1800.0  # 30 min
 
+# During a COLD REVIVE (re-attach → runner re-spawn → ~30-plugin bootstrap) the
+# server emits an INIT_PROGRESS ("Initializing… Loading plugins") and can then go
+# SILENT for longer than the 120s mid-turn stall timeout while plugins load — a
+# legitimate gap, not a stall. Firing the 120s timer there falsely "stops" a turn
+# that is actually still reviving (it races the real first answer and resets the
+# session). So once a revive is in progress (INIT_PROGRESS seen) and the turn has
+# not started producing output yet, use this far more generous cap.
+_INIT_TIMEOUT_SECS = 420.0  # 7 min — covers a slow runner re-spawn + plugin bootstrap
+
 
 # --- Markdown -> Telegram HTML --------------------------------------------------
 # The model is told the client supports markdown (presentation context), so it
@@ -502,15 +511,24 @@ class ResponseRenderer:
                 or (self._clarification_handler is not None
                     and self._clarification_handler.get_pending(chat_id) is not None)
             )
-            timeout = _AWAIT_USER_TIMEOUT_SECS if awaiting_user else _STALL_TIMEOUT_SECS
+            # A cold revive (INIT_PROGRESS seen, turn not yet producing output) can
+            # be legitimately silent for >120s while plugins bootstrap — use the
+            # generous revive cap there so we don't falsely stall the reviving turn.
+            reviving = init_progress_count > 0 and not turn_started
+            if awaiting_user:
+                timeout = _AWAIT_USER_TIMEOUT_SECS
+            elif reviving:
+                timeout = _INIT_TIMEOUT_SECS
+            else:
+                timeout = _STALL_TIMEOUT_SECS
             try:
                 event = await asyncio.wait_for(
                     event_iter.__anext__(), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "stream_response: no event for %.0fs (awaiting_user=%s) — treating session as stalled",
-                    timeout, awaiting_user,
+                    "stream_response: no event for %.0fs (awaiting_user=%s reviving=%s) — treating session as stalled",
+                    timeout, awaiting_user, reviving,
                 )
                 ctx.stalled = True
                 break
