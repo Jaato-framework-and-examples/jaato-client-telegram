@@ -63,10 +63,17 @@ premium-free, just tidies memory tiering.)
   [--daemon]`, with built-in `--status` / `--stop` / `--restart`.
 - Bot: `jaato-tg` (console script) / `python -m jaato_client_telegram`.
 
-**TLS — co-location avoids it.** The server terminates TLS from a `servers.json`
-`tls: {cert, key}` section (`websocket.py::load_tls_context`); there is no
-`--tls` CLI flag. Bot + server on one VPS ⇒ connect `ws://localhost:PORT`
-(loopback, no certs). TLS only matters if the WS endpoint is exposed off-box.
+**TLS — co-location avoids it, and `servers.json` is NOT needed.** The server
+terminates TLS only from a `servers.json` `tls: {cert, key}` section
+(`websocket.py::load_tls_context`); there is no `--tls` CLI flag.
+`load_tls_context` returns `None` when `servers.json` is **missing** / has no
+`tls` section / certs are absent (`websocket.py:188-208`) → the server then binds
+**plain `ws://`**. So for bot + server on one VPS over `ws://localhost:PORT`
+(loopback, no certs), the bootstrap **omits `servers.json` entirely**.
+(`servers.json` is a shared file — server-core reads its `tls` section + optional
+`--server-name` self-match, and premium **gossip** uses it as a peer registry —
+but we need none of those: no TLS, no gossip/premium, no multi-server identity.)
+TLS only matters if the WS endpoint is exposed off-box.
 
 **Secrets — env vars are the portable path.** The server reads provider keys
 from the environment. The `pass://` resolver (premium) needs gpg/pass and is the
@@ -101,8 +108,9 @@ server's host-process / subprocess-runner assumptions.
 
 ### Option A (recommended) — idempotent bash bootstrap (`deploy-vps.sh`)
 Clone → venv → `pip install -e` the 3 packages → interactive secret prompts →
-render configs (`servers.json`/bot yaml/env files) → install + enable systemd
-units → start server, wait healthy, start bot → smoke check. Run via
+render configs (bot yaml + env files; **no `servers.json`** — loopback is plain
+`ws://`) → install + enable systemd units → start server, wait healthy, start bot
+→ smoke check. Run via
 `ssh vps 'bash -s' < deploy-vps.sh` or `curl … | bash`.
 - **Pros:** matches the ask literally; no Docker; transparent + debuggable;
   reuses the proven systemd model; AppArmor works natively; builds on the
@@ -136,9 +144,10 @@ container-runner question solved first.
 4. **Secrets + provider (interactive — see next section):** Telegram token;
    pick provider(s) + model(s) + key(s); generate `JAATO_WS_TOKEN`; write
    `EnvironmentFile`s (chmod 600).
-5. **Configure:** render `servers.json` (no TLS for loopback), the bot
-   `jaato-client-telegram.yaml` (`ws://localhost:PORT`, polling, workspace +
-   host_tools_dir paths), and the **customized profile** (provider/model/tiers).
+5. **Configure:** render the bot `jaato-client-telegram.yaml` (`ws://localhost:PORT`,
+   polling, workspace + host_tools_dir paths) and the **customized profile**
+   (provider/model/tiers). **No `servers.json`** — absent ⇒ the server binds plain
+   `ws://` (no TLS), which is what loopback wants.
 6. **Service:** install systemd units `jaato-server.service` (`--web-socket
    :PORT --ws-token-file …`) and `jaato-tg.service` (After/Requires server);
    enable both.
@@ -202,8 +211,8 @@ manual workflows to fire on tag-push (and adding tags) — but a production VPS
 should build from pinned SHAs regardless.
 
 ## Open items to confirm before building
-- Exact `servers.json` schema the server expects (TLS section + any required
-  keys) and whether a non-TLS loopback config needs anything beyond the port.
+- Confirm the no-TLS loopback server needs nothing beyond `--web-socket :PORT`
+  `--ws-token-file …` (no `servers.json`, verified — absent ⇒ plain `ws://`).
 - Provider/profile defaults: which profile+agent the bootstrap should wire
   (OpenRouter vision tier vs a text-only minimal profile) and the minimal env
   keys that profile needs.
