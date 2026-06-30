@@ -50,6 +50,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Memory-write tools whose successful completion should trigger a raw->curated
+# drain (so the NEXT session's enrichment surfaces the memory). The model calls
+# these via the server's memory plugin.
+_MEMORY_STORE_TOOLS = frozenset({"store_memory", "memory", "update_memory"})
+
 
 @dataclass
 class SessionMetadata:
@@ -211,6 +216,12 @@ class SessionPool:
                     raise RuntimeError("WSRecoveryClient.connect() returned False")
                 logger.info("Connected facade WS client for chat_id %d", chat_id)
 
+                # Auto-curate memories client-side: a successful memory-write tool
+                # call promotes raw->curated (replaces the premium reactor engine).
+                # Registered on the recovery client's registry, so it survives
+                # reconnects.
+                client.subscribe(EventType.TOOL_CALL_END, self._on_tool_call_end)
+
                 # No manual set_workspace: the client's _handshake already sends a
                 # set_workspace CommandRequest (from workspace_path) AND the
                 # ClientConfigRequest on connect — and re-sends both on every
@@ -337,6 +348,48 @@ class SessionPool:
         dest_dir.mkdir(parents=True, exist_ok=True)
         (dest_dir / safe).write_bytes(data)
         return f"uploads/{safe}"
+
+    # --- Client-side memory curation (replaces the premium reactor) ----------
+    def _curate_memories(self) -> int:
+        """Promote this workspace's raw memories to curated — the same
+        deterministic raw->validated drain the premium reactor did, now
+        client-side. Returns the count promoted. No-op (returns 0) if the
+        workspace or the server's memory package is unavailable, so the bot
+        degrades gracefully without curation rather than failing."""
+        workspace = self._ws_config.workspace
+        if not workspace:
+            return 0
+        try:
+            import dataclasses
+
+            from shared.plugins.memory.models import MATURITY_VALIDATED
+            from shared.plugins.memory.storage import MemoryStore
+        except Exception:
+            logger.debug(
+                "memory curation skipped: shared.plugins.memory unavailable", exc_info=True
+            )
+            return 0
+        store = MemoryStore(f"{workspace.rstrip('/')}/.jaato/memories")
+        raw = store.list_raw()
+        if not raw:
+            return 0
+        for memory in raw:
+            store.update(dataclasses.replace(memory, maturity=MATURITY_VALIDATED))
+        return len(raw)
+
+    async def _on_tool_call_end(self, event) -> None:
+        """Auto-curate after the model stores a memory: when a memory-write tool
+        completes successfully, drain raw->curated so the next session's
+        enrichment surfaces it. Event-driven, client-side — replaces the premium
+        reactor engine. Subscribed per client (survives reconnects via the
+        recovery client's subscription registry)."""
+        if getattr(event, "tool_name", "") not in _MEMORY_STORE_TOOLS:
+            return
+        if not getattr(event, "success", False):
+            return
+        promoted = await asyncio.to_thread(self._curate_memories)
+        if promoted:
+            logger.info("memory curation: promoted %d raw -> curated", promoted)
 
     def _make_register_tool_executor(self, chat_id: int):
         async def executor(args: dict) -> dict:

@@ -166,13 +166,6 @@ runtime/.jaato/*
 !runtime/.jaato/scripts/
 !runtime/.jaato/scripts/**
 runtime/.jaato/scripts/**/__pycache__/
-# memory curation reactor (deterministic raw->curated drain) is deployment
-# config, tracked like the profile/agent. memories/ itself stays ignored below
-# (transient state). See docs/features/memory-continuity.md.
-!runtime/.jaato/reactors.json
-!runtime/.jaato/reactors/
-!runtime/.jaato/reactors/**
-runtime/.jaato/reactors/**/__pycache__/
 
 # User data and workspaces
 workspaces/

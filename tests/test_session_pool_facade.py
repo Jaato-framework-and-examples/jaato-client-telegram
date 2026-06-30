@@ -32,6 +32,11 @@ class _FakeClient:
         self.is_connected = True
         return True
 
+    def subscribe(self, event_type, handler):
+        # event subscription (e.g. memory-curation on TOOL_CALL_END); no-op here,
+        # intentionally not recorded so lifecycle call-order assertions stay clean.
+        return lambda: None
+
     async def execute_command(self, command, args=None):
         self.calls.append(("execute_command", command, list(args or [])))
 
@@ -172,6 +177,50 @@ def test_stage_upload_binary_ok(tmp_path):
 def test_stage_upload_none_without_workspace():
     pool = _pool_with_workspace("")
     assert pool.stage_upload("x.txt", b"x") is None
+
+
+# ── client-side memory curation (replaces the premium reactor) ───────────────
+
+def test_on_tool_call_end_curates_on_memory_store_success():
+    pool = _pool_with_workspace("/ws")
+    calls = []
+    pool._curate_memories = lambda: (calls.append(1), 1)[1]
+    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="store_memory", success=True)))
+    assert calls == [1]
+
+
+def test_on_tool_call_end_ignores_non_memory_and_failures():
+    pool = _pool_with_workspace("/ws")
+    calls = []
+    pool._curate_memories = lambda: (calls.append(1), 1)[1]
+    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="web_search", success=True)))
+    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="store_memory", success=False)))
+    assert calls == []
+
+
+def test_curate_memories_noop_without_workspace():
+    assert _pool_with_workspace("")._curate_memories() == 0
+
+
+def test_curate_memories_promotes_raw_to_curated(tmp_path):
+    import pytest
+    pytest.importorskip("shared.plugins.memory")  # needs jaato-server installed
+    from shared.plugins.memory.models import MATURITY_RAW, Memory
+    from shared.plugins.memory.storage import MemoryStore
+
+    store = MemoryStore(str(tmp_path / ".jaato" / "memories"))
+    store.save(Memory(
+        id="m1", content="favorite color is blue", description="user pref",
+        tags=["pref"], timestamp="2026-06-30T00:00:00", maturity=MATURITY_RAW,
+        source_agent="telegram_chat",
+    ))
+    assert len(store.list_raw()) == 1
+
+    promoted = _pool_with_workspace(tmp_path)._curate_memories()
+    assert promoted == 1
+    assert store.list_raw() == []
+    curated = store.load_curated()
+    assert len(curated) == 1 and curated[0].maturity == "validated"
 
 
 if __name__ == "__main__":
