@@ -63,8 +63,6 @@ plugins:
   - flow_tools
   - template
   - prompt_library
-  - profile_tools
-  - session_ops
   # environment
   - environment
 # Chat-style turns; the bot streams output and surfaces tool/permission/
