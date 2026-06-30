@@ -23,13 +23,13 @@ from pathlib import Path
 
 TOOL_SCHEMA = {
     "name": "gmail",
-    "description": "Access a Gmail account via OAuth2/Gmail API. Actions: 'configure' (set OAuth2 client credentials), 'auth' (start OAuth flow or exchange code), 'check' (fetch unread emails), 'read' (full email by ID), 'watch' (periodic polling with Telegram notifications), 'unwatch' (stop polling), 'status' (connection health).",
+    "description": "Access a Gmail account via OAuth2/Gmail API. Actions: 'configure' (set OAuth2 client credentials), 'auth' (start OAuth flow or exchange code), 'check' (fetch unread emails), 'read' (full email by ID), 'watch' (periodic polling with Telegram notifications), 'unwatch' (stop polling), 'status' (connection health), 'doctor' (diagnose/dryrun/fix auth issues).",
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["configure", "auth", "check", "read", "watch", "unwatch", "status"],
+                "enum": ["configure", "auth", "check", "read", "watch", "unwatch", "status", "doctor"],
                 "description": "What to do."
             },
             "client_id": {
@@ -51,6 +51,11 @@ TOOL_SCHEMA = {
             "interval_minutes": {
                 "type": "integer",
                 "description": "Polling interval in minutes (default 5). Only for 'watch'."
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["", "dryrun", "fix"],
+                "description": "Doctor mode: '' (diagnose), 'dryrun' (show fix plan), 'fix' (run interactive onboarding)."
             },
             "max_emails": {
                 "type": "integer",
@@ -245,6 +250,74 @@ def _extract_parts(part: dict, parts: list):
         for sub in part["parts"]:
             _extract_parts(sub, parts)
 
+def _doctor_diagnose() -> str:
+    """Run diagnostics and return a report string."""
+    lines = ["🧪 Gmail Doctor — Diagnostic Report\n"]
+
+    cfg = _load_json(CONFIG_PATH)
+    config_ok = bool(cfg.get("client_id") and cfg.get("client_secret"))
+    lines.append(f"  Config file:  {CONFIG_PATH}  {'✅' if CONFIG_PATH.exists() else '❌ missing'}")
+    lines.append(f"  Client ID:    {'✅' if cfg.get('client_id') else '❌ not set'}")
+    lines.append(f"  Client secret: {'✅' if cfg.get('client_secret') else '❌ not set'}")
+    lines.append("")
+
+    token_data = _load_json(TOKEN_PATH)
+    token_ok = bool(token_data.get("refresh_token"))
+    lines.append(f"  Token file:   {TOKEN_PATH}  {'✅' if TOKEN_PATH.exists() else '❌ missing'}")
+    lines.append(f"  Refresh token: {'✅' if token_ok else '❌ not set'}")
+    if token_data.get("expiry"):
+        expiry = token_data["expiry"]
+        now = datetime.now().timestamp()
+        if now > expiry - 60:
+            lines.append("  Token expiry:  ⚠️ expired (needs refresh)")
+        else:
+            remaining = int((expiry - now) / 60)
+            lines.append(f"  Token expiry:  ✅ {remaining} min remaining")
+    else:
+        lines.append("  Token expiry:  ❌ unknown")
+    lines.append("")
+
+    lines.append(f"  Seen IDs:     {SEEN_PATH}  {'✅' if SEEN_PATH.exists() else '❌ missing'}")
+    lines.append("")
+
+    if config_ok and token_ok:
+        try:
+            _get_access_token()
+            lines.append("  API refresh:  ✅ token refresh works")
+        except Exception as exc:
+            lines.append(f"  API refresh:  ❌ {exc}")
+    elif config_ok and not token_ok:
+        lines.append("  API refresh:  ⚠️ skipped (no token to refresh)")
+    else:
+        lines.append("  API refresh:  ⚠️ skipped (no config)")
+
+    return "\n".join(lines)
+
+
+def _doctor_dryrun() -> str:
+    """Show what a fix would do without changing anything."""
+    lines = ["🧪 Gmail Doctor — Dry Run\n"]
+    cfg = _load_json(CONFIG_PATH)
+    token_data = _load_json(TOKEN_PATH)
+
+    steps = []
+    if not cfg.get("client_id") or not cfg.get("client_secret"):
+        steps.append("1. ⚙️ Run `gmail configure client_id=... client_secret=...` to save OAuth credentials")
+    else:
+        steps.append("1. ✅ Config already exists — would SKIP configure")
+
+    if not token_data.get("refresh_token"):
+        steps.append("2. 🔗 Run `gmail auth` to get authorization URL")
+        steps.append("3. 🔗 Open URL in browser, sign in, copy code")
+        steps.append("4. 🔗 Run `gmail auth auth_code=<CODE>` to exchange for token")
+    else:
+        steps.append("2. ✅ Token already exists — would SKIP auth")
+
+    lines.append("Fix plan:\n")
+    lines.extend(steps)
+    lines.append("")
+    lines.append("No changes made. Run with mode='fix' to execute.")
+    return "\n".join(lines)
 
 async def _poll_loop(bot, chat_id: int, interval: int):
     global _last_poll
@@ -405,5 +478,41 @@ async def execute(args: dict, ctx) -> dict:
                 f"  Last new: {poll_info.get('new', '-')}"
             )
         }
+
+    if action == "doctor":
+        mode = args.get("mode", "")
+        if mode == "dryrun":
+            return {"result": _doctor_dryrun()}
+        if mode == "fix":
+            cfg = _load_json(CONFIG_PATH)
+            token_data = _load_json(TOKEN_PATH)
+            needs_config = not (cfg.get("client_id") and cfg.get("client_secret"))
+            needs_auth = not token_data.get("refresh_token")
+            if not needs_config and not needs_auth:
+                return {"result": "\U0001f9ea Gmail Doctor \u2014 Everything looks healthy! No fix needed."}
+            if needs_config:
+                return {"result": (
+                    "\U0001f9ea Gmail Doctor \u2014 Fix Mode\n"
+                    "\n"
+                    "\u2699\ufe0f **Step 1: Configure credentials**\n"
+                    "Run: `gmail configure client_id=<ID> client_secret=<SECRET>`\n"
+                    "\n"
+                    "Then re-run: `gmail doctor mode=fix`"
+                )}
+            url = _get_auth_url(cfg)
+            return {"result": (
+                "\U0001f9ea Gmail Doctor \u2014 Fix Mode\n"
+                "\n"
+                "\U0001f517 **Step 2: Authorize Gmail access**\n"
+                "1. Open the link below in your browser\n"
+                "2. Sign in and grant access\n"
+                "3. The page will fail to load (that\'s normal)\n"
+                "4. Copy the code after \'code=\' from the URL bar\n"
+                "5. Run: `gmail auth auth_code=<THE_CODE>`\n"
+                "\n"
+                f"{url}"
+            )}
+        # default: diagnose
+        return {"result": _doctor_diagnose()}
 
     return {"error": f"Unknown action: {action}"}
