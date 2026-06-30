@@ -77,3 +77,10 @@ plugin_configs:
     # resolved daemon-side from the GPG `pass` store (HOME-matched; doctor
     # --secret confirms it resolves). Never inline the raw key here.
     api_key: "pass://jaato/openrouter/api-key"
+  memory:
+    # Write-side scope gate (server PR #468): the bot has a SINGLE workspace
+    # shared across all of a user's chats, so "project" scope already spans every
+    # chat — restricting to it keeps memories in the workspace store (curated
+    # client-side on tool.call_end) and NEVER writes to the HOME/global tier
+    # (avoids raw-in-home). A disallowed scope is hard-rejected to the model.
+    allowed_scopes: ["project"]
