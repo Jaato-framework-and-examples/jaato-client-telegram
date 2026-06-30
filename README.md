@@ -1,333 +1,186 @@
 # jaato-client-telegram
 
-A standalone Telegram bot client that bridges Telegram conversations with a [jaato](https://github.com/apanoia/jaato) AI agent server via the jaato-sdk IPC interface.
+A standalone Telegram bot that bridges Telegram chats to a running [jaato](https://github.com/Jaato-framework-and-examples/jaato) AI agent server over a **WebSocket** connection.
 
 ## Overview
 
 `jaato-client-telegram` is a **client**, not a plugin. It's a separate Python application that:
 
-- Connects to a running jaato server via Unix socket IPC
-- Provides a Telegram bot interface for interacting with the AI agent
-- Manages isolated sessions for each Telegram user
-- Streams agent responses progressively as events arrive
+- Connects to a running jaato server over a WebSocket (the `jaato_ws:` config block)
+- Provides a Telegram bot interface for talking to the AI agent
+- Manages one isolated agent session per Telegram chat
+- Streams agent responses progressively as events arrive, editing messages in place
 
-The agent logic, tool execution, plugins, and permissions all remain in the jaato server. This client is simply another I/O surface.
+All agent logic, tool execution, plugins, and permissions live in the **jaato server**. This process is purely an I/O surface: it translates Telegram messages into jaato session events and renders the streamed event responses back into Telegram messages.
+
+> **Transport note:** earlier revisions of this project spoke to the server over a Unix-socket "jaato-sdk IPC" connection (`/tmp/jaato.sock`, `socket_path`). That is no longer the case — the live transport is a WebSocket configured under `jaato_ws:` (`url: ws://…` / `wss://…`). The client imports the wire schema (event dataclasses) from `jaato_sdk.events`.
 
 ## Features
 
-- **User whitelist** - Username-based access control (see [WHITELIST.md](WHITELIST.md))
-- **Multi-user support** - Each Telegram user gets their own isolated agent session
-- **Workspace isolation** - Complete filesystem-level segregation with per-user `.env` and `.jaato/` directories
-- **Progressive streaming** - Responses stream in real-time as the agent generates them
-- **Session management** - Automatic cleanup of idle sessions and workspace directories
-- **Text-only messaging** - Send text messages, receive agent responses
-- **Long message handling** - Automatically splits long responses at paragraph boundaries
-- **Bot commands** - `/start`, `/reset`, `/status`, `/help`, plus admin commands
-- **Graceful shutdown** - Properly disconnects all sessions on exit
-- **🆃 Expandable content** - Wide tool outputs (JSON, code, tables) automatically collapsed for mobile
-- **🆃 Presentation awareness** - Agent adapts output format based on Telegram's constraints
-- **🛡️ Rate limiting** - Token bucket algorithm to prevent abuse with per-user limits and admin bypass
-- **🔧 Self-extending tools** - The agent builds new host tools on request via `register_tool`; core tools (`send_to_telegram`, `show_image`, `register_tool`, `service_manifest`) ship as fixed built-ins (see [docs/features/host-tools.md](docs/features/host-tools.md), with runnable examples in [examples/host_tools/](examples/host_tools/))
-- **🔧 Session-startup services** - A per-agent manifest of host tools is checked/started at the start of every session via a deterministic prefetch checklist, keeping long-running services (e.g. the approval webhook) up without relying on the model to remember (see [docs/features/service-checklist.md](docs/features/service-checklist.md))
+- **WebSocket transport** — one connection + one jaato session per Telegram `chat_id`, matching the server's 1-client-1-session model; optional TLS (`wss://`) and Keycloak auth.
+- **Session re-attachment** — with `session.session_store_path` set, a bot restart re-attaches to the same daemon session (verified via `session.list`) instead of starting a fresh conversation.
+- **Progressive streaming** — responses stream in real time with edit-in-place and throttling; long replies split at paragraph boundaries (Telegram's 4096-char limit).
+- **Multi-user isolation** — every chat gets its own session; conversations are not shared.
+- **Group chat support** — mention / reply / trigger-prefix activation, per-user sessions within a group.
+- **Permission approvals** — gated tools surface as inline-keyboard prompts with the tool's parameters shown for review (oversized payloads delivered as files).
+- **Clarification requests** — the agent can ask the user structured questions and receive batched answers.
+- **Vision attachments** — inbound photos and PDFs are forwarded as base64 user-message attachments for the profile's vision tier.
+- **Expandable content** — wide tool outputs (JSON, code, tables) are collapsed behind a "show more" affordance for mobile.
+- **Presentation awareness** — the bot tells the server its display capabilities (narrow width, no wide tables, images + expandable supported) so the model adapts its output.
+- **Self-extending host tools** — the agent builds new tools on request via `register_tool`; four core tools (`send_to_telegram`, `show_image`, `register_tool`, `service_manifest`) ship as fixed built-ins. See [docs/features/host-tools.md](docs/features/host-tools.md) and the runnable [examples/host_tools/](examples/host_tools/).
+- **Session-startup services** — a per-agent manifest of host tools is checked/started at the start of every session via a deterministic prefetch checklist. See [docs/features/service-checklist.md](docs/features/service-checklist.md).
+- **Thread continuity** — bot replies and host-tool messages follow the Telegram thread the user is writing in.
+- **Rate limiting** — token-bucket per-user limits with admin bypass.
+- **Abuse protection** — reputation tracking with escalating warnings/bans.
+- **Telemetry** — minimal bot-layer metrics (does not duplicate server metrics).
+- **User whitelist** — username/chat access control with an access-request flow (see [WHITELIST.md](WHITELIST.md)).
+- **Graceful shutdown** — detaches all sessions on exit.
 
 ## Architecture
 
 ```
-Telegram Users
+Telegram update
+       │
+       ▼
+aiogram router (handler)
        │
        ▼
 ┌─────────────────────────────┐
 │  jaato-client-telegram      │
-│  - Session Pool             │
-│  - Event Renderer           │
-│  - Message Handlers         │
+│  - SessionPool              │   one WS connection + one session per chat_id
+│  - ResponseRenderer         │   streams events → edited Telegram messages
+│  - Handlers / Permissions   │
 └─────────────────────────────┘
-       │ (IPC via jaato-sdk)
+       │  WebSocket  (jaato_ws: url)
        ▼
 ┌─────────────────────────────┐
 │  jaato Server               │
-│  - Agent Logic              │
-│  - Tools & Plugins          │
-│  - Session Management       │
+│  - Agent logic              │
+│  - Tools & plugins          │
+│  - Permissions              │
+│  - Session management        │
 └─────────────────────────────┘
 ```
 
+Server events stream back over the same WebSocket and are rendered progressively.
+
 ## Prerequisites
 
-1. **jaato server** - A running jaato server instance with Unix socket IPC enabled
-2. **Python 3.10+** - Required for aiogram v3.x
-3. **Telegram Bot Token** - Obtain from [@BotFather](https://t.me/botfather) on Telegram
+1. **jaato server** — a running jaato server reachable over WebSocket (`ws://` or `wss://`).
+2. **Python 3.10+** — required for aiogram v3.x.
+3. **Telegram Bot Token** — from [@BotFather](https://t.me/botfather).
 
 ## Installation
 
-### From Source
-
 ```bash
-git clone https://github.com/yourusername/jaato-client-telegram.git
+git clone https://github.com/Jaato-framework-and-examples/jaato-client-telegram.git
 cd jaato-client-telegram
-pip install -e .
-```
-
-### Development Installation
-
-```bash
-pip install -e ".[dev]"
-```
-
-### Optional Dependencies
-
-```bash
-# Multimodal support (Phase 3 - future)
-pip install -e ".[multimodal]"
-
-# OpenTelemetry observability (Phase 3 - future)
-pip install -e ".[observability]"
+pip install -e .            # or: pip install -e ".[dev]" for tooling
 ```
 
 ## Configuration
 
-### Basic Config
-
-1. Copy the example configuration:
+Configuration is a YAML file (`jaato-client-telegram.yaml`) with `${ENV_VAR}` substitution. Start from the example:
 
 ```bash
 cp config.example.yaml jaato-client-telegram.yaml
 ```
 
-2. Edit `jaato-client-telegram.yaml`:
+Top-level blocks: `telegram`, `jaato_ws`, `session`, `rendering`, `permissions`, `file_sharing`, `rate_limiting`, `abuse_protection`, `telemetry`, `logging`. The key one is the transport:
 
 ```yaml
 telegram:
-  bot_token: "${TELEGRAM_BOT_TOKEN}"  # Set as environment variable
+  bot_token: "${TELEGRAM_BOT_TOKEN}"   # never inline secrets; use ${ENV} / pass://
+  mode: "polling"                       # or "webhook"
 
-jaato:
-  socket_path: "/tmp/jaato.sock"  # Path to jaato server socket
+jaato_ws:
+  url: "wss://localhost:8089"           # ws:// for plain (dev only), wss:// for TLS
+  tls:
+    enabled: true
+  secret_token: "${JAATO_WS_TOKEN}"     # optional shared-secret auth
+  profile: ""                            # server-side profile name (empty = server default)
+  agent: ""                              # server-side agent persona (empty = none)
+  workspace: "${JAATO_TG_WORKSPACE}"     # server-side workspace path (.jaato/ lives here)
+  host_tools_dir: "${JAATO_TG_HOST_TOOLS_DIR}"   # bot-owned install dir, OUTSIDE the workspace
+
+session:
+  max_concurrent: 50
+  session_store_path: "${JAATO_TG_SESSION_STORE}"  # enables re-attach across restarts
 ```
 
-3. Set your bot token as an environment variable:
+> **No hardcoded fallbacks.** An empty config string means a feature is deliberately disabled (e.g. `host_tools_dir`, `session_store_path`, `workspace`, `profile`). The bot never invents default paths. `host_tools_dir` **must** be outside the workspace so the server's confined runner cannot tamper with installed tool code.
+
+### Whitelist (optional)
+
+Username/chat access control with an access-request flow. See [WHITELIST.md](WHITELIST.md).
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your-bot-token-here"
+cp whitelist.example.json whitelist.json   # edit to add your username + admins
 ```
 
-Or hardcode it in the config file (not recommended for production).
+### Permission UI (optional)
 
-### Whitelist Configuration (Optional)
-
-The bot supports username-based whitelisting to restrict access. See [WHITELIST.md](WHITELIST.md) for full documentation.
-
-Quick setup:
-
-```bash
-cp whitelist.example.json whitelist.json
-# Edit whitelist.json to add your username and admins
-```
-
-### Permission UI Configuration (Optional)
-
-The permission request UI can be customized to filter out certain action types that don't work well with Telegram's inline keyboard. See [PERMISSION_APPROVAL_UI.md](PERMISSION_APPROVAL_UI.md) for full documentation.
-
-**Example - Customizing unsupported actions:**
+The inline-keyboard permission prompt can be tuned — which action buttons are primary, which to filter out, and which tools render their argument as code. See [docs/features/permission-approval-ui.md](docs/features/permission-approval-ui.md).
 
 ```yaml
-# jaato-client-telegram.yaml
 permissions:
-  # Action types to filter from inline keyboard
-  # Supports comma or pipe separation: "comment,edit,idle" or "comment|edit|idle"
-  unsupported_actions: "comment,edit,modify,custom,input"
+  primary_actions: "yes,no,always,never"        # buttons shown prominently
+  unsupported_actions: "comment,edit,modify"    # filtered from the keyboard
+  code_extensions: "notebook_execute:py"        # render this tool's arg as a .py file
 ```
 
-Or via environment variable:
+### Trace logging (jaato-sdk client standard)
+
+Set `JAATO_TRACE_LOG` to redirect all logs to a file (the console then prints only the file path); unset, logs go to stderr.
 
 ```bash
-export JAATO_PERMISSION_UNSUPPORTED_ACTIONS="comment|edit|idle|turn|all"
+export JAATO_TRACE_LOG="/var/log/jaato-client-telegram.log"
 ```
 
-### Trace Log Configuration (jaato-sdk Client Standard)
+### Rate limiting / Abuse protection / Telemetry (optional)
 
-This client follows the jaato-sdk client standard for trace logging:
-
-**Standard Behavior:**
-
-- **If `JAATO_TRACE_LOG` environment variable is set and non-empty**: All logs are written to the specified file. Only a single console message indicates where logs are being written.
-
-  ```bash
-  export JAATO_TRACE_LOG="/var/log/jaato-client-telegram.log"
-  ```
-
-  Console output:
-  ```
-  📝 Logs are being written to: /var/log/jaato-client-telegram.log
-  ```
-
-- **If `JAATO_TRACE_LOG` is not set**: Logs are sent to the console (stderr) as usual.
-
-This standard ensures consistent logging behavior across all jaato-sdk based clients.
-
-### Abuse Protection (Optional)
-
-The bot includes an abuse protection system that detects and mitigates abusive behavior:
-
-**Features:**
-
-- **Suspicious Activity Detection** - Detects rapid messaging and spam patterns
-- **User Reputation System** - Tracks user trust scores (0-100)
-- **Automatic Escalation** - Warnings → Temporary bans → Permanent bans
-- **Admin Management** - Ban/unban users, view abuse statistics
-
-**Configuration:**
+All three are off by default and constructed only when enabled.
 
 ```yaml
-# jaato-client-telegram.yaml
+rate_limiting:
+  enabled: true
+
 abuse_protection:
   enabled: true
-  max_rapid_messages: 5          # Max messages in rapid interval
-  rapid_message_interval: 3      # Interval in seconds
-  suspicion_threshold: 70        # Score threshold for escalation
-  reputation_threshold: 30.0     # Below this: bans apply
-  temporary_ban_duration: 300    # Seconds
+  max_rapid_messages: 5
+  rapid_message_interval: 3
+  temporary_ban_duration: 300
   admin_bypass: true
-```
 
-**Admin Commands:**
-
-```bash
-/ban <user_id> [reason]           # Ban a user (permanent by default)
-/ban <user_id> --temp [reason]     # Temporary ban
-/unban <user_id>                   # Unban a user
-/abuse_stats                       # View abuse statistics
-```
-
-### Telemetry (Optional)
-
-The bot includes minimal bot-layer telemetry that collects metrics not tracked by jaato-server:
-
-**What's Collected:**
-
-- **Telegram Delivery** - Message success/failure rates, API errors
-- **UI Interactions** - Permission approvals, command usage, button clicks, message edits
-- **Session Pool** - Active connections, utilization, errors
-- **Rate Limiting** - Users limited, cooldowns triggered
-- **Abuse Protection** - Bans applied, warnings issued
-- **Latency** - End-to-end latency (avg, P50, P95, P99)
-
-**Configuration:**
-
-```yaml
-# jaato-client-telegram.yaml
 telemetry:
-  enabled: false
-  collect_telegram_delivery: true
-  collect_ui_interactions: true
-  collect_session_pool: true
-  collect_rate_limiting: true
-  collect_abuse_protection: true
-  collect_latency: true
-  retention_hours: 24
-  cleanup_interval_minutes: 60
+  enabled: false          # bot-layer metrics only; does NOT duplicate server metrics
 ```
 
-**Admin Commands:**
-
-```bash
-/telemetry    # View all telemetry statistics
-```
-
-**Example Output:**
-```
-📊 Telemetry Statistics
-
-Uptime: 2.3 hours
-
-📤 Telegram API:
-  Sent: 142
-  Failed: 3
-  Error rate: 2.1%
-  Errors (1h): 2
-
-🖱️ UI Interactions:
-  Permissions: 15✅ / 3❌
-  Message edits: 47
-  Collapsible expands: 8
-  Top commands: /start, /reset, /help
-
-🔗 Session Pool:
-  Active: 5/50
-  Utilization: 10.0%
-  Errors: 0
-  Avg session: 45.2s
-
-⏱️ Rate Limiting:
-  Users limited: 2
-  Cooldowns: 5
-  Active limited: 1
-
-🛡️ Abuse Protection:
-  Bans applied: 3
-  Temporary: 2
-  Permanent: 1
-  Warnings: 7
-
-⚡ Latency (end-to-end):
-  Avg: 2345ms
-  P50: 1980ms
-  P95: 4120ms
-  P99: 5780ms
-  Requests: 142
-```
-
-**Note:** This telemetry is minimal and bot-layer only. It does NOT duplicate metrics already collected by jaato-server (agent execution, tool usage, token counts, etc.).
+Admin commands: `/ban <user_id> [--temp] [reason]`, `/unban <user_id>`, `/abuse_stats`, `/telemetry`.
 
 ## Running
 
-### Start jaato Server
-
-First, ensure your jaato server is running with IPC enabled:
+Start the jaato server (separate project) so it is listening on your configured WebSocket URL, then:
 
 ```bash
-# In your jaato repository
-python -m jaato
+jaato-tg                                   # installed script
+python -m jaato_client_telegram            # or via module
+jaato-tg --config <path> --whitelist <path>
+./start.sh                                 # guided first-run: scaffolds config, checks token + server port
 ```
 
-The server should create a Unix socket at `/tmp/jaato.sock` (or your configured path).
+The bot loads config, connects to the server over WebSocket, starts polling (default) or the webhook server, and runs a background idle-session cleanup task.
 
-### Start the Telegram Bot
-
-```bash
-# Using the installed script
-jaato-tg
-
-# Or via Python module
-python -m jaato_client_telegram
-
-# With custom config path
-jaato-tg --config /path/to/config.yaml
-```
-
-The bot will:
-1. Load configuration
-2. Connect to jaato server via IPC
-3. Start polling for Telegram messages (default mode)
-4. Run background cleanup of idle sessions
-
-#### Polling Mode (Default)
-
-Polling mode is simpler for development and testing. The bot polls Telegram's API for updates periodically.
+### Polling mode (default)
 
 ```yaml
-# jaato-client-telegram.yaml
 telegram:
-  mode: "polling"  # Default mode
+  mode: "polling"
 ```
 
-#### Webhook Mode (Production)
-
-Webhook mode is recommended for production deployments. Telegram sends updates to your server in real-time, reducing latency and server load.
-
-**Configuration:**
+### Webhook mode (production)
 
 ```yaml
-# jaato-client-telegram.yaml
 telegram:
   mode: "webhook"
   webhook:
@@ -338,60 +191,31 @@ telegram:
     secret_token: "${WEBHOOK_SECRET}"
 ```
 
-**Generate a webhook secret:**
-
-```bash
-openssl rand -hex 32
-# Set this as WEBHOOK_SECRET environment variable
-```
-
-**Deployment Requirements:**
-
-1. **Public HTTPS URL**: Telegram only sends webhooks to HTTPS endpoints
-2. **Reverse Proxy**: Use nginx, Caddy, or Apache to proxy requests to the webhook server
-3. **SSL Certificate**: Valid SSL certificate (Let's Encrypt recommended)
-
-**Example nginx configuration:**
+Webhook deployment needs a public HTTPS URL (Telegram only delivers to HTTPS), a reverse proxy (nginx/Caddy), and a valid certificate.
 
 ```nginx
 server {
     listen 443 ssl http2;
     server_name your-domain.com;
-
-    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
-
     location /tg-webhook {
         proxy_pass http://127.0.0.1:8443;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
-**Example Caddy configuration:**
-
-```caddy
-your-domain.com {
-    reverse_proxy 127.0.0.1:8443
-}
-```
-
-**Systemd service example:**
-
 ```ini
+# /etc/systemd/system/jaato-client-telegram.service
 [Unit]
 Description=jaato-client-telegram
 After=network.target
 
 [Service]
 Type=simple
-User=botuser
 WorkingDirectory=/path/to/jaato-client-telegram
-Environment="TELEGRAM_BOT_TOKEN=your-bot-token"
-Environment="WEBHOOK_SECRET=your-webhook-secret"
 ExecStart=/usr/local/bin/jaato-tg --config /path/to/jaato-client-telegram.yaml
 Restart=on-failure
 RestartSec=10
@@ -400,199 +224,150 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-**Switching between modes:**
-
-```bash
-# Polling mode (development)
-jaato-tg --config jaato-client-telegram-polling.yaml
-
-# Webhook mode (production)
-jaato-tg --config jaato-client-telegram-webhook.yaml
-```
-
 ## Usage
 
-### Private Chats
+### Private chats
 
-1. **Start a conversation** - Send `/start` to the bot in a private DM
-2. **Send messages** - Just type and send text messages
-3. **Reset session** - Use `/reset` to clear your conversation state
-4. **Check status** - Use `/status` to see active sessions and your connection state
-5. **Get help** - Use `/help` to see available commands
+- `/start` — begin a conversation
+- send text, photos, or PDFs — the agent responds (photos/PDFs go to the vision tier)
+- `/reset` — drop your session and start fresh
+- `/status` — active sessions and your connection state
+- `/help` — available commands
 
-### Group Chats
+### Group chats
 
-The bot also works in Telegram groups and supergroups!
-
-**How to trigger the bot:**
-
-- **Mention the bot** - Type `@your_bot_username` followed by your message
-- **Use trigger prefix** - Configure a prefix like `!ask` to trigger without mentioning
-- **Reply to bot** - Replying to a bot message will also trigger a response
-
-**Configuration:**
+Activate the bot by **mentioning** it (`@your_bot`), **replying** to one of its messages, or using a configured **trigger prefix**. Each user gets their own isolated session within the group.
 
 ```yaml
-# jaato-client-telegram.yaml
 telegram:
   group:
-    require_mention: true  # Only respond when mentioned or reply
-    trigger_prefix: "!ask"   # Optional: use prefix instead of mention
+    require_mention: true
+    trigger_prefix: "!ask"
 ```
 
-**Session Isolation in Groups:**
+## Host tools & self-extension
 
-Each user in a group gets their own isolated session, even when chatting in the same group:
-- User A's conversation with the bot is private to User A
-- User B's conversation with the bot is private to User B
-- Sessions are not shared between users
+The bot registers tools the *model* can call back into over the same WebSocket. Four are fixed built-ins (`send_to_telegram`, `show_image`, `register_tool`, `service_manifest`). The rest are **self-extension**: the agent writes a draft to `tool_drafts/<name>.py`, and after you approve, the (unconfined) bot installs it into `host_tools_dir` and re-registers it on the live session. See [docs/features/host-tools.md](docs/features/host-tools.md).
 
-**Group Commands:**
+### Shipped example tools
 
-- `/help` - Show group usage instructions
-- `/reset` - Reset your personal session
+Real tools the bot built dynamically during use, promoted to [examples/host_tools/](examples/host_tools/) as references. Secrets and personal data were scrubbed; credential files are never shipped (e.g. `gmail` expects you to supply your own OAuth credentials at runtime via its `configure` action). Some are region-specific.
 
-**Example Group Interaction:**
+| Tool | What it does | Notes | Demo |
+|------|--------------|-------|------|
+| `weather` | Today/tomorrow forecast via Open-Meteo | no API key | [📷](examples/host_tools/screenshots/weather.jpg) |
+| `youtube_search` | Top YouTube results (title, URL, duration, channel) | no key | |
+| `image_search` | Find and show a web image inline | | |
+| `moon_phase` | Today's moon phase as a PIL-rendered image + illumination % | image output | [📷](examples/host_tools/screenshots/moon_phase.jpg) |
+| `daily_ephemerides` | Astronomy ephemerides on demand or scheduled daily | scheduling | |
+| `screenshot` | Render a Telegram-style chat screenshot from messages | image output | |
+| `ttt` | Tic-tac-toe with an inline-button board + board image | interactive | |
+| `die_roller` | Roll dice (`d20`, `2d6`, `1d20+3`) | | |
+| `reverse_text` | Reverse a string | minimal demo | |
+| `docker_status` | Docker container status (running/stopped/total) | host shell-out | [📷](examples/host_tools/screenshots/docker_status.jpg) |
+| `docker_report` | Filtered Docker container report | host shell-out | |
+| `remind` | Create/list/cancel reminders delivered as Telegram messages | scheduling | |
+| `shopping_list` | Persistent shopping list (add/list/remove) | workspace state | |
+| `gmail` | Gmail over OAuth2/Gmail API (configure/auth/check/read/watch/doctor) | creds user-supplied | [📷](examples/host_tools/screenshots/gmail.jpg) |
+| `approval_webhook` | In-process webhook server that asks the user to approve/deny via buttons | server + `ask_user` | |
+| `mercadona` | Mercadona grocery via an external CLI (search/cart/postal) | region: Spain | |
+| `spanish_news` | RSS digest from public Spanish news sources | region: Spain | [📷](examples/host_tools/screenshots/spanish_news.jpg) |
 
-```
-User A: @mybot What's the weather today?
-Bot A: [Responds with weather info - visible to all]
-
-User B: /reset
-Bot: 🔄 Session reset. [Only User B sees this]
-```
-
-## Project Structure
+## Project structure
 
 ```
 jaato-client-telegram/
-├── pyproject.toml              # Package dependencies
-├── README.md                   # This file
-├── config.example.yaml         # Example configuration
-├── .env                        # Root environment template
-├── .jaato/                     # Root jaato directory template
-├── examples/                   # Reference host-tool examples + example service manifest
+├── pyproject.toml
+├── config.example.yaml          # example configuration
+├── jaato-client-telegram.yaml   # tracked live config (paths only; secrets are ${ENV})
+├── start.sh                     # guided first-run
+├── docs/                        # features/ design/ fixes/ implementation/
+├── examples/                    # reference host tools + example service manifest
+├── runtime/                     # bot workspace (gitignored; tracked: .jaato/ profile + agent)
+├── tests/
 └── src/jaato_client_telegram/
-    ├── __init__.py
-    ├── __main__.py             # Entry point
-    ├── config.py               # Configuration model
-    ├── bot.py                  # Bot & dispatcher setup
-    ├── session_pool.py         # Per-user SDK client management
-    ├── host_tools.py           # Built-in host tools (send_to_telegram, show_image, register_tool, service_manifest)
-    ├── host_tool_loader.py     # Loader for agent-installed dynamic host tools
-    ├── workspace.py            # Per-user workspace isolation
-    ├── renderer.py             # Response streaming & formatting
+    ├── __main__.py              # run loop, logging, signals, polling/webhook startup, idle cleanup
+    ├── bot.py                   # builds Bot + Dispatcher, wires singletons into handlers
+    ├── config.py                # Pydantic config model tree
+    ├── transport.py             # WebSocket transport to the jaato server
+    ├── session_pool.py          # one WS connection + one session per chat_id; re-attach
+    ├── renderer.py              # event stream → edited/sent Telegram messages
+    ├── permissions.py           # inline-keyboard permission UI
+    ├── clarification.py         # structured clarification questions
+    ├── file_handler.py          # file delivery
+    ├── host_tools.py            # built-in host tools
+    ├── host_tool_loader.py      # loader for agent-installed dynamic tools
+    ├── chat_session_store.py    # chat_id → session_id persistence (re-attach)
+    ├── thread_store.py          # per-chat Telegram thread continuity
+    ├── thread_bot.py            # injects the current thread into host-tool sends
+    ├── whitelist.py             # access control + access-request flow
+    ├── rate_limiter.py          # token-bucket limiter
+    ├── abuse_protection.py      # reputation + escalating bans
+    ├── telemetry.py             # bot-layer metrics
+    ├── semantic_markup.py       # markdown → Telegram HTML helpers
     └── handlers/
-        ├── __init__.py
-        ├── admin.py            # Admin commands
-        ├── callbacks.py        # Callback query handlers
-        ├── commands.py        # /start, /reset, /status, /help
-        ├── group.py           # Group chat message handler
-        └── private.py         # Private chat message handler
+        ├── admin.py             # ban/telemetry/whitelist admin commands
+        ├── callbacks.py         # inline-keyboard taps (permissions, expand)
+        ├── commands.py          # /start, /reset, /status, /help
+        ├── filters.py           # aiogram filters
+        ├── group.py             # group chat handler
+        ├── lifecycle.py         # startup/shutdown hooks
+        └── private.py           # private chat handler (text + photo/PDF)
 ```
 
-## Workspace Isolation
+## Session & workspace model
 
-Each Telegram user gets their own isolated workspace:
+The bot uses **one WebSocket connection and one jaato session per Telegram chat**. There is a single server-side `workspace` (the `jaato_ws.workspace` directory); the server runs each chat's session inside it. Key behaviors:
 
-```
-workspaces/
-├── user_123456789/             # Per-user workspace
-│   ├── .env                    # User's environment variables
-│   └── .jaato/                 # User's memories, waypoints, templates
-│       ├── memory/
-│       ├── waypoints/
-│       └── templates/
-└── user_987654321/
-    ├── .env
-    └── .jaato/
-```
-
-**Benefits:**
-- Complete isolation of user data and configurations
-- Each user has their own `.env` for custom environment variables
-- Each user has their own `.jaato/` for memories, waypoints, and templates
-- Automatic cleanup when sessions expire or `/reset` is used
+- **Re-attach** — when `session_store_path` is set, `chat_id → session_id` is persisted so a restart re-attaches to the same daemon session (history preserved) instead of starting over. Unset ⇒ sessions are per-process.
+- **Self-healing** — a cached session is reused only if its WebSocket is alive; a dropped connection is recreated on the next message.
+- **Idle detach** — idle chats are detached so the server can free runners for active chats; the first message after a detach pays a cold-revive cost (re-spawn + restore under the same id). This trade is intentional — see [docs/design/session-lifecycle.md](docs/design/session-lifecycle.md).
 
 ## Development
 
-### Running Tests
-
 ```bash
-pytest tests/
+pip install -e ".[dev]"
+pytest tests/                 # unit tests run fully offline (transport/server mocked)
+black src/                    # format (line-length 100)
+ruff check src/               # lint (E, F, I, N, W)
+mypy src/                     # type-check
 ```
 
-### Code Formatting
-
-```bash
-black src/
-ruff check src/
-mypy src/
-```
-
-## Roadmap
-
-### Phase 1: MVP (Current)
-- ✅ Text-only messaging
-- ✅ Session pool with per-user isolation
-- ✅ Progressive response streaming
-- ✅ Basic commands (/start, /reset, /status, /help)
-- ✅ Long message splitting
-- ✅ Polling mode
-- ✅ Idle session cleanup
-
-### Phase 2: Interactive Features (Planned)
-- Permission approval via inline keyboards
-- Webhook mode support
-- Group chat support with mention filtering
-- Enhanced streaming with edit throttling
-- `/help` command with examples
-
-### Phase 3: Advanced (Planned)
-- Multimodal support (images, files, voice)
-- OpenTelemetry observability
-- Rate limiting per user
-- Abuse protection
-- Voice message transcription
+Integration testing is manual and needs a live jaato server + a real bot token — see [TESTING.md](TESTING.md).
 
 ## Troubleshooting
 
-### "Failed to connect to jaato server"
+**"Failed to connect to jaato server"**
+- Ensure the jaato server is running and listening on your configured WebSocket URL.
+- Check that `jaato_ws.url` matches the server's bind address/port.
+- For `wss://`, verify the TLS settings (`jaato_ws.tls`) and certificate.
 
-- Ensure jaato server is running: `ps aux | grep jaato`
-- Check socket path matches in both jaato and client config
-- Verify socket exists: `ls -l /tmp/jaato.sock`
+**Bot doesn't respond**
+- Verify the bot token is correct and the bot is running.
+- Check the logs (`JAATO_TRACE_LOG`) for errors.
+- Try `/reset` to drop a stuck session.
 
-### Bot doesn't respond to messages
-
-- Check bot token is correct
-- Verify bot is running and connected to jaato
-- Check logs for errors
-- Try `/reset` to clear your session
-
-### "Permission denied" errors
-
-- Ensure jaato server socket has proper permissions
-- Check that your user can read/write the socket file
+**Auth failures**
+- If the server requires it, set `jaato_ws.secret_token` (or the Keycloak fields). Empty ⇒ the connection is anonymous.
 
 ## Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT License — see [LICENSE](LICENSE).
 
 ## Links
 
 - [jaato Server](https://github.com/Jaato-framework-and-examples/jaato)
 - [jaato Documentation](https://jaato-framework-and-examples.github.io/jaato/)
-- [jaato-sdk Reference](https://github.com/Jaato-framework-and-examples/jaato-sdk)
+- [jaato-sdk](https://github.com/Jaato-framework-and-examples/jaato-sdk)
 - [aiogram Documentation](https://docs.aiogram.dev/)
 
 ## Acknowledgments
 
 Built with:
-- [jaato-sdk](https://github.com/Jaato-framework-and-examples/jaato-sdk) - IPC client for jaato
-- [aiogram](https://github.com/aiogram/aiogram) - Async Telegram bot framework
-- [Pydantic](https://github.com/pydantic/pydantic) - Configuration validation
+- [jaato-sdk](https://github.com/Jaato-framework-and-examples/jaato-sdk) — the event/wire schema (`jaato_sdk.events`) this client speaks over WebSocket
+- [aiogram](https://github.com/aiogram/aiogram) — async Telegram bot framework
+- [Pydantic](https://github.com/pydantic/pydantic) — configuration validation
