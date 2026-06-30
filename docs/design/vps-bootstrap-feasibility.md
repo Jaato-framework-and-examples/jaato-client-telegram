@@ -133,18 +133,59 @@ container-runner question solved first.
 2. **Fetch:** clone the 2 public repos at a pinned ref into `/opt/jaato` (or
    `~/jaato`).
 3. **Install:** create a venv; `pip install -e` sdk, server, bot (no premium).
-4. **Secrets (interactive):** prompt for Telegram token + provider key; generate
-   `JAATO_WS_TOKEN`; write `EnvironmentFile`s (chmod 600).
+4. **Secrets + provider (interactive — see next section):** Telegram token;
+   pick provider(s) + model(s) + key(s); generate `JAATO_WS_TOKEN`; write
+   `EnvironmentFile`s (chmod 600).
 5. **Configure:** render `servers.json` (no TLS for loopback), the bot
    `jaato-client-telegram.yaml` (`ws://localhost:PORT`, polling, workspace +
-   host_tools_dir paths), and the agent/profile selection.
+   host_tools_dir paths), and the **customized profile** (provider/model/tiers).
 6. **Service:** install systemd units `jaato-server.service` (`--web-socket
    :PORT --ws-token-file …`) and `jaato-tg.service` (After/Requires server);
    enable both.
-7. **Start + verify:** start server → `--status` until ready → start bot →
-   confirm it connects (log line) → print the bot @username and next steps.
+7. **Start + health check (see next section):** start server → validate profile
+   → preflight WS/auth → live provider check → start bot → confirm it connects →
+   print the bot @username and next steps.
 8. **Idempotent re-run:** safe to re-run for upgrades (pull + reinstall +
    restart); `--uninstall` to tear down.
+
+## Provider configuration + health check (interactive, provider-agnostic)
+Do **not** hardcode OpenRouter. The framework supports several providers
+(`anthropic`, `openai`, `openrouter`, `gemini`/`google`, `groq`, `together`,
+`fireworks`, `ollama`, `zhipuai`); the bootstrap asks the operator to choose and
+validates the choice end-to-end.
+
+**Key resolution — env var, no secret in the profile.** Each provider resolves
+its key as `config.api_key or <conventional env var>`
+(`model_provider/.../provider.py`: `api_key = config.api_key or resolve_api_key()`).
+Conventions: `openrouter → JAATO_OPENROUTER_API_KEY`,
+`anthropic → ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `zhipuai → ZHIPUAI_API_KEY`,
+etc. ⇒ the bootstrap writes the provider's env var into the server
+`EnvironmentFile` and leaves the profile's `api_key` unset — **no key inlined in
+the profile.**
+
+**Prompt flow:**
+1. **Main (executor) tier:** choose provider → enter model (suggest a sensible
+   default per provider) → enter API key/token.
+2. **Vision tier (optional):** enable image/PDF understanding? If yes, choose
+   provider + a vision-capable model + key (may be the same provider). If no,
+   render a single-tier profile and tell the operator images won't be understood
+   (the bot still does text + host tools).
+3. **Customize the profile:** write `provider`, `model`, and `model_tiers`
+   (`executor` [+ `vision`], each naming its own provider) into
+   `runtime/.jaato/profiles/telegram_chat.yaml`; set the matching provider env
+   vars; (when Advisor's knob lands) add `plugin_configs.memory.allowed_scopes:
+   ["project"]`.
+
+**Health check (layered; re-prompt on failure):**
+1. `jaato-scaffold validate <profile>` — profile is well-formed (provider/model/
+   plugins/tiers coherent) *before* starting anything.
+2. `jaato-doctor --web-socket :PORT --ws-token-file …` — daemon reachable, WS
+   port + bearer-token + auth mode OK.
+3. **Live provider check** — create a session with the profile (the server runs
+   `verify_auth(provider)`) or send a one-shot "ping" turn; a real reply proves
+   provider + model + key work end-to-end. On failure, surface the provider auth
+   plugin's own error (they print actionable messages) and re-prompt that tier's
+   provider/model/key.
 
 ## Pinning policy (resolved with Advisor)
 Pin **commit SHAs**, not tags — the repos have **zero tags**. Pin a **coherent
