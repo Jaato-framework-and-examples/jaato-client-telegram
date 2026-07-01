@@ -86,6 +86,15 @@ jaato_ws:
   # systemd EnvironmentFile alongside the tokens:
   # workspace: "${JAATO_TG_WORKSPACE}"
 
+  # Per-workspace venv the CONFINED runner installs dynamic-tool dependencies
+  # into (notebook/cli/shell `pip install` → this venv). The bot prepends its
+  # site-packages to sys.path so an in-process host tool can import a dep the
+  # model installed. Set it to the SAME path as the server-side notebook/cli/
+  # shell `workspace_venv` knob (the knob IS the agreement — one explicit shared
+  # path), and create the venv with the SAME Python as the bot. Empty = off
+  # (host tools get stdlib only). No hardcoded default.
+  # host_tools_venv: "${JAATO_TG_WORKSPACE}/.jaato/tool-venv"
+
 # Session Pool Configuration
 session:
   # Maximum concurrent SDK clients

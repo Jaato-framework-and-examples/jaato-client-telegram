@@ -27,8 +27,10 @@ confined runner cannot write there) and are loaded at startup without re-prompt.
 """
 
 import asyncio
+import importlib
 import logging
 import re
+import sys
 import types
 import uuid
 from dataclasses import dataclass
@@ -122,6 +124,19 @@ def validate_name(name: str) -> None:
             f"invalid tool name {name!r}: use lowercase letters, digits and "
             f"underscores, starting with a letter (2-41 chars)"
         )
+
+
+def tools_venv_site_packages(venv: Path) -> Path:
+    """Expected ``site-packages`` of the tools venv for the CURRENT (bot)
+    interpreter: ``<venv>/lib/pythonX.Y/site-packages``.
+
+    Returned whether or not it exists yet — the confined runner creates the venv
+    on its first ``pip install``, and putting the path on ``sys.path`` early means
+    a later install resolves without a bot restart (Python skips absent path
+    entries at import time). The venv MUST be built with the bot's Python for the
+    in-process import to be ABI-compatible; a mismatched version yields a path
+    that never exists (feature stays off — no silent fallback)."""
+    return venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
 
 
 def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
@@ -218,6 +233,11 @@ def load_all_tools(host_tools_dir: Path) -> dict[str, dict]:
     tools: dict[str, dict] = {}
     if not host_tools_dir.is_dir():
         return tools
+    # A tool's deps may have just been pip-installed into the tools venv (on
+    # sys.path) by the confined runner. Drop importlib's finder caches so a tool
+    # importing that fresh package resolves on this (re)load instead of failing
+    # until the next bot restart.
+    importlib.invalidate_caches()
     for path in sorted(host_tools_dir.glob("*.py")):
         if path.name.startswith("_"):
             continue

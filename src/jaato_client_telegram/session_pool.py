@@ -16,6 +16,7 @@ and the public surface the handlers/renderer call.
 import asyncio
 import logging
 import ssl
+import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +33,7 @@ from jaato_client_telegram.host_tool_loader import (
     load_tool_file,
     make_executor,
     mark_user_installed,
+    tools_venv_site_packages,
     validate_name,
 )
 from jaato_client_telegram.host_tools import (
@@ -126,6 +128,7 @@ class SessionPool:
             )
         if self._session_store:
             logger.info("Session re-attachment enabled (store=%s)", session_store_path)
+        self._wire_tools_venv()
 
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
@@ -281,6 +284,27 @@ class SessionPool:
                 raise RuntimeError(
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
+
+    def _wire_tools_venv(self) -> None:
+        """Prepend the per-workspace tools venv's site-packages to this process's
+        sys.path, so an in-process host tool can import a dependency the confined
+        runner installed there (notebook/cli/shell `pip install` → workspace venv).
+
+        No-op when `host_tools_venv` is unconfigured. The path is added even if it
+        doesn't exist yet (the runner creates the venv on first install) so a
+        later install resolves without a bot restart — Python skips absent
+        sys.path entries at import time, and load_all_tools invalidate_caches()es
+        before each (re)load. Idempotent."""
+        venv = self._ws_config.host_tools_venv
+        if not venv:
+            return
+        sp = str(tools_venv_site_packages(Path(venv).expanduser()))
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+        logger.info(
+            "Dynamic-tool deps venv wired on sys.path: %s (exists=%s)",
+            sp, Path(sp).is_dir(),
+        )
 
     def _host_tools_dir(self) -> Path | None:
         """Bot-owned install dir for dynamic host tools — OUTSIDE the workspace so

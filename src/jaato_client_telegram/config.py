@@ -83,6 +83,15 @@ class JaatoWSConfig(BaseModel):
     # write/tamper with installed tool code — only the unconfined bot writes here.
     # Empty = dynamic tools disabled (no hardcoded fallback path).
     host_tools_dir: str = ""
+    # Path to the per-workspace venv that the CONFINED runner (notebook/cli/shell)
+    # installs dynamic-tool dependencies into. The bot prepends THIS venv's
+    # site-packages to its own sys.path so an in-process host tool can import a dep
+    # the model installed there. Set it to the SAME path as the server-side
+    # notebook/cli/shell `workspace_venv` knob (the knob IS the agreement — an
+    # explicit shared path), and create the venv with the SAME Python as the bot
+    # (in-process import ⇒ ABI must match). Empty = off (host tools get stdlib
+    # only). No hardcoded default.
+    host_tools_venv: str = ""
 
 
 class SessionConfig(BaseModel):
