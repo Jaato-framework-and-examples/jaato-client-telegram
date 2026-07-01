@@ -84,3 +84,13 @@ plugin_configs:
     # client-side on tool.call_end) and NEVER writes to the HOME/global tier
     # (avoids raw-in-home). A disallowed scope is hard-rejected to the model.
     allowed_scopes: ["project"]
+  # Dynamic-tool dependency venv: the confined runner installs deps here
+  # (pip install in notebook/cli/shell → <workspace>/.jaato/tool-venv), and the
+  # bot prepends its site-packages so an in-process host tool can import them.
+  # Path is relative to the workspace; MUST match the bot's jaato_ws.host_tools_venv.
+  notebook:
+    workspace_venv: ".jaato/tool-venv"
+  cli:
+    workspace_venv: ".jaato/tool-venv"
+  interactive_shell:
+    workspace_venv: ".jaato/tool-venv"

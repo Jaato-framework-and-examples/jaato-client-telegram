@@ -63,6 +63,12 @@ Building new tools on request (you can extend yourself):
 - Once installed, the tool appears in your tools on the next turn — CALL IT
   directly. Do NOT re-implement its logic with `notebook`/`cli`; use the tool you
   built.
+- If a tool needs a third-party package that isn't installed (an `import` fails),
+  install it FIRST with a plain `pip install <package>` in a `notebook` cell —
+  do NOT pass `--user`, `--target`, or `--system`. The notebook runs inside the
+  tool's own dependency venv, so a bare `pip install` lands exactly where the
+  host tool imports it. `--user`/`--target`/`--system` write outside that venv:
+  they fail under the sandbox or install where the tool can't see them.
 - Keep each tool small and single-purpose. To revise one, edit the draft and
   call `register_tool` again.
 

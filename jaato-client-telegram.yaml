@@ -58,6 +58,12 @@ jaato_ws:
   # MUST be OUTSIDE `workspace` so the AppArmor-confined runner can't write or
   # tamper with installed tool code. Empty = dynamic-tool installs disabled.
   host_tools_dir: "${JAATO_TG_HOST_TOOLS_DIR}"
+  # Per-workspace venv the confined runner installs dynamic-tool deps into
+  # (notebook/cli/shell workspace_venv knob). The bot prepends its site-packages
+  # to sys.path so in-process host tools import those deps. MUST match the
+  # server-side plugin_configs.<tool>.workspace_venv path (which is relative to
+  # the workspace, i.e. .jaato/tool-venv → this absolute path).
+  host_tools_venv: "${JAATO_TG_WORKSPACE}/.jaato/tool-venv"
 
 # Session Pool Configuration
 session:
