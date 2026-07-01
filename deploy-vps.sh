@@ -98,8 +98,15 @@ preflight(){
 _clone_at(){ local repo="$1" dir="$2" ref="$3"
   if [ -d "$dir/.git" ]; then git -C "$dir" fetch --quiet origin
   else git clone --quiet "$repo" "$dir"; fi
-  git -C "$dir" checkout --quiet "$ref"
-  git -C "$dir" pull --quiet --ff-only origin "$ref" 2>/dev/null || true
+  # Hard-reset to the target ref. write_profile/write_bot_config regenerate
+  # git-tracked files every run, leaving the tree permanently dirty — so a plain
+  # `pull --ff-only` is always blocked (and the old `|| true` swallowed it,
+  # pinning the bot repo to its first-cloned commit). Those generated files are
+  # disposable (rewritten seconds later), so discard local changes and advance
+  # to the fetched tip. Handles a branch ref (origin/<branch>) or a pinned SHA.
+  git -C "$dir" checkout --quiet --force "$ref"
+  git -C "$dir" reset --hard --quiet "origin/$ref" 2>/dev/null \
+    || git -C "$dir" reset --hard --quiet "$ref"
   printf '  %s @ %s\n' "$(basename "$dir")" "$(git -C "$dir" rev-parse --short HEAD)"
 }
 fetch(){ info "Fetch repos (pinned: jaato=$JAATO_REF bot=$BOT_REF)"
@@ -295,6 +302,17 @@ plugin_configs:
     # Single shared workspace => "project" scope already spans all of a user's
     # chats; keeps memories off the HOME/global tier (server PR #468).
     allowed_scopes: ["project"]
+  # Dynamic-tool dependency venv: the confined runner installs deps here
+  # (a bare `pip install` in notebook/cli/shell -> <workspace>/.jaato/tool-venv,
+  # via the pip shim + `<venv>/bin/* ix` apparmor grant, server #479), and the
+  # bot prepends its site-packages so an in-process host tool imports them.
+  # Path is workspace-relative; MUST match the bot's jaato_ws.host_tools_venv.
+  notebook:
+    workspace_venv: ".jaato/tool-venv"
+  cli:
+    workspace_venv: ".jaato/tool-venv"
+  interactive_shell:
+    workspace_venv: ".jaato/tool-venv"
 YAML
   printf '  provider=%s model=%s vision=%s apparmor=%s\n' \
     "$EXEC_PROVIDER" "$EXEC_MODEL" "${VISION_PROVIDER:-off}" "$apparmor"
@@ -337,6 +355,10 @@ jaato_ws:
   agent: "telegram_chat"
   workspace: "\${JAATO_TG_WORKSPACE}"
   host_tools_dir: "\${JAATO_TG_HOST_TOOLS_DIR}"
+  # Same tool-venv the server installs dynamic-tool deps into (profile
+  # plugin_configs.<notebook|cli|interactive_shell>.workspace_venv). The bot
+  # prepends its site-packages to sys.path so in-process host tools import them.
+  host_tools_venv: "\${JAATO_TG_WORKSPACE}/.jaato/tool-venv"
 session:
   max_concurrent: 50
   session_store_path: "\${JAATO_TG_SESSION_STORE}"
