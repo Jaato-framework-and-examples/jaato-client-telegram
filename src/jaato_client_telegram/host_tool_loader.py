@@ -189,6 +189,12 @@ def make_executor(
     ctx = ToolContext(bot=bot, chat_id=chat_id)
 
     async def executor(args: dict) -> dict:
+        # A tool may import a dependency the confined runner just pip-installed
+        # into the workspace tools venv (on sys.path). Drop importlib's finder
+        # caches so a call-time `import X` sees a package added AFTER the venv dir
+        # was first scanned (empty) at startup — the "install then use it now"
+        # case, e.g. moon_phase importing skyfield inside execute().
+        importlib.invalidate_caches()
         try:
             result = await execute_fn(args or {}, ctx)
         except Exception as e:  # noqa: BLE001 — tool boundary

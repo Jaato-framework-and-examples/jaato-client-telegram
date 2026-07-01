@@ -80,6 +80,43 @@ def test_host_tool_imports_dep_installed_into_the_venv(tmp_path):
         importlib.invalidate_caches()
 
 
+def test_executor_sees_dep_installed_after_creation(tmp_path):
+    """make_executor invalidate_caches() lets a tool import a dep that appears in
+    a sys.path dir AFTER the executor was built — the install-then-use-now case
+    (e.g. moon_phase importing skyfield inside execute() right after a pip
+    install into the workspace venv)."""
+    import asyncio
+
+    from jaato_client_telegram.host_tool_loader import make_executor
+
+    venv = tmp_path / "tool-venv"
+    site = tools_venv_site_packages(venv)
+    sp = str(site)
+    sys.path.insert(0, sp)
+    try:
+        importlib.invalidate_caches()
+        try:                                  # force a scan that caches the dir empty
+            import faketooldep_late  # noqa: F401
+        except ModuleNotFoundError:
+            pass
+
+        async def execute(args, ctx):
+            import faketooldep_late            # imported at CALL time
+            return {"result": faketooldep_late.V}
+
+        executor = make_executor(execute, bot=None, chat_id=1)
+        site.mkdir(parents=True)              # runner "installs" the dep AFTER
+        (site / "faketooldep_late.py").write_text("V = 7\n")
+
+        out = asyncio.new_event_loop().run_until_complete(executor({}))
+        assert out == {"result": 7}
+    finally:
+        while sp in sys.path:
+            sys.path.remove(sp)
+        sys.modules.pop("faketooldep_late", None)
+        importlib.invalidate_caches()
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
