@@ -27,9 +27,9 @@ confined runner cannot write there) and are loaded at startup without re-prompt.
 """
 
 import asyncio
-import importlib.util
 import logging
 import re
+import types
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,11 +130,23 @@ def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
     Raises ``ValueError`` if the file does not match the contract. NOTE: this
     executes the module body — only call it on trusted/approved files.
     """
-    spec = importlib.util.spec_from_file_location(f"host_tool__{path.stem}", path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"{path.name}: could not load module spec")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Compile the source DIRECTLY — do not go through importlib's __pycache__.
+    # importlib validates the bytecode cache by source mtime at 1-second
+    # granularity, so re-registering a modified tool (overwrite + reload within
+    # the same second, as register_tool does) would run STALE bytecode — the new
+    # version would only take effect on a later/new session. compile()+exec()
+    # reads the current source every time, so a re-registration takes effect
+    # immediately.
+    try:
+        source = path.read_text()
+    except OSError as e:
+        raise ValueError(f"{path.name}: could not read file: {e}") from e
+    module = types.ModuleType(f"host_tool__{path.stem}")
+    module.__file__ = str(path)
+    try:
+        exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102 — trusted, user-approved file
+    except Exception as e:  # noqa: BLE001 — surface any load error as ValueError
+        raise ValueError(f"{path.name}: failed to load: {e}") from e
 
     schema = getattr(module, "TOOL_SCHEMA", None)
     execute = getattr(module, "execute", None)
