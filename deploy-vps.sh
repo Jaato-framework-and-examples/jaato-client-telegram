@@ -39,6 +39,7 @@ HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.
 CFG_DIR="$HOME/.config/jaato-tg"
 SERVER_ENV="$CFG_DIR/server.env"; BOT_ENV="$CFG_DIR/bot.env"
 WS_TOKEN_FILE="$CFG_DIR/ws.token"; BOT_CONFIG="$CFG_DIR/jaato-client-telegram.yaml"
+WHITELIST_FILE="$CFG_DIR/whitelist.json"
 # systemd: system-wide units when root (VPS-native), --user units otherwise.
 if [ "$(id -u)" -eq 0 ]; then
   SYSTEMD_MODE=system; UNIT_DIR="/etc/systemd/system"; WANTED_BY="multi-user.target"
@@ -187,6 +188,14 @@ collect(){ info "Configuration"
     IFS='|' read -r VISION_PROVIDER VISION_MODEL VISION_ENVVAR VISION_KEY < <(_pick_provider "vision")
   else warn "  Vision disabled — the bot does text + tools; images/PDFs won't be understood."; fi
 
+  # Whitelist (username-based access control). Non-interactive via
+  # WHITELIST_ADMINS / WHITELIST_USERS (comma-separated Telegram usernames).
+  WL_ADMINS="${WHITELIST_ADMINS:-}"; WL_USERS="${WHITELIST_USERS:-}"
+  if [ -z "$WL_ADMINS$WL_USERS" ] && [ "$noninteractive" != "1" ]; then
+    WL_ADMINS=$(ask "Admin Telegram username(s), comma-separated, no @ (they can use the bot + admin cmds)")
+    WL_USERS=$(ask "Additional allowed username(s), comma-separated (optional)" "")
+  fi
+
   WS_TOKEN=$("$PYV" -c 'import secrets;print(secrets.token_urlsafe(32))')
 }
 
@@ -266,6 +275,28 @@ YAML
     "$EXEC_PROVIDER" "$EXEC_MODEL" "${VISION_PROVIDER:-off}" "$apparmor"
 }
 
+# ── 6b. Whitelist (username-based access control) ────────────────────────────
+write_whitelist(){ info "Write whitelist -> $WHITELIST_FILE"
+  "$PYV" - "$WHITELIST_FILE" "$WL_ADMINS" "$WL_USERS" <<'PY'
+import json, sys
+from datetime import datetime
+path, admins_s, users_s = sys.argv[1], sys.argv[2], sys.argv[3]
+parse = lambda s: [u.strip().lstrip("@") for u in s.split(",") if u.strip()]
+admins, users = parse(admins_s), parse(users_s)
+now = datetime.now().isoformat(timespec="seconds")
+seen, entries = set(), []
+for u in admins + users:
+    if u not in seen:
+        seen.add(u); entries.append({"username": u, "added_by": "deploy-vps.sh", "added_at": now})
+# entries present -> lock to the whitelist; none -> open (with a warning below).
+data = {"enabled": bool(entries), "admin_usernames": admins,
+        "entries": entries, "access_requests": []}
+json.dump(data, open(path, "w"), indent=2)
+print(f"  {len(entries)} allowed user(s), {len(admins)} admin(s), enabled={bool(entries)}")
+PY
+  [ -n "$WL_ADMINS$WL_USERS" ] || warn "  No whitelist users given — the bot is OPEN to anyone. Set WHITELIST_ADMINS to lock it down."
+}
+
 # ── 7. Bot config (ws://localhost, polling, no TLS/servers.json) ─────────────
 write_bot_config(){ info "Write bot config -> $BOT_CONFIG"
   cat > "$BOT_CONFIG" <<YAML
@@ -312,7 +343,7 @@ Requires=jaato-server.service
 [Service]
 Type=simple
 EnvironmentFile=$BOT_ENV
-ExecStart=$VENV/bin/jaato-tg --config $BOT_CONFIG
+ExecStart=$VENV/bin/jaato-tg --config $BOT_CONFIG --whitelist $WHITELIST_FILE
 Restart=on-failure
 RestartSec=10
 [Install]
@@ -392,7 +423,7 @@ main(){
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
-  preflight; fetch; install; collect; write_env; write_profile; write_bot_config
+  preflight; fetch; install; collect; write_env; write_profile; write_whitelist; write_bot_config
   install_units; start_and_check
   printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
 }
