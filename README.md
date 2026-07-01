@@ -15,6 +15,37 @@ All agent logic, tool execution, plugins, and permissions live in the **jaato se
 
 > **Transport note:** earlier revisions of this project spoke to the server over a Unix-socket "jaato-sdk IPC" connection (`/tmp/jaato.sock`, `socket_path`). That is no longer the case — the live transport is a WebSocket configured under `jaato_ws:` (`url: ws://…` / `wss://…`). The client imports the wire schema (event dataclasses) from `jaato_sdk.events`.
 
+## Deploy to a VPS (one command)
+
+`deploy-vps.sh` bootstraps the **whole stack** — the jaato server *and* this bot — onto a fresh Linux VPS: it installs system deps, clones + installs the jaato monorepo (server + SDK) and this bot into a venv, asks for your provider/model/keys, generates the config + a **user whitelist**, wires two **systemd** services (server + bot), and runs a layered health check. Premium-free, no TLS or inbound ports (bot ↔ server over `ws://localhost`, Telegram polling).
+
+On a fresh **Ubuntu/Debian** VPS (as root, or a sudo user):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jaato-framework-and-examples/jaato-client-telegram/master/deploy-vps.sh -o deploy-vps.sh
+chmod +x deploy-vps.sh
+./deploy-vps.sh          # prompts for token, provider, model, key, whitelist
+```
+
+It prompts for:
+- your **Telegram bot token** ([@BotFather](https://t.me/botfather))
+- the **provider + model + API key** — the provider menu and each provider's key env-var are discovered from `jaato-scaffold explain` (no hardcoded list: ZhipuAI, OpenRouter, Anthropic, OpenAI, Gemini, Groq, …), with an optional **separate vision tier** (different provider/model/key)
+- the **whitelist** — admin + allowed Telegram usernames
+
+**Non-interactive** (automation/CI) — provide the same values as env vars:
+
+```bash
+TELEGRAM_BOT_TOKEN=… \
+EXEC_PROVIDER=zhipuai EXEC_MODEL=glm-4.6 EXEC_KEY=… \
+VISION_PROVIDER=openrouter VISION_MODEL=google/gemini-2.5-flash VISION_KEY=… \
+WHITELIST_ADMINS=yourhandle WHITELIST_USERS=friend1,friend2 \
+./deploy-vps.sh
+```
+
+Idempotent (re-run to upgrade); `./deploy-vps.sh --uninstall` to remove the services. Secrets go to `chmod 600` env files — never inlined in the profile. As root it installs **system** units (`systemctl status jaato-server jaato-tg`); as a non-root user, **`--user`** units with linger. Validated on a fresh Ubuntu 26.04 / Python 3.14 VPS. Design notes: [docs/design/vps-bootstrap-feasibility.md](docs/design/vps-bootstrap-feasibility.md).
+
+> Prefer to run the server and bot yourself, or connect to an existing jaato server? See **Configuration** and **Running** below.
+
 ## Features
 
 - **WebSocket transport** — one connection + one jaato session per Telegram `chat_id`, matching the server's 1-client-1-session model; optional TLS (`wss://`) and Keycloak auth.
