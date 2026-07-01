@@ -43,6 +43,7 @@ from jaato_client_telegram.host_tools import (
 )
 from jaato_client_telegram.thread_bot import ThreadAwareBot
 from jaato_client_telegram.thread_store import ChatThreadStore
+from jaato_client_telegram.welcome_store import WelcomeStore
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -113,6 +114,13 @@ class SessionPool:
             if session_store_path else ""
         )
         self._thread_store = ChatThreadStore(thread_store_path)
+        # One-time first-contact welcome tracking (persisted next to the session
+        # store; in-memory when that's unconfigured, i.e. re-welcomes per process).
+        welcome_store_path = (
+            str(Path(session_store_path).with_name("welcomed_chats.json"))
+            if session_store_path else ""
+        )
+        self._welcome_store = WelcomeStore(welcome_store_path)
         # Whether the most recent get_or_create_session for a chat RE-ATTACHED to
         # a persisted session (vs created fresh / reused in-memory) — so the
         # handler can show a "Resumed" cue. Read via took_reattach().
@@ -133,6 +141,12 @@ class SessionPool:
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
         self._file_config = file_config
+
+    def claim_first_contact(self, chat_id: int) -> bool:
+        """True (once ever per chat) if this is the chat's first contact — the
+        caller should then send the one-time model-generated welcome. False on
+        every later message. Persisted so it survives restarts."""
+        return self._welcome_store.claim_first_contact(chat_id)
 
     def took_reattach(self, chat_id: int) -> bool:
         """True if the most recent get_or_create_session for this chat RE-ATTACHED

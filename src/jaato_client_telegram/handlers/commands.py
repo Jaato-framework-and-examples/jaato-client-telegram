@@ -8,32 +8,41 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.welcome_store import WELCOME_START
 
 
 router = Router()
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, pool: SessionPool) -> None:
+async def cmd_start(
+    message: Message, pool: SessionPool, renderer: ResponseRenderer
+) -> None:
     """
-    Initialize a session for the user.
-
-    Creates or retrieves an SDK client for this chat_id,
-    establishing a connection to the jaato server.
+    Initialize a session and, on a chat's FIRST contact, stream a one-time
+    model-generated welcome (the agent introduces itself + its capabilities/tools,
+    which stays accurate as tools change). Returning users get a light reconnect.
     """
     chat_id = message.chat.id
 
     try:
         # Ensure a session exists (creates/re-attaches + connects if needed)
-        await pool.get_or_create_session(chat_id)
+        session_id = await pool.get_or_create_session(chat_id)
 
-        await message.answer(
-            "✅ Connected to jaato!\n\n"
-            "Send me a message and I'll forward it to the AI agent. "
-            "Each conversation is isolated and private.\n\n"
-            "💡 Tip: Use /help to see available commands"
-        )
+        if pool.claim_first_contact(chat_id):
+            # First time ever for this chat → let the AGENT introduce itself.
+            await pool.send_message(session_id, WELCOME_START)
+            await renderer.stream_response(
+                initial_message=message,
+                event_stream=await pool.events(session_id),
+                thread_id_getter=lambda cid=chat_id: pool.current_thread(cid),
+            )
+        else:
+            await message.answer(
+                "✅ Reconnected. Send me a message anytime — /help for commands."
+            )
     except Exception as e:
         await message.answer(
             f"❌ Failed to connect to jaato server.\n\n"

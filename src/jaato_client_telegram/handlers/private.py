@@ -16,6 +16,7 @@ from aiogram.types import Message
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.welcome_store import WELCOME_PREFIX
 
 if TYPE_CHECKING:
     from jaato_client_telegram.rate_limiter import RateLimiter
@@ -146,6 +147,11 @@ async def handle_private_message(
                 )
 
             logger.debug(f"User {chat_id}: session_id = {session_id}")
+
+            # First message ever from this chat → have the agent introduce itself
+            # (its capabilities/tools) before answering. Gated once per chat.
+            if pool.claim_first_contact(chat_id):
+                user_text = WELCOME_PREFIX + user_text
 
             # Send user message to jaato
             await pool.send_message(session_id, user_text)
@@ -330,6 +336,9 @@ async def handle_private_media(
                 await message.answer(
                     "⏳ Resuming your previous conversation…", parse_mode=None
                 )
+            # First contact via a photo/PDF → introduce before describing.
+            if pool.claim_first_contact(chat_id):
+                caption = WELCOME_PREFIX + caption
             await pool.send_message(session_id, caption, attachments=attachments)
             ctx = await renderer.stream_response(
                 initial_message=message,
