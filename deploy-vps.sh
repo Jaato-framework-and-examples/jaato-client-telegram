@@ -113,9 +113,14 @@ install(){ info "Install (venv + editable packages)"
   [ -x "$PYV" ] || "$PYTHON_BIN" -m venv "$VENV"
   "$PYV" -m pip install --quiet --upgrade pip wheel
   "$PYV" -m pip install --quiet -e "$JAATO_DIR/jaato-sdk"
-  "$PYV" -m pip install --quiet -e "$JAATO_DIR/jaato-server"
+  # Server WITH the plugin + provider extras our profile needs (pexpect for
+  # interactive_shell, web/ast/notebook/templates, and the common provider SDKs).
+  # NOT `[all]` — that pulls kerberos→gssapi which needs libkrb5-dev and we don't
+  # use it. Anthropic's SDK is a base dep already.
+  "$PYV" -m pip install --quiet -e \
+    "$JAATO_DIR/jaato-server[web,interactive,ast,notebook,templates,diagrams,google,github-models,nim,openrouter]"
   "$PYV" -m pip install --quiet -e "$BOT_DIR"
-  printf '  installed: jaato-sdk, jaato-server, jaato-client-telegram (no premium)\n'
+  printf '  installed: jaato-sdk, jaato-server[extras], jaato-client-telegram (no premium)\n'
 }
 
 # The provider's key env-var name, discovered from `scaffold explain env`
@@ -260,7 +265,6 @@ plugins:
   - interactive_shell
   - notebook
   - subagent
-  - flow_tools
   - template
   - prompt_library
   - environment
@@ -383,7 +387,7 @@ start_and_check(){ info "Start server + health check"
   for _ in $(seq 1 30); do "$PYV" -m server --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
 
   info "  validate profile (jaato-scaffold validate)"
-  scaffold validate --workspace "$WORKSPACE" || die "profile validation failed — fix the profile and re-run"
+  scaffold validate "$PROFILE_FILE" || die "profile validation failed (see above) — fix the profile and re-run"
 
   info "  preflight WS/auth (jaato-doctor)"
   "$PYV" -m jaato_sdk.doctor --web-socket ":$WS_PORT" --ws-token-file "$WS_TOKEN_FILE" --no-auto-start \
