@@ -39,7 +39,13 @@ HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.
 CFG_DIR="$HOME/.config/jaato-tg"
 SERVER_ENV="$CFG_DIR/server.env"; BOT_ENV="$CFG_DIR/bot.env"
 WS_TOKEN_FILE="$CFG_DIR/ws.token"; BOT_CONFIG="$CFG_DIR/jaato-client-telegram.yaml"
-UNIT_DIR="$HOME/.config/systemd/user"
+# systemd: system-wide units when root (VPS-native), --user units otherwise.
+if [ "$(id -u)" -eq 0 ]; then
+  SYSTEMD_MODE=system; UNIT_DIR="/etc/systemd/system"; WANTED_BY="multi-user.target"
+else
+  SYSTEMD_MODE=user; UNIT_DIR="$HOME/.config/systemd/user"; WANTED_BY="default.target"
+fi
+_sc(){ if [ "$SYSTEMD_MODE" = system ]; then systemctl "$@"; else systemctl --user "$@"; fi; }
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_B=$'\e[1m'; C_0=$'\e[0m'
@@ -111,6 +117,19 @@ install(){ info "Install (venv + editable packages)"
   printf '  installed: jaato-sdk, jaato-server, jaato-client-telegram (no premium)\n'
 }
 
+# The provider's key env-var name, discovered from `scaffold explain env`
+# (prefer JAATO_*_API_KEY, then *_API_KEY, then *AUTH_TOKEN/_TOKEN; empty = keyless).
+_provider_keyvar(){ local provider="$1"
+  scaffold explain env --json 2>/dev/null | "$PYV" -c '
+import json,sys
+d=json.load(sys.stdin); pv=d.get("provider:'"$provider"'",{})
+cands=[k for k in pv if any(t in k for t in ("API_KEY","AUTH_TOKEN")) or k.endswith("_TOKEN")]
+def rank(k): return (0 if k.startswith("JAATO_") and k.endswith("API_KEY")
+  else 1 if k.endswith("API_KEY") else 2)
+cands.sort(key=rank)
+print(cands[0] if cands else "")'
+}
+
 # ── Provider picking, driven entirely by `scaffold explain` ──────────────────
 # Echoes "PROVIDER|MODEL|ENVVAR|KEYVALUE" (ENVVAR/KEYVALUE empty for keyless/local).
 _pick_provider(){ local role="$1"
@@ -129,16 +148,7 @@ d=json.load(sys.stdin); c=d.get("capabilities",{})
 print("  images=%s pdf=%s"%(c.get("user_message_images"),c.get("pdf_input")))' >&2 || true
   local model; model=$(ask "model id for $provider")
   [ -n "$model" ] || die "model is required"
-  # The provider's key env-var, discovered from `scaffold explain env`.
-  local envvar; envvar=$(scaffold explain env --json 2>/dev/null | "$PYV" -c '
-import json,sys
-d=json.load(sys.stdin); pv=d.get("provider:'"$provider"'",{})
-# auth-relevant vars, prefer a JAATO_*_API_KEY, then *_API_KEY, then *AUTH*/_TOKEN
-cands=[k for k in pv if any(t in k for t in ("API_KEY","AUTH_TOKEN")) or k.endswith("_TOKEN")]
-def rank(k): return (0 if k.startswith("JAATO_") and k.endswith("API_KEY")
-  else 1 if k.endswith("API_KEY") else 2)
-cands.sort(key=rank)
-print(cands[0] if cands else "")')
+  local envvar; envvar=$(_provider_keyvar "$provider")
   local keyval=""
   if [ -n "$envvar" ]; then keyval=$(ask_secret "API key/token for $provider (-> \$$envvar)")
   else warn "  $provider exposes no API-key env var (local/keyless) — set host/endpoint env vars yourself if needed."; fi
@@ -146,15 +156,34 @@ print(cands[0] if cands else "")')
 }
 
 # ── 4. Collect operator input ────────────────────────────────────────────────
+# Interactive by default; fully NON-INTERACTIVE when these env vars are set
+# (handy for automation / a scripted VPS test):
+#   TELEGRAM_BOT_TOKEN, EXEC_PROVIDER, EXEC_MODEL, EXEC_KEY,
+#   and optionally VISION_PROVIDER, VISION_MODEL, VISION_KEY.
 collect(){ info "Configuration"
-  TG_TOKEN=$(ask_secret "Telegram bot token (from @BotFather)")
+  local noninteractive=0
+  { [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || [ -n "${EXEC_PROVIDER:-}" ]; } && noninteractive=1
+  TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+  [ -n "$TG_TOKEN" ] || TG_TOKEN=$(ask_secret "Telegram bot token (from @BotFather)")
   [ -n "$TG_TOKEN" ] || die "Telegram token is required"
 
-  printf '\n  %sMain (text) tier%s\n' "$C_B" "$C_0"
-  IFS='|' read -r EXEC_PROVIDER EXEC_MODEL EXEC_ENVVAR EXEC_KEY < <(_pick_provider "main/text")
+  if [ -n "${EXEC_PROVIDER:-}" ]; then
+    EXEC_MODEL="${EXEC_MODEL:?EXEC_MODEL required when EXEC_PROVIDER is set}"
+    EXEC_ENVVAR=$(_provider_keyvar "$EXEC_PROVIDER"); EXEC_KEY="${EXEC_KEY:-}"
+    info "  main tier (env): $EXEC_PROVIDER / $EXEC_MODEL -> \$${EXEC_ENVVAR:-<keyless>}"
+  else
+    printf '\n  %sMain (text) tier%s\n' "$C_B" "$C_0"
+    IFS='|' read -r EXEC_PROVIDER EXEC_MODEL EXEC_ENVVAR EXEC_KEY < <(_pick_provider "main/text")
+  fi
 
-  VISION_PROVIDER=""; VISION_MODEL=""; VISION_ENVVAR=""; VISION_KEY=""
-  if confirm "Enable image/PDF understanding (vision tier)?"; then
+  VISION_PROVIDER="${VISION_PROVIDER:-}"; VISION_MODEL="${VISION_MODEL:-}"; VISION_ENVVAR=""; VISION_KEY="${VISION_KEY:-}"
+  if [ -n "$VISION_PROVIDER" ]; then
+    VISION_MODEL="${VISION_MODEL:?VISION_MODEL required when VISION_PROVIDER is set}"
+    VISION_ENVVAR=$(_provider_keyvar "$VISION_PROVIDER")
+    info "  vision tier (env): $VISION_PROVIDER / $VISION_MODEL"
+  elif [ "$noninteractive" = "1" ]; then
+    warn "  Vision disabled (non-interactive run, no VISION_PROVIDER set)."
+  elif confirm "Enable image/PDF understanding (vision tier)?"; then
     IFS='|' read -r VISION_PROVIDER VISION_MODEL VISION_ENVVAR VISION_KEY < <(_pick_provider "vision")
   else warn "  Vision disabled — the bot does text + tools; images/PDFs won't be understood."; fi
 
@@ -258,8 +287,8 @@ session:
 YAML
 }
 
-# ── 8. systemd --user units (server + bot) ───────────────────────────────────
-install_units(){ info "Install systemd --user units"
+# ── 8. systemd units (server + bot) — system-wide as root, else --user ───────
+install_units(){ info "Install systemd units ($SYSTEMD_MODE mode)"
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/jaato-server.service" <<UNIT
 [Unit]
@@ -273,7 +302,7 @@ ExecStart=$PYV -m server --web-socket :$WS_PORT --ws-token-file $WS_TOKEN_FILE
 Restart=on-failure
 RestartSec=5
 [Install]
-WantedBy=default.target
+WantedBy=$WANTED_BY
 UNIT
   cat > "$UNIT_DIR/jaato-tg.service" <<UNIT
 [Unit]
@@ -287,12 +316,13 @@ ExecStart=$VENV/bin/jaato-tg --config $BOT_CONFIG
 Restart=on-failure
 RestartSec=10
 [Install]
-WantedBy=default.target
+WantedBy=$WANTED_BY
 UNIT
-  systemctl --user daemon-reload
-  # Survive logout / start at boot.
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || warn "could not enable linger (services won't start at boot without it)"
-  systemctl --user enable jaato-server.service jaato-tg.service >/dev/null 2>&1 || true
+  _sc daemon-reload
+  # --user only: survive logout / start at boot via linger (system units don't need it).
+  [ "$SYSTEMD_MODE" = user ] && { loginctl enable-linger "$USER" >/dev/null 2>&1 \
+    || warn "could not enable linger (services won't start at boot without it)"; }
+  _sc enable jaato-server.service jaato-tg.service >/dev/null 2>&1 || true
 }
 
 # ── 9. Start + layered health check ──────────────────────────────────────────
@@ -318,7 +348,7 @@ sys.exit(asyncio.run(main()))
 PY
 }
 start_and_check(){ info "Start server + health check"
-  systemctl --user restart jaato-server.service
+  _sc restart jaato-server.service
   for _ in $(seq 1 30); do "$PYV" -m server --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
 
   info "  validate profile (jaato-scaffold validate)"
@@ -337,20 +367,21 @@ start_and_check(){ info "Start server + health check"
   esac
 
   info "Start the bot"
-  systemctl --user restart jaato-tg.service
+  _sc restart jaato-tg.service
   sleep 3
-  if systemctl --user is-active --quiet jaato-tg.service; then
+  if _sc is-active --quiet jaato-tg.service; then
     info "Bot is running. Message it on Telegram to begin."
   else
-    die "bot failed to start — check: journalctl --user -u jaato-tg -e"
+    local j="journalctl -u jaato-tg -e"; [ "$SYSTEMD_MODE" = user ] && j="journalctl --user -u jaato-tg -e"
+    die "bot failed to start — check: $j"
   fi
 }
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
-uninstall(){ info "Uninstall"
-  systemctl --user disable --now jaato-tg.service jaato-server.service 2>/dev/null || true
+uninstall(){ info "Uninstall ($SYSTEMD_MODE mode)"
+  _sc disable --now jaato-tg.service jaato-server.service 2>/dev/null || true
   rm -f "$UNIT_DIR/jaato-tg.service" "$UNIT_DIR/jaato-server.service"
-  systemctl --user daemon-reload 2>/dev/null || true
+  _sc daemon-reload 2>/dev/null || true
   warn "Left in place (delete manually if wanted): $INSTALL_DIR, $CFG_DIR, $STATE_DIR"
   info "Services removed."
 }
