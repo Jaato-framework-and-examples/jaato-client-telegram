@@ -223,6 +223,27 @@ write_env(){ info "Write secrets (chmod 600)"
   chmod 600 "$WS_TOKEN_FILE" "$SERVER_ENV" "$BOT_ENV"
 }
 
+# ── 5b. Seed curated host tools (repo is the source of truth) ─────────────────
+# HOST_TOOLS_DIR is bot-owned and OUTSIDE the workspace, so the confined runner
+# can't tamper with it; tools placed here load at startup without re-prompt.
+# The curated set is DISCOVERED from the repo at run time (glob over
+# examples/host_tools/*.py) — never a hardcoded list — so example tools added to
+# the repo later ship automatically. We overwrite the curated files on every run
+# (repo wins → upgrades refresh them) but never delete tools that aren't in the
+# repo, leaving runtime-installed / operator "foreign" tools untouched.
+seed_host_tools(){ info "Seed curated host tools -> $HOST_TOOLS_DIR"
+  local src="$BOT_DIR/examples/host_tools"
+  [ -d "$src" ] || { warn "no examples/host_tools in repo — skipping tool seed"; return; }
+  mkdir -p "$HOST_TOOLS_DIR"
+  local n=0
+  for f in "$src"/*.py; do
+    [ -e "$f" ] || continue                          # empty-glob guard
+    case "$(basename "$f")" in _*) continue;; esac   # skip private modules
+    cp -f "$f" "$HOST_TOOLS_DIR/" && n=$((n+1))
+  done
+  printf '  seeded/refreshed %d curated tool(s); foreign tools left untouched\n' "$n"
+}
+
 # ── 6. Customize the agent profile (env-resolved keys; no secret inlined) ─────
 write_profile(){ info "Customize profile -> $PROFILE_FILE"
   mkdir -p "$PROFILE_DIR"
@@ -433,7 +454,7 @@ main(){
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
-  preflight; fetch; install; collect; write_env; write_profile; write_whitelist; write_bot_config
+  preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config
   install_units; start_and_check
   printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
 }
