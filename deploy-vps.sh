@@ -55,9 +55,26 @@ confirm(){ local a; read -rp "  $1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]; }
 scaffold(){ "$PYV" -m shared.scaffold "$@"; }   # available after install()
 
 # ── 1. Preflight ─────────────────────────────────────────────────────────────
+_pkg_mgr(){ local m; for m in apt-get dnf yum pacman zypper; do have "$m" && { printf '%s' "$m"; return; }; done; }
+install_system_deps(){
+  [ "${SKIP_SYSTEM_DEPS:-}" = "1" ] && { warn "SKIP_SYSTEM_DEPS=1 — skipping system package install"; return; }
+  local mgr; mgr=$(_pkg_mgr)
+  [ -n "$mgr" ] || { warn "no known package manager — ensure git, python3(>=3.10)+venv, pip, a C toolchain and curl are present"; return; }
+  local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+  info "Install system deps via $mgr (sudo may prompt)"
+  # python3-venv (Debian/Ubuntu split) + a C toolchain (some server deps build).
+  case "$mgr" in
+    apt-get) $SUDO apt-get update -qq && $SUDO apt-get install -y -qq \
+               git python3 python3-venv python3-pip build-essential curl ca-certificates ;;
+    dnf|yum) $SUDO "$mgr" install -y -q git python3 python3-pip gcc gcc-c++ make curl ca-certificates ;;
+    pacman)  $SUDO pacman -Sy --noconfirm --needed git python python-pip base-devel curl ca-certificates ;;
+    zypper)  $SUDO zypper -q install -y git python3 python3-pip gcc gcc-c++ make curl ca-certificates ;;
+  esac || warn "system-dep install returned nonzero — continuing (preflight verifies below)"
+}
 preflight(){
   info "Preflight"
-  have git || die "git not found"
+  install_system_deps
+  have git || die "git not found (install it or pre-provision system deps)"
   have "$PYTHON_BIN" || die "$PYTHON_BIN not found (need Python >= 3.10)"
   local v; v=$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')
   "$PYTHON_BIN" -c 'import sys;sys.exit(0 if sys.version_info[:2]>=(3,10) else 1)' \
