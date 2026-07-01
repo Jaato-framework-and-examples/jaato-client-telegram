@@ -397,8 +397,14 @@ start_and_check(){ info "Start server + health check"
   local out; out=$(_live_ping || true)
   printf '  %s\n' "$out"
   case "$out" in
-    *LIVE_OK:*) info "  provider + model + key OK ✓" ;;
-    *) die "live provider check failed — verify the provider/model/key, then re-run. ($out)" ;;
+    *LIVE_OK:*)
+      info "  provider + model + key OK ✓" ;;
+    *RateLimit*|*rate*limit*|*429*|*quota*)
+      # The request REACHED + AUTHENTICATED with the provider — config is valid,
+      # it's just throttled. Don't abort; the bot will work once the limit clears.
+      warn "  provider reached + authenticated but RATE-LIMITED right now — config is valid; the bot will answer once the limit clears / on a higher tier." ;;
+    *)
+      die "live provider check failed — verify the provider/model/key, then re-run. ($out)" ;;
   esac
 
   info "Start the bot"
