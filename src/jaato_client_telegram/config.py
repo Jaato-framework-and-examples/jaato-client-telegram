@@ -137,6 +137,11 @@ class RenderingConfig(BaseModel):
     stream_edits: bool = True
     typing_indicator: bool = True
     edit_throttle_ms: int = 500
+    # Minimum gap between message-creating sends to the SAME chat, so we stay
+    # under Telegram's ~1 message/second per-chat limit (proactive outbound rate
+    # limiting; see outbound_rate_limiter.py). 0 disables pacing (429s are still
+    # retried reactively).
+    send_min_interval_ms: int = 1050
 
 
 class RateLimitingConfig(BaseModel):

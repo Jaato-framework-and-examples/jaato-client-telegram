@@ -24,6 +24,7 @@ from jaato_client_telegram.handlers import (
     lifecycle_router,
     private_router,
 )
+from jaato_client_telegram.outbound_rate_limiter import OutboundRateLimiter
 from jaato_client_telegram.permissions import PermissionHandler
 from jaato_client_telegram.rate_limiter import RateLimiter
 from jaato_client_telegram.renderer import ResponseRenderer
@@ -82,6 +83,12 @@ def create_bot_and_dispatcher(
     bot = Bot(
         token=config.telegram.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    # Proactively pace outbound sends so we never trip Telegram's ~1 msg/sec
+    # per-chat limit (and retry any 429 that still slips through). Sits on the
+    # session, so it catches EVERY send regardless of handler.
+    bot.session.middleware(
+        OutboundRateLimiter(per_chat_interval=config.rendering.send_min_interval_ms / 1000.0)
     )
 
     # Create dispatcher with FSM storage (for future flows like permissions)

@@ -119,6 +119,12 @@ rendering:
   # Throttle edits to respect rate limits (milliseconds)
   edit_throttle_ms: 500
 
+  # Minimum gap between message-creating sends to the SAME chat (milliseconds),
+  # so we stay under Telegram's ~1 message/second per-chat limit. A long reply
+  # split into several messages paces out at this interval. 0 disables pacing
+  # (429s are still retried automatically). Edits/typing are never paced.
+  send_min_interval_ms: 1050
+
 # Permission Request UI
 permissions:
   # Action types to filter from inline keyboard (comma or pipe separated)
