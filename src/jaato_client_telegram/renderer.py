@@ -736,22 +736,19 @@ class ResponseRenderer:
                     msg = ""
 
                 if msg:
-                    # Format based on style
-                    if style == "error":
-                        formatted = f"❌ **System**: {msg}"
-                    elif style == "warning":
-                        formatted = f"⚠️ **System**: {msg}"
-                    elif style == "success":
-                        formatted = f"✅ **System**: {msg}"
-                    else:
-                        formatted = f"ℹ️ **System**: {msg}"
-                    
-                    if ctx.accumulated_text:
-                        ctx.accumulated_text += f"\n\n{formatted}"
-                    else:
-                        ctx.accumulated_text = formatted
-                    
-                    await self._edit_or_send(initial_message, ctx)
+                    # Render the notice as ONE standalone, markdown-converted
+                    # message. Previously this appended to accumulated_text AND
+                    # sent it raw via _edit_or_send, while the segment-emit path
+                    # (markdown_to_telegram_html) later re-emitted the SAME text
+                    # converted — a visible duplicate: one "**System**" (plain,
+                    # literal asterisks) + one "<b>System</b>" (HTML). Seen on the
+                    # "[apparmor] profile provisioned" notice on a session revive.
+                    icon = {"error": "❌", "warning": "⚠️", "success": "✅"}.get(style, "ℹ️")
+                    formatted = markdown_to_telegram_html(
+                        f"{icon} **System**: {escape_html_content(msg)}"
+                    )
+                    await self._safe_answer(initial_message, formatted, parse_mode="HTML")
+                    ctx.produced_output = True
                     ctx.last_edit_time = time.monotonic()
 
             elif event_type == EventType.ERROR:

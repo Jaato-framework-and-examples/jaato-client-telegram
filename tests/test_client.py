@@ -121,6 +121,45 @@ class TestEventStreaming:
         assert ctx.produced_output
         assert not ctx.accumulated_text
 
+    @pytest.mark.asyncio
+    async def test_system_message_rendered_once(self):
+        """A SYSTEM_MESSAGE notice renders as ONE converted message — not the
+        raw '**System**' + HTML '<b>System</b>' duplicate it used to (regression:
+        the '[apparmor] profile provisioned' notice appeared twice on revive)."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from jaato_client_telegram.renderer import ResponseRenderer
+
+        renderer = ResponseRenderer()
+        mock_message = MagicMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
+        mock_message.chat.id = 123
+
+        events = [
+            SimpleNamespace(
+                type="system.message",
+                message="[apparmor] profile provisioned; runner spawned",
+                style="info",
+            ),
+            MockEvent(type="agent.output", source="model", mode="write", text="Done."),
+            MockEvent(type="turn.completed"),
+            MockEvent(type="agent.completed"),
+        ]
+
+        async def event_generator():
+            for e in events:
+                yield e
+
+        await renderer.stream_response(mock_message, event_generator())
+
+        sends = [str(c.args[0]) for c in mock_message.answer.call_args_list if c.args]
+        provisioned = [s for s in sends if "profile provisioned" in s]
+        assert len(provisioned) == 1, f"system notice sent {len(provisioned)}x: {provisioned}"
+        assert "<b>System</b>" in provisioned[0]     # converted (bold)
+        assert "**System**" not in provisioned[0]    # not raw literal asterisks
+
 
 class TestConfig:
     """Test configuration loading."""
