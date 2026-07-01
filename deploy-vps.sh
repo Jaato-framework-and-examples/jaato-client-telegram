@@ -303,9 +303,11 @@ plugin_configs:
     # chats; keeps memories off the HOME/global tier (server PR #468).
     allowed_scopes: ["project"]
   # Dynamic-tool dependency venv: the confined runner installs deps here
-  # (a bare `pip install` in notebook/cli/shell -> <workspace>/.jaato/tool-venv,
-  # via the pip shim + `<venv>/bin/* ix` apparmor grant, server #479), and the
+  # (a bare pip install in notebook/cli/shell lands in workspace .jaato/tool-venv,
+  # via the pip shim + the venv-bin ix apparmor grant, server #479), and the
   # bot prepends its site-packages so an in-process host tool imports them.
+  # NOTE: this heredoc is unquoted (it interpolates \$tiers etc.) — keep this
+  # block free of backticks and \$ so nothing is command/param-substituted.
   # Path is workspace-relative; MUST match the bot's jaato_ws.host_tools_venv.
   notebook:
     workspace_venv: ".jaato/tool-venv"
