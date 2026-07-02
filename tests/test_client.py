@@ -160,6 +160,45 @@ class TestEventStreaming:
         assert "<b>System</b>" in provisioned[0]     # converted (bold)
         assert "**System**" not in provisioned[0]    # not raw literal asterisks
 
+    @pytest.mark.asyncio
+    async def test_mid_turn_injection_starts_a_new_bubble(self):
+        """A mid-turn user steer: the model's reply must be its OWN bubble, not
+        glued onto the tail of the narrative it interrupted. The
+        MID_TURN_PROMPT_INJECTED event flushes the narration as a separate
+        message so the reply starts fresh."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from jaato_client_telegram.renderer import ResponseRenderer
+
+        renderer = ResponseRenderer()
+        mock_message = MagicMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
+        mock_message.chat.id = 123
+
+        events = [
+            MockEvent(type="agent.output", source="model", mode="write",
+                      text="Working on the analysis now"),
+            MockEvent(type="mid_turn_prompt.injected", text="stop"),
+            MockEvent(type="agent.output", source="model", mode="write",
+                      text="Stopped as requested."),
+            MockEvent(type="agent.completed"),
+        ]
+
+        async def event_generator():
+            for e in events:
+                yield e
+
+        await renderer.stream_response(mock_message, event_generator())
+
+        sends = [str(c.args[0]) for c in mock_message.answer.call_args_list if c.args]
+        assert any("Working on the analysis" in s for s in sends), "narration bubble missing"
+        assert any("Stopped as requested" in s for s in sends), "reply bubble missing"
+        # Narration and steer reply are DISTINCT bubbles, never one glued message.
+        assert not any(
+            "Working on the analysis" in s and "Stopped as requested" in s for s in sends
+        ), "narration and steer reply were glued into one bubble"
+
 
 class TestConfig:
     """Test configuration loading."""

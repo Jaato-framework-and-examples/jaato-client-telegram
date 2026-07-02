@@ -642,6 +642,15 @@ class ResponseRenderer:
                 # the response after the first turn.
                 log.debug("Turn completed, continuing to stream events...")
 
+            elif event_type == EventType.MID_TURN_PROMPT_INJECTED:
+                # A user message was injected into THIS turn mid-stream (steering).
+                # The model's reply to it is a NEW conversational beat, so flush the
+                # in-progress narration now as its own message — the reply then
+                # starts a FRESH bubble instead of gluing onto the tail of the
+                # narrative it interrupted.
+                await self._emit_segments(initial_message, ctx, flush=True, final=True)
+                log.debug("mid-turn prompt injected — flushed narration; reply starts a new bubble")
+
             elif event_type == EventType.AGENT_STATUS_CHANGED:
                 # Agent status changed - check for completion signals
                 status = getattr(event, "status", "")
