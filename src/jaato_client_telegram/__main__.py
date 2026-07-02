@@ -198,6 +198,7 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
 
     # Get shared dependencies
     pool = dp["pool"]
+    pump = dp["pump"]
 
     # Start background idle session cleanup
     cleanup_task = asyncio.create_task(
@@ -273,6 +274,9 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
             await cleanup_task
         except asyncio.CancelledError:
             pass
+
+        # Stop the per-chat pump actors before disconnecting clients.
+        await pump.shutdown()
 
         # Shutdown session pool (disconnect all SDK clients)
         await pool.shutdown()

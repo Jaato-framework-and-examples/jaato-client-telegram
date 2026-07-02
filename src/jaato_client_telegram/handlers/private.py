@@ -5,7 +5,6 @@ Handles messages from private (DM) conversations.
 Each user gets their own isolated jaato SDK client session.
 """
 
-import asyncio
 import base64
 import logging
 from typing import TYPE_CHECKING
@@ -13,10 +12,9 @@ from typing import TYPE_CHECKING
 from aiogram import Router, F
 from aiogram.types import Message
 
+from jaato_client_telegram.chat_pump import ChatPump, PumpItem
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
-from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
-from jaato_client_telegram.welcome_store import WELCOME_PREFIX
 
 if TYPE_CHECKING:
     from jaato_client_telegram.rate_limiter import RateLimiter
@@ -28,46 +26,24 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-# Lock to prevent concurrent message processing for the same user
-_user_locks: dict[int, asyncio.Lock] = {}
-
-
-def _get_user_lock(chat_id: int) -> asyncio.Lock:
-    """Get or create a lock for this user."""
-    if chat_id not in _user_locks:
-        _user_locks[chat_id] = asyncio.Lock()
-    return _user_locks[chat_id]
-
 
 @router.message(F.text, F.chat.type == "private")
 async def handle_private_message(
     message: Message,
     pool: SessionPool,
-    renderer: ResponseRenderer,
+    pump: ChatPump,
     clarification_handler: ClarificationHandler | None = None,
     rate_limiter: "RateLimiter | None" = None,
     abuse_protector: "AbuseProtector | None" = None,
     telemetry: "TelemetryCollector | None" = None,
     admin_user_ids: list[int] | None = None,
 ) -> None:
-    """
-    Handle text messages from private chats.
+    """Handle text messages from private chats.
 
-    This is the core message flow:
-    1. Check rate limits (if enabled)
-    2. Check abuse protection (if enabled)
-    3. Get or create SDK client for this user
-    4. Send user message to jaato via SDK
-    5. Stream response events back to Telegram
-    6. Render progressively with edit-in-place
-
-    Args:
-        message: Telegram message from user
-        pool: Session pool for SDK clients
-        renderer: Response renderer for streaming output
-        rate_limiter: Optional rate limiter instance
-        abuse_protector: Optional abuse protector instance
-        admin_user_ids: Optional list of admin user IDs (for rate limit bypass)
+    Runs access/abuse/rate checks, then hands the message to the per-chat pump,
+    which owns the turn lifecycle. A message that arrives while a turn is still
+    streaming is delivered mid-turn (steering) instead of blocking until the turn
+    ends — see chat_pump.ChatPump.
     """
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
@@ -77,10 +53,10 @@ async def handle_private_message(
         return
 
     # If a clarification is awaiting this user's reply, route the text as the
-    # answer to the current question instead of a new prompt. This runs BEFORE
-    # the per-user lock: the turn that asked the question is still streaming and
-    # holds that lock, so acquiring it here would deadlock. The answer unblocks
-    # the server and the in-flight stream renders the continuation.
+    # answer to the current question instead of a new prompt. Handled here rather
+    # than via the pump because it is a DISTINCT response type
+    # (respond_to_clarification_batch) that unblocks the in-flight turn; the live
+    # stream then renders the continuation.
     if clarification_handler and clarification_handler.get_pending(chat_id) is not None:
         status, payload = clarification_handler.record_answer(chat_id, user_text)
         await advance_clarification(
@@ -109,97 +85,11 @@ async def handle_private_message(
             await message.answer(error_msg)
             return
 
-    # Get lock for this user to prevent concurrent message processing
-    user_lock = _get_user_lock(chat_id)
-
-    # Acquire lock before processing
-    async with user_lock:
-        try:
-            # Check if this is a new session (first message from user)
-            is_first_message = pool.get_session_info(chat_id) is None
-
-            # IMMEDIATELY send feedback before any slow operations
-            if is_first_message:
-                # First message: warn about initialization time
-                await message.answer(
-                    "⏳ Connecting to your session...\n"
-                    "(First message takes a few seconds to initialize)"
-                )
-            else:
-                # Returning user: quick typing indicator
-                await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-            # Follow the user's Telegram thread: host-tool sends (and, later, the
-            # renderer) go into whatever thread this message is in. Logged so we
-            # can see what inbound messages actually carry (forum vs reply-thread).
-            logger.info(
-                "inbound thread: chat=%s message_thread_id=%s is_topic_message=%s",
-                chat_id, message.message_thread_id,
-                getattr(message, "is_topic_message", None),
-            )
-            pool.sync_thread(chat_id, message.message_thread_id)
-
-            session_id = await pool.get_or_create_session(chat_id)
-
-            if pool.took_reattach(chat_id):
-                await message.answer(
-                    "⏳ Resuming your previous conversation…", parse_mode=None
-                )
-
-            logger.debug(f"User {chat_id}: session_id = {session_id}")
-
-            # First message ever from this chat → have the agent introduce itself
-            # (its capabilities/tools) before answering. Gated once per chat.
-            if pool.claim_first_contact(chat_id):
-                user_text = WELCOME_PREFIX + user_text
-
-            # Send user message to jaato
-            await pool.send_message(session_id, user_text)
-
-            # Stream response events and render progressively
-            ctx = await renderer.stream_response(
-                initial_message=message,
-                event_stream=await pool.events(session_id),
-                thread_id_getter=lambda cid=chat_id: pool.current_thread(cid),
-            )
-            if ctx.stalled:
-                # The runner went silent (e.g. a broken/stuck re-attach). Tell the
-                # user plainly and forget the session so the NEXT message starts a
-                # fresh one instead of re-attaching the stuck one again.
-                await message.answer(
-                    "⚠️ The session stopped responding — I've reset it. "
-                    "Please resend your message.",
-                    parse_mode=None,
-                )
-                await pool.forget_session(chat_id)
-
-        except Exception as e:
-            logger.exception(f"Error handling message from chat_id {chat_id}")
-
-            # Check if this is a session-related error that might be transient
-            # If so, provide a user-friendly message suggesting retry
-            is_session_error = any(keyword in str(e).lower() for keyword in [
-                'session', 'connection', 'disconnected', 'timeout'
-            ])
-
-            if is_session_error:
-                error_text = (
-                    f"❌ Connection or session issue detected.\n\n"
-                    f"Details: {e}\n\n"
-                    f"Please send your message again to retry with a fresh session."
-                )
-            else:
-                error_text = (
-                    f"❌ Error processing your message.\n\n"
-                    f"Details: {e}\n\n"
-                    f"Use /reset to start a fresh session if the problem persists."
-                )
-
-            # Handle long error messages
-            if len(error_text) > 4096:
-                error_text = error_text[:4000] + "\n\n... (truncated)"
-
-            await message.answer(error_text)
+    # Hand off to the per-chat pump: it owns session + turn + mid-turn steering.
+    pump.submit(PumpItem(
+        chat_id=chat_id, message=message, text=user_text,
+        apply_welcome=True, reply=False,
+    ))
 
 
 # Image understanding is ON: the telegram_chat profile carries a real vision
@@ -242,7 +132,7 @@ def _build_image_attachments(data: bytes, mime_type: str, name: str) -> list[dic
 async def handle_private_media(
     message: Message,
     pool: SessionPool,
-    renderer: ResponseRenderer,
+    pump: ChatPump,
 ) -> None:
     """Handle an inbound photo or document.
 
@@ -290,76 +180,49 @@ async def handle_private_media(
         )
         return
 
-    user_lock = _get_user_lock(chat_id)
-    async with user_lock:
-        try:
-            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-            tg_file_info = await message.bot.get_file(tg_file.file_id)
-            buf = await message.bot.download_file(tg_file_info.file_path)
-            data = buf.read()
+    # Download + build the attachments/caption here (download errors handled
+    # locally); the turn itself — send, stream, and mid-turn steering — is the
+    # pump's job. The pre-download typing cue shows activity while we fetch.
+    try:
+        await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        tg_file_info = await message.bot.get_file(tg_file.file_id)
+        buf = await message.bot.download_file(tg_file_info.file_path)
+        data = buf.read()
+    except Exception as e:  # noqa: BLE001 — download boundary
+        logger.exception("Error downloading media from chat_id %s", chat_id)
+        await message.answer(f"❌ Sorry, I couldn't download that {kind} — {e}")
+        return
 
-            if is_vision:
-                # Image / PDF → vision-tier attachment (a PDF is read, not "seen").
-                attachments = _build_image_attachments(data, mime_type, name)
-                caption = (message.caption or "").strip() or (
-                    "Summarize this document." if is_pdf
-                    else "Describe what you see in this image."
-                )
-            else:
-                # Any other document → stage into the workspace; the agent reads
-                # it with its file tools (handles text AND binary, no context bloat).
-                rel_path = pool.stage_upload(name, data)
-                if rel_path is None:
-                    await message.answer(
-                        "📎 I can't save files right now — no workspace is "
-                        "configured for this bot."
-                    )
-                    return
-                attachments = None
-                user_q = (message.caption or "").strip()
-                note = (
-                    f"📎 The user attached a file, saved to your workspace as "
-                    f"`{rel_path}`. Read it with your file tools to help."
-                )
-                caption = f"{user_q}\n\n{note}" if user_q else note
-
-            logger.info(
-                "inbound thread (media): chat=%s message_thread_id=%s "
-                "is_topic_message=%s vision=%s",
-                chat_id, message.message_thread_id,
-                getattr(message, "is_topic_message", None), is_vision,
-            )
-            pool.sync_thread(chat_id, message.message_thread_id)
-
-            session_id = await pool.get_or_create_session(chat_id)
-            if pool.took_reattach(chat_id):
-                await message.answer(
-                    "⏳ Resuming your previous conversation…", parse_mode=None
-                )
-            # First contact via a photo/PDF → introduce before describing.
-            if pool.claim_first_contact(chat_id):
-                caption = WELCOME_PREFIX + caption
-            await pool.send_message(session_id, caption, attachments=attachments)
-            ctx = await renderer.stream_response(
-                initial_message=message,
-                event_stream=await pool.events(session_id),
-                thread_id_getter=lambda cid=chat_id: pool.current_thread(cid),
-            )
-            if ctx.stalled:
-                # The runner went silent (e.g. a broken/stuck re-attach). Tell the
-                # user plainly and forget the session so the NEXT message starts a
-                # fresh one instead of re-attaching the stuck one again.
-                await message.answer(
-                    "⚠️ The session stopped responding — I've reset it. "
-                    "Please resend your message.",
-                    parse_mode=None,
-                )
-                await pool.forget_session(chat_id)
-        except Exception as e:
-            # Covers download failures and model-turn errors (e.g. a PDF with
-            # too many pages for the vision model). Friendly + file-aware; the
-            # full trace is logged, not dumped at the user.
-            logger.exception("Error handling media from chat_id %s", chat_id)
+    if is_vision:
+        # Image / PDF → vision-tier attachment (a PDF is read, not "seen").
+        attachments = _build_image_attachments(data, mime_type, name)
+        caption = (message.caption or "").strip() or (
+            "Summarize this document." if is_pdf
+            else "Describe what you see in this image."
+        )
+    else:
+        # Any other document → stage into the workspace; the agent reads it with
+        # its file tools (handles text AND binary, no context bloat).
+        rel_path = pool.stage_upload(name, data)
+        if rel_path is None:
             await message.answer(
-                f"❌ Sorry, I couldn't process that {kind} — {e}"
+                "📎 I can't save files right now — no workspace is "
+                "configured for this bot."
             )
+            return
+        attachments = None
+        user_q = (message.caption or "").strip()
+        note = (
+            f"📎 The user attached a file, saved to your workspace as "
+            f"`{rel_path}`. Read it with your file tools to help."
+        )
+        caption = f"{user_q}\n\n{note}" if user_q else note
+
+    logger.info(
+        "inbound thread (media): chat=%s message_thread_id=%s vision=%s",
+        chat_id, message.message_thread_id, is_vision,
+    )
+    pump.submit(PumpItem(
+        chat_id=chat_id, message=message, text=caption,
+        attachments=attachments, apply_welcome=True, reply=False,
+    ))

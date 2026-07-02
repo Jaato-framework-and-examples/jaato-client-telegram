@@ -13,6 +13,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from jaato_client_telegram.abuse_protection import AbuseProtector
+from jaato_client_telegram.chat_pump import ChatPump
 from jaato_client_telegram.clarification import ClarificationHandler
 from jaato_client_telegram.config import Config
 from jaato_client_telegram.file_handler import FileHandler
@@ -110,6 +111,11 @@ def create_bot_and_dispatcher(
     # For now, event_subscriber is None and won't be started
 
     renderer = _create_renderer(config, permission_handler, file_handler, clarification_handler)
+    # Per-chat message pump: owns each chat's turn lifecycle and delivers a
+    # message that arrives mid-turn as a steer instead of blocking it behind the
+    # in-flight turn (replaces the old per-chat lock). Message handlers submit to
+    # it rather than driving send_message + stream_response themselves.
+    pump = ChatPump(pool, renderer)
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
 
     # Create rate limiter if enabled
@@ -151,6 +157,7 @@ def create_bot_and_dispatcher(
     # This makes them available to all handlers via dependency injection
     dp["pool"] = pool
     dp["renderer"] = renderer
+    dp["pump"] = pump
     dp["whitelist"] = whitelist
     dp["permission_handler"] = permission_handler
     dp["clarification_handler"] = clarification_handler
