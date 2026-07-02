@@ -90,15 +90,19 @@ TOOL_SCHEMAS = [
     {
         "name": "register_tool",
         "description": (
-            "Install a NEW host tool you have written, making it callable from "
-            "your NEXT turn. Workflow: (1) write the tool to "
-            "tool_drafts/<name>.py in the workspace — a module-level TOOL_SCHEMA "
-            "dict (name = the file stem, description, JSON-schema parameters) "
-            "plus `async def execute(args, ctx)` returning a dict; ctx.bot and "
-            "ctx.chat_id let it talk to Telegram. (2) SHOW the user the code. "
-            "(3) call register_tool(name). The user approves, then the bot "
-            "installs and registers it. Use this to extend your own capabilities "
-            "on request."
+            "Install or update a host tool, making it callable from your NEXT "
+            "turn. To CREATE one: (1) write tool_drafts/<name>.py in the "
+            "workspace — a module-level TOOL_SCHEMA dict (name = the file stem, "
+            "description, JSON-schema parameters) plus `async def execute(args, "
+            "ctx)` returning a dict; ctx.bot and ctx.chat_id let it talk to "
+            "Telegram. (2) SHOW the user the code. (3) call register_tool(name). "
+            "To MODIFY an EXISTING installed tool — whose source is NOT in your "
+            "workspace, because installed tools live outside your sandbox — first "
+            "call register_tool(name, action='edit'): the bot copies the tool's "
+            "CURRENT source into tool_drafts/<name>.py; then read + edit that "
+            "draft and call register_tool(name) to install your change. The user "
+            "approves before any install. Use this to extend or fix your own "
+            "capabilities on request."
         ),
         "parameters": {
             "type": "object",
@@ -106,6 +110,16 @@ TOOL_SCHEMAS = [
                 "name": {
                     "type": "string",
                     "description": "Tool name = the draft file stem (tool_drafts/<name>.py).",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["install", "edit"],
+                    "description": (
+                        "'install' (default) installs tool_drafts/<name>.py as a "
+                        "live tool. 'edit' seeds tool_drafts/<name>.py with the "
+                        "CURRENT source of the already-installed tool <name> so "
+                        "you can read and modify it, then install."
+                    ),
                 },
             },
             "required": ["name"],

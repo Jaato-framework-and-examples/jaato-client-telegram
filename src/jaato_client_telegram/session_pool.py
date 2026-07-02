@@ -431,13 +431,53 @@ class SessionPool:
 
     def _make_register_tool_executor(self, chat_id: int):
         async def executor(args: dict) -> dict:
-            name = (args or {}).get("name", "")
+            args = args or {}
+            name = args.get("name", "")
+            action = args.get("action", "install")
             try:
+                if action == "edit":
+                    return await self.seed_tool_draft(chat_id, name)
                 return await self.install_and_register_tool(chat_id, name)
             except Exception as e:  # noqa: BLE001 — tool boundary
                 logger.exception("register_tool failed")
                 return {"error": str(e)}
         return executor
+
+    async def seed_tool_draft(self, chat_id: int, name: str) -> dict:
+        """Copy an installed host tool's CURRENT source into the workspace draft
+        area so the confined agent can read + edit it.
+
+        The reverse of install_and_register_tool. Installed tool source lives in
+        host_tools_dir, which is OUTSIDE the workspace (so the confined runner
+        can't tamper with — or even see — it), which is why the agent can't
+        locate it to modify. Here the UNCONFINED bot reads the trusted installed
+        file and writes it to tool_drafts/<name>.py; the agent then edits that
+        draft and calls register_tool(name) to install the change."""
+        validate_name(name)
+        tools_dir = self._host_tools_dir()
+        if tools_dir is None:
+            return {"error": (
+                "Dynamic tools are disabled (set jaato_ws.host_tools_dir in the bot config)."
+            )}
+        installed = tools_dir / f"{name}.py"
+        if not installed.is_file():
+            return {"error": (
+                f"No installed host tool named '{name}' to edit. Built-in tools "
+                f"(send_to_telegram, show_image, register_tool, service_manifest) "
+                f"and server-side plugins have no editable host-tool source."
+            )}
+        workspace = Path(self._ws_config.workspace)
+        drafts = workspace / "tool_drafts"
+        drafts.mkdir(parents=True, exist_ok=True)
+        (drafts / f"{name}.py").write_text(installed.read_text())
+        logger.info("Seeded tool_drafts/%s.py from installed source for chat %d", name, chat_id)
+        return {"result": (
+            f"Seeded tool_drafts/{name}.py with the CURRENT source of the "
+            f"installed tool '{name}'. Its source was NOT in your workspace "
+            f"before — installed tools live outside your sandbox. Read + edit "
+            f"that draft, then call register_tool(name='{name}') to install your "
+            f"changes (this overwrites the running tool)."
+        )}
 
     async def install_and_register_tool(self, chat_id: int, name: str) -> dict:
         """Install a drafted tool and re-register it on the live session.

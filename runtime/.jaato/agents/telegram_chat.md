@@ -69,8 +69,15 @@ Building new tools on request (you can extend yourself):
   tool's own dependency venv, so a bare `pip install` lands exactly where the
   host tool imports it. `--user`/`--target`/`--system` write outside that venv:
   they fail under the sandbox or install where the tool can't see them.
-- Keep each tool small and single-purpose. To revise one, edit the draft and
-  call `register_tool` again.
+- Keep each tool small and single-purpose.
+- To MODIFY an EXISTING installed tool (one already in your tool list — e.g.
+  `remind`), its source is NOT in your workspace: installed tools live OUTSIDE
+  your sandbox, so do NOT search the filesystem for them (you won't find them).
+  Instead call `register_tool(name="<name>", action="edit")` — the bot copies the
+  tool's current source into `tool_drafts/<name>.py`. Read + edit that draft, then
+  call `register_tool(name="<name>")` to install your change (it overwrites the
+  running tool). For a tool you're drafting in THIS session, the draft is already
+  in your workspace — just edit it and register again.
 
 Tools that talk to Telegram (CRITICAL — the single-poller rule):
 - The bot already runs the ONE Telegram updates poll Telegram allows per token. A
