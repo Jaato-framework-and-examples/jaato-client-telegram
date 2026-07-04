@@ -61,13 +61,25 @@ constraint I raised is met by design. (#469 persistence is what makes this hold.
 - The relay (GitHub Action on the store repo) resolves the token and POSTs the
   review to the daemon shim.
 
-**One open joint question — relay→shim auth secret model** (settle with Advisor
-before its shim stage): #498 wants the inbound POST authenticated. Options: (a) the
-relay holds a per-daemon HMAC secret — trivial for a **single daemon** (Daniel's
-VPS bot), but a secret-sprawl problem at marketplace scale (N daemons); (b) the
-token is a **daemon-issued bearer capability** the shim self-verifies, so the relay
-forwards it and holds no per-daemon secret. (a) ships Daniel's case now; (b) is the
-general answer. Decide before building the relay.
+**Relay→shim auth model — DECIDED (b), 2026-07-04 (Daniel): no per-daemon secret,
+and crucially no secret in the public PR.** A bearer credential embedded in a
+*public* store PR is world-readable → anyone could replay it to wake-spam the
+session (bounded by the untrusted-wrap + rate-limiting, but a real nuisance/DoS). So
+the safe form of (b) puts **nothing secret in the PR**:
+- The PR carries only a **non-secret routing reference** — its branch
+  (`share-<tool>`) or PR number (public anyway).
+- `share_tool` **registers `(pr_ref → session_id)` with its daemon** at share time
+  (extends the `session_id→workspace` index).
+- Auth is a **store-level signature the daemon trusts** — the relay signs each
+  forwarded wake with the **store's** single key; each daemon is configured once to
+  trust the store's public key. Relay holds no per-daemon secret; nothing forgeable
+  sits in the PR.
+
+Rejected (a) (per-daemon HMAC in the relay — secret sprawl at marketplace scale)
+and naive-(b) (daemon-issued bearer *in the PR* — public credential). Exact
+mechanism (the shim's accept-mode for a store-signed request; the daemon's
+trust-store-pubkey config; `pr_ref→session_id` index) is being shaped with Advisor,
+whose shim gate owns it.
 
 **Build staging:** Advisor stages server-side (index+command+wrap first, HTTP shim
 second). End-to-end is blocked on the shim (stage 2); the client token-mint in
