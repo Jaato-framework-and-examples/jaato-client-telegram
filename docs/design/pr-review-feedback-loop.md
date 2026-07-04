@@ -224,6 +224,42 @@ chat→session map and the revive logic.
 code; A is a real server project whose only win (no bot port) the reverse-proxy
 prerequisite already neutralizes.
 
+### Security: external input starting a turn IS the injection boundary (Advisor, 2026-07-04)
+
+Advisor (jaato-server security owner) verified the trace against current `main` and
+answered the two questions:
+
+- **EVENT-vs-USER is a delivery-*timing* semantic, not a fail-closed posture.**
+  `event_bus_tools.py:349-353` frames `SourceType.EVENT` purely by *when* it lands
+  (high-priority, non-interrupting, at the next pause of an already-running turn —
+  which is exactly what `webhook_poll` blocking *inside* a turn relies on).
+  `message_queue.py:180-198`: USER/SYSTEM interrupt; EVENT/PARENT wait for a pause.
+  There is **zero** anti-injection intent behind the EVENT choice — idle/detached
+  wake is genuinely **unbuilt**, it just falls out of the timing semantic.
+- **#498 (webhook fail-closed auth) does not change the delivery path** — it's pure
+  *ingress* auth (a matched route needs HMAC **or** mTLS **or** IP-allowlist **or**
+  explicit `allow_unauthenticated:true`, else 401). Once published, delivery
+  semantics are unchanged.
+
+**The load-bearing caveat — and it applies to BOTH A and B:** making an external
+event *start a turn* means an **unauthenticated-external-party-initiates-agent-work**
+— precisely the indirect-prompt-injection class that **#495 (`TRAIT_UNTRUSTED_CONTENT`)**
+and **#498** exist to bound. Today's EVENT choice isn't *motivated* by fail-closed,
+but any turn-*starting* wake path **must be built on that boundary**:
+
+- **Option B (client, ours):** the bot's inbound receiver must be **fail-closed
+  HMAC** (mirror #498 — reject unless verified), and the woken turn must carry the
+  review text as **untrusted content** (the `#495` trait), *data to consider,
+  never instructions to obey*. A public PR comment is attacker-controlled input.
+- **Option A (server, roadmap):** same boundary — Advisor's framing is "build the
+  wake feature **ON #498**, not around it": daemon-tier ingress (survives unload;
+  listener not bound to runner lifecycle) + revive-by-`session_id` + inject as USER,
+  **gated by #498 auth**. Advisor has captured this as a jaato-server roadmap item.
+
+So B stays the recommendation, with a firm requirement attached: **fail-closed HMAC
+on the bot ingress + untrusted-content handling of the payload** — not optional
+hardening, it's the boundary the whole feature lives behind.
+
 ## Remaining questions (decide before building)
 
 1. **Capability token** — format, where it lives in the PR (body marker vs a
