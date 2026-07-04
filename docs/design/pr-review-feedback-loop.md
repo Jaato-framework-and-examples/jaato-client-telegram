@@ -107,10 +107,23 @@ proxy) → mode A, zero new code. Operators who must front it with a terminating
 need mode B. See the delivery-tier decision for Daniel below.
 
 **Build staging:**
-- **PR #516 (UP)** — core primitive: `session.wake` + `session_id→workspace` index
-  + untrusted-wrap + `event_id` dedup. (jaato repo.)
+- **PR #516 (UP, contract finalized 885be89b; awaits Daniel review + Copilot pass)**
+  — core primitive: `session.wake` + `session_id→workspace` index + untrusted-wrap
+  + `event_id` dedup. (jaato repo.) **Locked shim contract:**
+  `session.wake(session_id, text, source, event_id) → (WakeOutcome, detail)` with
+  `WakeOutcome ∈ {OK, DUPLICATE, INVALID, UNRESOLVED, REVIVE_FAILED, NOT_DRIVABLE}`
+  + `.is_success` (OK|DUPLICATE). The shim maps enum→HTTP with no prose matching:
+  **OK/DUPLICATE→2xx** (DUPLICATE = idempotent no-op, not an error — a redelivered
+  webhook must not look failed/retry), **INVALID/UNRESOLVED→4xx** (permanent),
+  **REVIVE_FAILED/NOT_DRIVABLE→5xx** (transient/retry). (`source` stays a coarse
+  provenance tag; rich attacker-influenceable context rides inside the wrapped
+  `text`.)
 - **PR 2** — the HTTP shim + relay trust (mode A mTLS; mode B if Daniel approves) +
-  `WakeBindingRegistry` + `session.bind_wake` / `session.unbind_wake` commands.
+  `WakeBindingRegistry` + `session.bind_wake` / `session.unbind_wake` commands. The
+  registry captures **(session_id + workspace_path)** at bind time (bind runs AS the
+  caller's session), so a bound session stays wakeable even if its id is AMBIGUOUS in
+  the core index — the collision class only bites *unbound* wakes, and the PR-review
+  path is always bound.
 - **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref)` at share time
   and `session.unbind_wake(pr_ref)` on merge/close; the relay (store-repo Action)
   presents the store client cert. **Waits on PR 2's `bind_wake`/`unbind_wake`
