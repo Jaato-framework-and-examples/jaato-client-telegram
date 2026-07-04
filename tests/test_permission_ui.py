@@ -115,3 +115,54 @@ def test_empty_primary_actions_is_legacy_show_all():
     h = PermissionHandler(primary_actions_str="")
     _, keyboard, _ = h.create_permission_ui(_event({"x": "1"}, _ALL_OPTIONS), 1)
     assert len(_button_labels(keyboard)) == len(_ALL_OPTIONS)
+
+
+# --- register_tool install: show the code being installed (stage 2) -----------
+
+def _reg_event(name, action=None):
+    args = {"name": name}
+    if action:
+        args["action"] = action
+    return SimpleNamespace(
+        tool_name="register_tool", tool_args=args,
+        response_options=_ALL_OPTIONS, request_id="req1",
+    )
+
+
+def test_register_tool_install_attaches_draft_code(tmp_path):
+    (tmp_path / "tool_drafts").mkdir()
+    (tmp_path / "tool_drafts" / "greeter.py").write_text(
+        "TOOL_SCHEMA = {}\nasync def execute(a, c):\n    return {}  # SECRET_MARKER\n"
+    )
+    h = PermissionHandler(workspace=str(tmp_path))
+    text, _, files = h.create_permission_ui(_reg_event("greeter"), 1)
+    assert any(fn == "greeter.py" and "SECRET_MARKER" in body for fn, body in files)
+    assert "UNCONFINED" in text and "greeter.py" in text
+
+
+def test_register_tool_edit_does_not_review_code(tmp_path):
+    (tmp_path / "tool_drafts").mkdir()
+    (tmp_path / "tool_drafts" / "greeter.py").write_text("x")
+    h = PermissionHandler(workspace=str(tmp_path))
+    text, _, files = h.create_permission_ui(_reg_event("greeter", action="edit"), 1)
+    assert not any(fn == "greeter.py" for fn, _ in files)
+    assert "UNCONFINED" not in text
+
+
+def test_register_tool_missing_draft_warns(tmp_path):
+    h = PermissionHandler(workspace=str(tmp_path))  # no draft written
+    text, _, files = h.create_permission_ui(_reg_event("ghost"), 1)
+    assert not files
+    assert "couldn't find its code" in text
+
+
+def test_register_tool_unsafe_name_ignored(tmp_path):
+    h = PermissionHandler(workspace=str(tmp_path))
+    text, _, files = h.create_permission_ui(_reg_event("../../etc/passwd"), 1)
+    assert not files and "UNCONFINED" not in text
+
+
+def test_non_register_tool_has_no_install_warning(tmp_path):
+    h = PermissionHandler(workspace=str(tmp_path))
+    text, _, _ = h.create_permission_ui(_event({"path": "a.txt"}, _ALL_OPTIONS), 1)
+    assert "UNCONFINED" not in text

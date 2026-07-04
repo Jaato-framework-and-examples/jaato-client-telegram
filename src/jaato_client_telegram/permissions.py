@@ -11,7 +11,12 @@ import html
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+# A host-tool name = lowercase identifier (the file stem). Used to guard the
+# tool_drafts/<name>.py path we read for install review — no path traversal.
+_SAFE_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 from aiogram.types import (
     InlineKeyboardButton,
@@ -141,6 +146,7 @@ class PermissionHandler:
         unsupported_actions_str: str | None = None,
         primary_actions_str: str | None = "yes,no,always,never",
         code_extensions_str: str | None = "notebook_execute:py",
+        workspace: str = "",
     ):
         """
         Initialize permission handler.
@@ -152,6 +158,9 @@ class PermissionHandler:
                                      action types (e.g., "comment,edit" or "comment|edit")
                                      If None, uses default set
         """
+        # Workspace root — so a register_tool INSTALL prompt can surface the
+        # draft code (tool_drafts/<name>.py) for the user to actually review.
+        self._workspace = workspace
         # Map: chat_id -> PendingPermission
         self._pending: dict[int, PendingPermission] = {}
         # Map: chat_id -> (tool_name, tool_args) for recently approved tools
@@ -250,6 +259,40 @@ class PermissionHandler:
                 lines.append(f"<blockquote expandable>{preview}…</blockquote>")
         return lines, files
 
+    def _install_review(
+        self, tool_name: Any, tool_args: dict[str, Any] | None,
+    ) -> "tuple[str, str | None, str] | None":
+        """For a ``register_tool`` INSTALL, return ``(filename, source_or_None,
+        note)`` so the prompt shows the exact code the user is about to run
+        UNCONFINED. ``None`` when it isn't a code-installing action; ``source`` is
+        ``None`` (with a caution note) if the draft can't be read."""
+        if str(tool_name) != "register_tool" or not self._workspace:
+            return None
+        args = tool_args or {}
+        # 'edit' only seeds a draft from already-installed (trusted) source; the
+        # follow-up install is where the (possibly edited) code gets reviewed.
+        if args.get("action", "install") == "edit":
+            return None
+        name = str(args.get("name", ""))
+        if not _SAFE_TOOL_NAME.match(name):
+            return None
+        draft = Path(self._workspace) / "tool_drafts" / f"{name}.py"
+        try:
+            code = draft.read_text()
+        except OSError:
+            return (
+                f"{name}.py", None,
+                "⚠️ <b>Installing a host tool that runs UNCONFINED in the bot</b> — "
+                f"but I couldn't find its code (<code>tool_drafts/{html.escape(name)}.py</code>) "
+                "to show you. Approve only if you trust it.",
+            )
+        return (
+            f"{name}.py", code,
+            "⚠️ <b>Installing a host tool that runs UNCONFINED in the bot.</b> "
+            f"Its full code is attached as <code>{html.escape(name)}.py</code> (⬆️) — "
+            "review it before approving.",
+        )
+
     def create_permission_ui(
         self,
         event: PermissionRequestedEvent,
@@ -277,6 +320,18 @@ class PermissionHandler:
         if event.tool_args:
             param_lines, overflow_files = self._render_params(event.tool_name, event.tool_args)
             lines.extend(param_lines)
+            lines.append("")
+
+        # A register_tool INSTALL runs NEW code UNCONFINED in the bot, and that
+        # code is NOT in the args (it's the draft the agent wrote to
+        # tool_drafts/<name>.py). Surface it as a reviewable file so "approve" is
+        # a real code review rather than a blind yes.
+        review = self._install_review(event.tool_name, event.tool_args)
+        if review is not None:
+            fname, code, note = review
+            if code is not None:
+                overflow_files.append((fname, code))
+            lines.append(note)
             lines.append("")
 
         # Prompt from agent (why it needs permission)

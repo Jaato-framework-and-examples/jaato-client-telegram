@@ -102,6 +102,7 @@ def create_bot_and_dispatcher(
         config.permissions.unsupported_actions,
         config.permissions.primary_actions,
         config.permissions.code_extensions,
+        workspace=config.jaato_ws.workspace,
     )
     clarification_handler = ClarificationHandler()
     file_handler = FileHandler(config.file_sharing)
