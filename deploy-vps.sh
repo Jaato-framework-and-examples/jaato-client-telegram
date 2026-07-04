@@ -208,6 +208,17 @@ collect(){ info "Configuration"
     WL_USERS=$(ask "Additional allowed username(s), comma-separated (optional)" "")
   fi
 
+  # Optional: a GitHub token so the bot can PROPOSE tools to the shared store via
+  # PR (share_tool). Use a NON-admin bot GitHub account's classic PAT (public_repo
+  # scope). Blank = off (browse/install still work). Non-interactive: from env.
+  # An existing bot.env token is preserved in write_env when this is blank.
+  STORE_TOK="${JAATO_TOOLSTORE_GH_TOKEN:-}"
+  if [ -z "$STORE_TOK" ] && [ "$noninteractive" != "1" ]; then
+    printf '\n  %sTool-store contribution (optional)%s — lets the bot open PRs to\n' "${C_B:-}" "${C_0:-}"
+    printf '  propose tools to the shared store. Use a NON-admin bot GitHub account.\n'
+    STORE_TOK=$(ask_secret "GitHub token (classic PAT, public_repo) — blank to skip")
+  fi
+
   WS_TOKEN=$("$PYV" -c 'import secrets;print(secrets.token_urlsafe(32))')
 }
 
@@ -215,10 +226,10 @@ collect(){ info "Configuration"
 write_env(){ info "Write secrets (chmod 600)"
   mkdir -p "$CFG_DIR" "$STATE_DIR" "$HOST_TOOLS_DIR"
   umask 077
-  # Preserve an optional tool-store contribution token (enables share_tool)
-  # across redeploys: take it from the env if given, else from the existing
-  # bot.env. Empty ⇒ contribution stays off (no hardcoded default).
-  local store_tok="${JAATO_TOOLSTORE_GH_TOKEN:-}"
+  # The tool-store contribution token (enables share_tool): what collect()
+  # gathered (prompt / env), else preserve an existing one from bot.env so a
+  # redeploy never drops it. Empty ⇒ contribution stays off (no hardcoded default).
+  local store_tok="${STORE_TOK:-}"
   [ -z "$store_tok" ] && [ -f "$BOT_ENV" ] && \
     store_tok=$(sed -n 's/^JAATO_TOOLSTORE_GH_TOKEN=//p' "$BOT_ENV" | head -1)
   printf '%s' "$WS_TOKEN" > "$WS_TOKEN_FILE"
