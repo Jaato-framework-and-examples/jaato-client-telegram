@@ -37,6 +37,8 @@ def _fake_gh(calls):
             return 404, {}  # new file
         if method == "PUT" and "/contents/tools/" in path:
             return 201, {}
+        if method == "GET" and "/pulls?head=" in path:
+            return 200, []  # no existing open PR for this head
         if method == "POST" and path.endswith("/pulls"):
             return 201, {"html_url": "https://github.com/x/pull/1"}
         return 500, {"message": f"unexpected {method} {path}"}
@@ -108,12 +110,15 @@ def test_share_updates_existing_pr(tmp_path):
     calls = []
     g["_gh"] = _fake_gh_existing_pr(calls)
     g["_token"] = lambda: "tok"
-    r = asyncio.run(g["execute"]({"name": "greeter"}, _ctx(htd)))
+    # existing PR is detected up front → the confirm is phrased as an UPDATE
+    r = asyncio.run(g["execute"]({"name": "greeter"}, _ctx(htd, answer="Yes, update the PR")))
     assert "result" in r
-    assert "Updated the existing" in r["result"] and "pull/1" in r["result"]
-    # it actually pushed a new commit (PUT with the existing file's sha)
+    assert "Updated your existing" in r["result"] and "pull/1" in r["result"]
+    # it actually pushed a new commit (PUT with the existing file's sha)…
     put = next(c for c in calls if c[0] == "PUT")
     assert put[2].get("sha") == "oldsha"
+    # …and did NOT open a second PR
+    assert not any(c[0] == "POST" and c[1].endswith("/pulls") for c in calls)
 
 
 def test_share_disabled_without_token(tmp_path):
@@ -132,7 +137,9 @@ def test_share_cancelled_opens_nothing(tmp_path):
     g["_token"] = lambda: "tok"
     r = asyncio.run(g["execute"]({"name": "greeter"}, _ctx(htd, answer="Cancel")))
     assert "Cancelled" in r["result"]
-    assert calls == []  # no GitHub calls at all
+    # Only read-only checks (auth + existing-PR lookup) ran before the confirm;
+    # NOTHING was written — no fork, branch, commit, or PR.
+    assert not any(c[0] in ("POST", "PUT") for c in calls)
 
 
 def test_share_no_installed_tool(tmp_path):
