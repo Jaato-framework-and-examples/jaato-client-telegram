@@ -389,11 +389,13 @@ class SessionPool:
                 # workspace so a tool can stage a file (e.g. install_tool writing
                 # a verified draft to tool_drafts/).
                 wake = self._pump.wake if self._pump is not None else None
+                htd = self._host_tools_dir()
                 tools.append({
                     **schema,
                     "handler": make_executor(
                         t["execute"], tbot, chat_id,
                         wake=wake, workspace=self._ws_config.workspace,
+                        host_tools_dir=str(htd) if htd is not None else "",
                     ),
                 })
         return tools

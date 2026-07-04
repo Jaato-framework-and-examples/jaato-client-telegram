@@ -114,6 +114,10 @@ class ToolContext:
     # for the agent (e.g. install_tool writing the verified draft to
     # tool_drafts/<name>.py) writes under here.
     workspace: str = ""
+    # The bot-owned host_tools_dir where INSTALLED tools live ("" if unconfigured).
+    # A tool that reads installed tool source (e.g. share_tool contributing one to
+    # the store) reads from here.
+    host_tools_dir: str = ""
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -205,9 +209,13 @@ def make_executor(
     execute_fn: Callable[..., Awaitable[Any]], bot: Any, chat_id: int,
     wake: "Callable[[int, str], None] | None" = None,
     workspace: str = "",
+    host_tools_dir: str = "",
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
-    ctx = ToolContext(bot=bot, chat_id=chat_id, wake_fn=wake, workspace=workspace)
+    ctx = ToolContext(
+        bot=bot, chat_id=chat_id, wake_fn=wake,
+        workspace=workspace, host_tools_dir=host_tools_dir,
+    )
 
     async def executor(args: dict) -> dict:
         # A tool may import a dependency the confined runner just pip-installed
