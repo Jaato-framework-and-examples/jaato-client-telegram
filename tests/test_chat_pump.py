@@ -5,7 +5,8 @@ turn, not deferred to a new one) + turn serialization, ordering, error recovery.
 import asyncio
 from types import SimpleNamespace
 
-from jaato_client_telegram.chat_pump import ChatPump, PumpItem
+from jaato_client_telegram.chat_pump import ChatPump, OutboundAnchor, PumpItem
+from jaato_client_telegram.host_tool_loader import ToolContext
 
 
 # ---- fakes -----------------------------------------------------------------
@@ -217,6 +218,93 @@ def test_welcome_prefix_applied_on_first_contact():
         assert pool.sent[0][1] == WELCOME_PREFIX + "hi"
         rend._ev(0).set()
         await pump.shutdown()
+    asyncio.run(run())
+
+
+class RecordingBot:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send_message(self, chat_id, text, message_thread_id=None, **kw):
+        self.sent.append({"chat_id": chat_id, "text": text,
+                          "message_thread_id": message_thread_id, **kw})
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def send_chat_action(self, chat_id, action, **kw):
+        pass
+
+    async def send_document(self, chat_id, document, message_thread_id=None, **kw):
+        self.sent.append({"chat_id": chat_id, "document": document})
+        return SimpleNamespace(message_id=len(self.sent))
+
+
+def test_wake_defers_behind_an_active_turn_then_runs_as_its_own():
+    """ctx.wake / pump.wake must NOT steer a running turn. A reminder firing while
+    the user has a turn in flight waits, then runs as its OWN turn afterwards."""
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend, RecordingBot())
+
+        # user turn A is streaming
+        pump.submit(_item(1, "A", apply_welcome=False))
+        await _until(lambda: rend.started == [0] and len(pool.sent) == 1)
+
+        # a reminder fires mid-turn
+        pump.wake(1, "REMINDER")
+        await asyncio.sleep(0.02)
+        # it must NOT have been delivered into the live turn (no steer)
+        assert len(pool.sent) == 1, "deferred wake was steered mid-turn"
+        assert rend.started == [0]
+
+        # finish turn A → the reminder now runs as its OWN (second) turn
+        rend._ev(0).set()
+        await _until(lambda: rend.started == [0, 1] and len(pool.sent) == 2)
+        assert "REMINDER" in pool.sent[1][1]
+        rend._ev(1).set()
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_wake_on_idle_runs_immediately():
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend, RecordingBot())
+        pump.wake(1, "PING")
+        await _until(lambda: rend.started == [0] and pool.sent and pool.sent[0][1] == "PING")
+        rend._ev(0).set()
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_wake_without_bot_noops():
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend)  # no bot
+        pump.wake(1, "PING")         # must not raise
+        await asyncio.sleep(0.01)
+        assert rend.started == [] and pool.sent == []
+    asyncio.run(run())
+
+
+def test_outbound_anchor_sends_via_bot():
+    async def run():
+        bot = RecordingBot()
+        a = OutboundAnchor(bot, chat_id=7, thread_id=42)
+        assert a.chat.id == 7 and a.is_topic_message is False
+        await a.answer("hello", parse_mode="HTML")
+        assert bot.sent[0] == {"chat_id": 7, "text": "hello",
+                               "message_thread_id": 42, "parse_mode": "HTML"}
+    asyncio.run(run())
+
+
+def test_ctx_wake_calls_wake_fn_and_noops_without():
+    async def run():
+        calls = []
+        ctx = ToolContext(bot=None, chat_id=5, wake_fn=lambda cid, txt: calls.append((cid, txt)))
+        await ctx.wake("ping")
+        assert calls == [(5, "ping")]
+        # no wake_fn wired -> silently no-op
+        await ToolContext(bot=None, chat_id=5).wake("x")
     asyncio.run(run())
 
 

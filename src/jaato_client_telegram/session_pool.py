@@ -121,6 +121,10 @@ class SessionPool:
             if session_store_path else ""
         )
         self._welcome_store = WelcomeStore(welcome_store_path)
+        # The per-chat pump, injected after construction (it wraps this pool +
+        # the renderer). Host tools reach its wake() via ctx.wake — so a tool can
+        # make the model act on an event even after the session went idle.
+        self._pump = None
         # Whether the most recent get_or_create_session for a chat RE-ATTACHED to
         # a persisted session (vs created fresh / reused in-memory) — so the
         # handler can show a "Resumed" cue. Read via took_reattach().
@@ -141,6 +145,12 @@ class SessionPool:
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
         self._file_config = file_config
+
+    def set_pump(self, pump) -> None:
+        """Wire the per-chat pump (built after the pool in bot.py). Enables
+        ctx.wake() for host tools — a tool can submit an event turn that resumes
+        an idle session. Unset ⇒ ctx.wake() no-ops."""
+        self._pump = pump
 
     def claim_first_contact(self, chat_id: int) -> bool:
         """True (once ever per chat) if this is the chat's first contact — the
@@ -353,7 +363,13 @@ class SessionPool:
                 # Tag dynamically-installed tools so the model never mistakes them
                 # for built-ins present at bootstrap (see mark_user_installed).
                 schema = mark_user_installed(t["schema"])
-                tools.append({**schema, "handler": make_executor(t["execute"], tbot, chat_id)})
+                # Pass the pump's wake so the tool's ctx.wake() can raise an event
+                # turn (e.g. a reminder) that resumes an idle session.
+                wake = self._pump.wake if self._pump is not None else None
+                tools.append({
+                    **schema,
+                    "handler": make_executor(t["execute"], tbot, chat_id, wake=wake),
+                })
         return tools
 
     # --- Telegram thread continuity -----------------------------------------

@@ -107,6 +107,9 @@ class ToolContext:
     """Runtime context handed to a dynamic tool's ``execute(args, ctx)``."""
     bot: Any
     chat_id: int
+    # Injected by the bot: submit an agent-facing event turn to the chat's pump.
+    # None when no pump is wired (feature off) — ctx.wake() then no-ops.
+    wake_fn: "Callable[[int, str], None] | None" = None
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -115,6 +118,18 @@ class ToolContext:
         ``"timeout"`` (ms) in your tool's TOOL_SCHEMA so the runner waits for the
         human rather than giving up at the 30s default."""
         return await ask_user(self.bot, self.chat_id, text, options, timeout)
+
+    async def wake(self, text: str) -> None:
+        """Make the MODEL act on an event this tool is raising (e.g. a reminder
+        firing) — even if the session has gone idle since. Delivers ``text`` as a
+        new agent turn: resumes/re-attaches the session if needed, and if the user
+        happens to have a turn in flight it WAITS for that to finish rather than
+        interrupting it. Returns immediately after submitting (does not await the
+        model's reply). Status-agnostic: you do NOT need to know the session state.
+        No-ops if the bot didn't wire a pump."""
+        if self.wake_fn is None:
+            return
+        self.wake_fn(self.chat_id, text)
 
 
 def validate_name(name: str) -> None:
@@ -184,9 +199,10 @@ def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
 
 def make_executor(
     execute_fn: Callable[..., Awaitable[Any]], bot: Any, chat_id: int,
+    wake: "Callable[[int, str], None] | None" = None,
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
-    ctx = ToolContext(bot=bot, chat_id=chat_id)
+    ctx = ToolContext(bot=bot, chat_id=chat_id, wake_fn=wake)
 
     async def executor(args: dict) -> dict:
         # A tool may import a dependency the confined runner just pip-installed

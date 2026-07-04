@@ -17,7 +17,7 @@ from pathlib import Path
 
 TOOL_SCHEMA = {
     "name": "remind",
-    "description": "Create, list, or cancel scheduled reminders. Reminders are sent as Telegram messages when they fire.",
+    "description": "Create, list, or cancel scheduled reminders. When a reminder fires it WAKES the assistant (resuming the session if it went idle) to tell the user and act on it — it doesn't just post a static message.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -104,12 +104,20 @@ def _load() -> list[dict]:
         return []
 
 
-async def _fire(bot, chat_id: int, text: str, rid: str, target: datetime):
+async def _fire(ctx, text: str, rid: str, target: datetime):
     now = _now()
     if target > now:
         await asyncio.sleep((target - now).total_seconds())
     try:
-        await bot.send_message(chat_id=chat_id, text=f"\u23f0 **Reminder:** {text}")
+        # WAKE THE MODEL with the fired reminder as an event: ctx.wake resumes the
+        # session if it went idle and runs a turn, so the assistant can tell the
+        # user and take any action the reminder implies. (A plain bot.send_message
+        # would post text but never involve the model.) It defers behind any
+        # in-flight user turn rather than interrupting it.
+        await ctx.wake(
+            f"\u23f0 A scheduled reminder just fired: \"{text}\". "
+            f"Let the user know now, and take any action it implies."
+        )
     except Exception:
         pass
     finally:
@@ -117,17 +125,17 @@ async def _fire(bot, chat_id: int, text: str, rid: str, target: datetime):
         _save()
 
 
-def _schedule(bot, chat_id: int, rid: str, text: str, target: datetime):
+def _schedule(ctx, rid: str, text: str, target: datetime):
     loop = asyncio.get_running_loop()
-    task = loop.create_task(_fire(bot, chat_id, text, rid, target))
+    task = loop.create_task(_fire(ctx, text, rid, target))
     task._rid = rid
     task._text = text
     task._target = target
-    task._chat_id = chat_id
+    task._chat_id = ctx.chat_id
     _reminders[rid] = task
 
 
-async def _restore(bot, chat_id: int):
+async def _restore(ctx):
     """Re-schedule persisted reminders that are still in the future."""
     global _next_id
     now = _now()
@@ -137,7 +145,7 @@ async def _restore(bot, chat_id: int):
         target = datetime.fromisoformat(entry["target"])
         if target <= now:
             continue  # already expired, skip
-        _schedule(bot, chat_id, rid, entry["text"], target)
+        _schedule(ctx, rid, entry["text"], target)
         # keep _next_id above any restored ID
         try:
             num = int(rid[1:])
@@ -159,7 +167,7 @@ async def execute(args: dict, ctx) -> dict:
 
     # first call: restore any persisted reminders
     if not _reminders and _load():
-        n = await _restore(ctx.bot, ctx.chat_id)
+        n = await _restore(ctx)
         if n:
             _save()
 
@@ -215,7 +223,7 @@ async def execute(args: dict, ctx) -> dict:
         return {"error": "Provide either delay_minutes or time."}
 
     rid = _make_id()
-    _schedule(ctx.bot, ctx.chat_id, rid, text, target)
+    _schedule(ctx, rid, text, target)
     _save()
 
     wait_secs = (target - _now()).total_seconds()

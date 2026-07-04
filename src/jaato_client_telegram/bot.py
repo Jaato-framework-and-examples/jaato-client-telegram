@@ -115,7 +115,10 @@ def create_bot_and_dispatcher(
     # message that arrives mid-turn as a steer instead of blocking it behind the
     # in-flight turn (replaces the old per-chat lock). Message handlers submit to
     # it rather than driving send_message + stream_response themselves.
-    pump = ChatPump(pool, renderer)
+    pump = ChatPump(pool, renderer, bot)
+    # Let host tools reach the pump's wake() via ctx.wake (raise an event turn
+    # that resumes an idle session, e.g. a reminder firing).
+    pool.set_pump(pump)
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
 
     # Create rate limiter if enabled

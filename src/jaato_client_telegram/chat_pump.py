@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 from jaato_client_telegram.welcome_store import WELCOME_PREFIX
 
@@ -50,21 +51,78 @@ class PumpItem:
     """One inbound message to deliver to a chat's session."""
 
     chat_id: int
-    message: "Message"           # tg message: rendering target + thread source
+    message: "Message"           # tg message (or OutboundAnchor): render target + thread
     text: str
     attachments: list | None = None
     apply_welcome: bool = False  # prepend the first-contact welcome (private only)
     reply: bool = False          # feedback via message.reply (group) vs answer
+    # A DEFERRED item never steers a running turn: if a turn is active when it
+    # arrives, it waits and runs as its OWN turn after the current one finishes.
+    # Used for agent-facing events (e.g. a reminder firing) that must not barge
+    # into a user's in-flight turn. A normal user message (defer=False) is
+    # delivered mid-turn as a steer, per the pump's whole point.
+    defer: bool = False
+
+
+class OutboundAnchor:
+    """A minimal Message-like object so a turn can be rendered with NO inbound
+    Telegram message (e.g. a reminder waking the model). Implements only the
+    surface stream_response / _safe_answer touch: chat.id, bot, message_thread_id,
+    is_topic_message, answer, reply, answer_document. Sends via bot.send_message so
+    every send still funnels through the outbound rate limiter."""
+
+    is_topic_message = False
+
+    def __init__(self, bot: Any, chat_id: int, thread_id: int | None = None) -> None:
+        self.bot = bot
+        self.chat = SimpleNamespace(id=chat_id, type="private")
+        self.message_thread_id = thread_id
+
+    async def answer(self, text: str, **kwargs):
+        kwargs.pop("message_thread_id", None)
+        return await self.bot.send_message(
+            chat_id=self.chat.id, text=text,
+            message_thread_id=self.message_thread_id, **kwargs,
+        )
+
+    async def reply(self, text: str, **kwargs):
+        return await self.answer(text, **kwargs)
+
+    async def answer_document(self, document, **kwargs):
+        kwargs.pop("message_thread_id", None)
+        return await self.bot.send_document(
+            chat_id=self.chat.id, document=document,
+            message_thread_id=self.message_thread_id, **kwargs,
+        )
 
 
 class ChatPump:
     """One inbox queue + one actor task per chat_id."""
 
-    def __init__(self, pool: "SessionPool", renderer: "ResponseRenderer") -> None:
+    def __init__(
+        self, pool: "SessionPool", renderer: "ResponseRenderer", bot: Any = None,
+    ) -> None:
         self._pool = pool
         self._renderer = renderer
+        self._bot = bot  # needed to build an OutboundAnchor for wake()
         self._inbox: dict[int, asyncio.Queue] = {}
         self._actors: dict[int, asyncio.Task] = {}
+
+    def wake(self, chat_id: int, text: str) -> None:
+        """Make the model act on an agent-facing EVENT (e.g. a reminder firing),
+        resuming the session if it went idle. Runs as its OWN turn: if the user
+        currently has a turn in flight it WAITS for that to finish (defer=True) so
+        it never barges into their conversation. Status-agnostic — safe to call in
+        any session state; the pump handles resume/idle/busy. Requires a bot."""
+        if self._bot is None:
+            logger.warning("ChatPump.wake called but no bot configured — dropping")
+            return
+        thread = self._pool.current_thread(chat_id)
+        anchor = OutboundAnchor(self._bot, chat_id, thread)
+        self.submit(PumpItem(
+            chat_id=chat_id, message=anchor, text=text,
+            apply_welcome=False, reply=False, defer=True,
+        ))
 
     def submit(self, item: PumpItem) -> None:
         """Enqueue a message and ensure the chat's actor is running.
@@ -95,38 +153,52 @@ class ChatPump:
 
     async def _actor(self, chat_id: int) -> None:
         inbox = self._inbox[chat_id]
+        # Deferred items dequeued mid-turn wait here and run as their own turns,
+        # in arrival order, once the current turn finishes.
+        pending: list[PumpItem] = []
         get_task: asyncio.Task | None = None
         render: asyncio.Task | None = None
         try:
             while True:
-                # `get_task` may be carried over from the previous turn's drain
-                # loop (a pending inbox.get()) — don't lose it / its message.
-                if get_task is None:
-                    get_task = asyncio.create_task(inbox.get())
-                item = await get_task
-                get_task = None
+                # Pick the next turn-STARTING item: drain deferred items first,
+                # else take the next inbox message. `get_task` may be carried over
+                # from the previous turn's drain (a pending inbox.get()) — reuse
+                # it rather than dropping its message.
+                if pending:
+                    item = pending.pop(0)
+                else:
+                    if get_task is None:
+                        get_task = asyncio.create_task(inbox.get())
+                    item = await get_task
+                    get_task = None
 
                 try:
-                    # ---- start a NEW turn with `item` ----
+                    # ---- run a turn with `item` ----
                     session_id, text = await self._prepare_turn(item)
                     await self._pool.send_message(
                         session_id, text, attachments=item.attachments
                     )
                     render = asyncio.create_task(self._render(item, session_id))
 
-                    # Drain the inbox WHILE the turn streams: each message that
-                    # arrives mid-turn is injected into the LIVE turn (steering);
-                    # the running `render` shows the continuation.
-                    get_task = asyncio.create_task(inbox.get())
+                    # Drain the inbox WHILE the turn streams. A normal (user)
+                    # message is injected into the LIVE turn (steering) and the
+                    # running `render` shows the continuation. A DEFERRED item
+                    # (e.g. a reminder) is set aside to run as its own turn after
+                    # this one — it must not barge into the user's turn.
                     while True:
+                        if get_task is None:
+                            get_task = asyncio.create_task(inbox.get())
                         await asyncio.wait(
                             {render, get_task}, return_when=asyncio.FIRST_COMPLETED
                         )
                         if render.done():
                             break  # turn ended; carry the pending get_task
                         mid = get_task.result()
-                        get_task = asyncio.create_task(inbox.get())
-                        await self._deliver_mid_turn(mid, session_id)
+                        get_task = None
+                        if mid.defer:
+                            pending.append(mid)
+                        else:
+                            await self._deliver_mid_turn(mid, session_id)
 
                     ctx = render.result()
                     render = None
