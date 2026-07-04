@@ -385,11 +385,16 @@ class SessionPool:
                 # for built-ins present at bootstrap (see mark_user_installed).
                 schema = mark_user_installed(t["schema"])
                 # Pass the pump's wake so the tool's ctx.wake() can raise an event
-                # turn (e.g. a reminder) that resumes an idle session.
+                # turn (e.g. a reminder) that resumes an idle session, and the
+                # workspace so a tool can stage a file (e.g. install_tool writing
+                # a verified draft to tool_drafts/).
                 wake = self._pump.wake if self._pump is not None else None
                 tools.append({
                     **schema,
-                    "handler": make_executor(t["execute"], tbot, chat_id, wake=wake),
+                    "handler": make_executor(
+                        t["execute"], tbot, chat_id,
+                        wake=wake, workspace=self._ws_config.workspace,
+                    ),
                 })
         return tools
 

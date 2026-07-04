@@ -110,6 +110,10 @@ class ToolContext:
     # Injected by the bot: submit an agent-facing event turn to the chat's pump.
     # None when no pump is wired (feature off) — ctx.wake() then no-ops.
     wake_fn: "Callable[[int, str], None] | None" = None
+    # The session's workspace root ("" if unconfigured). A tool that stages a file
+    # for the agent (e.g. install_tool writing the verified draft to
+    # tool_drafts/<name>.py) writes under here.
+    workspace: str = ""
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -200,9 +204,10 @@ def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
 def make_executor(
     execute_fn: Callable[..., Awaitable[Any]], bot: Any, chat_id: int,
     wake: "Callable[[int, str], None] | None" = None,
+    workspace: str = "",
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
-    ctx = ToolContext(bot=bot, chat_id=chat_id, wake_fn=wake)
+    ctx = ToolContext(bot=bot, chat_id=chat_id, wake_fn=wake, workspace=workspace)
 
     async def executor(args: dict) -> dict:
         # A tool may import a dependency the confined runner just pip-installed
