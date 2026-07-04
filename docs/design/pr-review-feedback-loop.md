@@ -249,8 +249,15 @@ but any turn-*starting* wake path **must be built on that boundary**:
 
 - **Option B (client, ours):** the bot's inbound receiver must be **fail-closed
   HMAC** (mirror #498 — reject unless verified), and the woken turn must carry the
-  review text as **untrusted content** (the `#495` trait), *data to consider,
-  never instructions to obey*. A public PR comment is attacker-controlled input.
+  review text as **untrusted content** — *data to consider, never instructions to
+  obey*. A public PR comment is attacker-controlled input.
+  **Correctness gotcha (Advisor, 2026-07-04):** the framework's
+  `TRAIT_UNTRUSTED_CONTENT` auto-wrap (`wrap_untrusted_content` in
+  `render_result_for_model`) is **scoped by #495 to web_fetch / web_search / MCP
+  results only** — inbound/webhook was *deliberately excluded* (Daniel's call). So
+  the wrapping will **NOT auto-fire** for a bot-inbound turn; **we must call
+  `wrap_untrusted_content` on the review text ourselves.** Do not assume the trait
+  machinery tags it.
 - **Option A (server, roadmap):** same boundary — Advisor's framing is "build the
   wake feature **ON #498**, not around it": daemon-tier ingress (survives unload;
   listener not bound to runner lifecycle) + revive-by-`session_id` + inject as USER,
