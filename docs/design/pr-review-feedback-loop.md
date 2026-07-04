@@ -75,15 +75,47 @@ the safe form of (b) puts **nothing secret in the PR**:
   trust the store's public key. Relay holds no per-daemon secret; nothing forgeable
   sits in the PR.
 
-Rejected (a) (per-daemon HMAC in the relay — secret sprawl at marketplace scale)
-and naive-(b) (daemon-issued bearer *in the PR* — public credential). Exact
-mechanism (the shim's accept-mode for a store-signed request; the daemon's
-trust-store-pubkey config; `pr_ref→session_id` index) is being shaped with Advisor,
-whose shim gate owns it.
+Rejected (a) (per-daemon HMAC in the relay — secret sprawl) and naive-(b)
+(daemon-issued bearer *in the PR* — public credential).
 
-**Build staging:** Advisor stages server-side (index+command+wrap first, HTTP shim
-second). End-to-end is blocked on the shim (stage 2); the client token-mint in
-`share_tool` can start independently.
+**Pinned mechanism (Advisor, 2026-07-04):**
+- **Relay→daemon auth: mTLS-first (mode A).** The store relay presents a **store
+  client cert** (`curl --cert store.crt --key store.key`); each daemon trusts the
+  **store CA** once. This is *already* a #498 `transport_authenticated` mode
+  (`route.tls.ca_certfile`) — **zero new auth-mode code**, asymmetric (daemon holds
+  only the CA, cannot impersonate the store). **Fallback mode B** = an asymmetric
+  Ed25519 **signature-in-body** (daemon configured with the store pubkey), needed
+  **only if the shim sits behind a TLS-terminating proxy** that strips the client
+  cert. Mode B is net-new auth surface → Advisor takes it to Daniel as a
+  security-architecture decision for PR 2; mode A needs no such decision.
+  *(GitHub→relay stays GitHub's `X-Hub-Signature-256` HMAC — the two hops are
+  distinct.)*
+- **`pr_ref→session_id`: a separate `WakeBindingRegistry`, written via a new daemon
+  command `session.bind_wake(pr_ref)` that Advisor owns** — NOT raw index exposure.
+  The command binds `pr_ref → the caller's OWN session_id`, so a client can't hijack
+  another PR's routing (authorizable by construction). Kept out of the core
+  `session_id→workspace` index deliberately.
+- **Revocation: daemon TTL + explicit `session.unbind_wake(pr_ref)`** that the
+  client calls on PR merge/close. TTL is the safety net for the forgotten case; the
+  client does not carry sole responsibility.
+
+**Topology note (ours):** our reachability model exposes the shim via an operator
+reverse proxy — a *TLS-terminating* proxy (Caddy/nginx-http/Cloudflare Tunnel) would
+**strip the client cert**, breaking mode A. Daniel's single VPS bot avoids this by
+**exposing the wake-shim port directly with mTLS** (daemon binds it, no terminating
+proxy) → mode A, zero new code. Operators who must front it with a terminating proxy
+need mode B. See the delivery-tier decision for Daniel below.
+
+**Build staging:**
+- **PR #516 (UP)** — core primitive: `session.wake` + `session_id→workspace` index
+  + untrusted-wrap + `event_id` dedup. (jaato repo.)
+- **PR 2** — the HTTP shim + relay trust (mode A mTLS; mode B if Daniel approves) +
+  `WakeBindingRegistry` + `session.bind_wake` / `session.unbind_wake` commands.
+- **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref)` at share time
+  and `session.unbind_wake(pr_ref)` on merge/close; the relay (store-repo Action)
+  presents the store client cert. **Waits on PR 2's `bind_wake`/`unbind_wake`
+  command signatures** — building against not-yet-existent commands is the
+  guess-first trap. Wire it the moment those land.
 
 ## The loop we want to automate
 
