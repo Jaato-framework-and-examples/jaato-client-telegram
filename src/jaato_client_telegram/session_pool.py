@@ -152,6 +152,27 @@ class SessionPool:
         an idle session. Unset ⇒ ctx.wake() no-ops."""
         self._pump = pump
 
+    async def run_host_tool_startup(self) -> None:
+        """Call each installed host tool's optional ``on_startup(wake)`` hook once
+        at bot boot, so a tool can re-arm background work a restart dropped (e.g.
+        the reminder tool re-schedules persisted reminders — its in-memory timers
+        die on restart, the JSON schedule survives). ``wake`` is ``pump.wake``,
+        i.e. ``wake(chat_id, text)``. Needs the pump wired + host tools enabled."""
+        tools_dir = self._host_tools_dir()
+        if tools_dir is None or self._pump is None:
+            return
+        for name, t in load_all_tools(tools_dir).items():
+            # execute.__globals__ IS the tool module's namespace (kept alive by
+            # the execute reference), so on_startup is reachable without reloading.
+            hook = t["execute"].__globals__.get("on_startup")
+            if hook is None:
+                continue
+            try:
+                await hook(self._pump.wake)
+                logger.info("host tool %r on_startup ran", name)
+            except Exception:
+                logger.exception("host tool %r on_startup failed", name)
+
     def claim_first_contact(self, chat_id: int) -> bool:
         """True (once ever per chat) if this is the chat's first contact — the
         caller should then send the one-time model-generated welcome. False on

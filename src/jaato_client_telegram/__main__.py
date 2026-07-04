@@ -200,6 +200,14 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
     pool = dp["pool"]
     pump = dp["pump"]
 
+    # Re-arm host-tool background work that a restart dropped (e.g. persisted
+    # reminders: their in-memory timers die on restart, but the schedule is on
+    # disk). Runs their optional on_startup(wake) hooks.
+    try:
+        await pool.run_host_tool_startup()
+    except Exception:
+        log.exception("host-tool startup hooks failed")
+
     # Start background idle session cleanup
     cleanup_task = asyncio.create_task(
         _idle_session_cleanup_task(

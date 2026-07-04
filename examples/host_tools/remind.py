@@ -104,20 +104,26 @@ def _load() -> list[dict]:
         return []
 
 
-async def _fire(ctx, text: str, rid: str, target: datetime):
+def _wake_prompt(text: str) -> str:
+    return (
+        f"\u23f0 A scheduled reminder just fired: \"{text}\". "
+        f"Let the user know now, and take any action it implies."
+    )
+
+
+async def _fire(wake, chat_id: int, text: str, rid: str, target: datetime):
     now = _now()
     if target > now:
         await asyncio.sleep((target - now).total_seconds())
     try:
-        # WAKE THE MODEL with the fired reminder as an event: ctx.wake resumes the
-        # session if it went idle and runs a turn, so the assistant can tell the
-        # user and take any action the reminder implies. (A plain bot.send_message
-        # would post text but never involve the model.) It defers behind any
-        # in-flight user turn rather than interrupting it.
-        await ctx.wake(
-            f"\u23f0 A scheduled reminder just fired: \"{text}\". "
-            f"Let the user know now, and take any action it implies."
-        )
+        # WAKE THE MODEL with the fired reminder as an event: wake(chat_id, ...)
+        # resumes the session if it went idle and runs a turn, so the assistant
+        # can tell the user and take any action the reminder implies. (A plain
+        # bot.send_message would post text but never involve the model.) It defers
+        # behind any in-flight user turn rather than interrupting it. `wake` is the
+        # raw pump wake (ctx.wake_fn) \u2014 it takes chat_id, so a reminder restored at
+        # bot startup fires for its OWN chat, not the current one.
+        wake(chat_id, _wake_prompt(text))
     except Exception:
         pass
     finally:
@@ -125,18 +131,19 @@ async def _fire(ctx, text: str, rid: str, target: datetime):
         _save()
 
 
-def _schedule(ctx, rid: str, text: str, target: datetime):
+def _schedule(wake, chat_id: int, rid: str, text: str, target: datetime):
     loop = asyncio.get_running_loop()
-    task = loop.create_task(_fire(ctx, text, rid, target))
+    task = loop.create_task(_fire(wake, chat_id, text, rid, target))
     task._rid = rid
     task._text = text
     task._target = target
-    task._chat_id = ctx.chat_id
+    task._chat_id = chat_id
     _reminders[rid] = task
 
 
-async def _restore(ctx):
-    """Re-schedule persisted reminders that are still in the future."""
+async def _restore(wake) -> int:
+    """Re-schedule persisted reminders still in the future, each for its OWN
+    chat_id (read from the store) \u2014 so a restart re-arms them correctly."""
     global _next_id
     now = _now()
     restored = 0
@@ -145,7 +152,7 @@ async def _restore(ctx):
         target = datetime.fromisoformat(entry["target"])
         if target <= now:
             continue  # already expired, skip
-        _schedule(ctx, rid, entry["text"], target)
+        _schedule(wake, entry.get("chat_id", 0), rid, entry["text"], target)
         # keep _next_id above any restored ID
         try:
             num = int(rid[1:])
@@ -159,17 +166,27 @@ async def _restore(ctx):
     return restored
 
 
+async def on_startup(wake) -> int:
+    """Bot-startup hook (called by SessionPool.run_host_tool_startup): re-arm
+    persisted reminders that a restart dropped. ``wake(chat_id, text)`` is the
+    pump wake. Durable reminders survive bot restarts through this."""
+    if not _reminders and _load():
+        return await _restore(wake)
+    return 0
+
+
 async def execute(args: dict, ctx) -> dict:
     global _next_id, _ctx
 
     # stash ctx for future restores (e.g. after restart)
     _ctx = ctx
 
-    # first call: restore any persisted reminders
-    if not _reminders and _load():
-        n = await _restore(ctx)
-        if n:
-            _save()
+    # Raw pump wake: wake(chat_id, text) resumes the session + runs a turn. None
+    # when no pump is wired (feature off). on_startup already restores at boot;
+    # this covers a tool loaded AFTER boot (its on_startup never ran).
+    wake = ctx.wake_fn
+    if wake is not None and not _reminders and _load():
+        await _restore(wake)
 
     action = args["action"]
 
@@ -222,8 +239,11 @@ async def execute(args: dict, ctx) -> dict:
     else:
         return {"error": "Provide either delay_minutes or time."}
 
+    if wake is None:
+        return {"error": "Reminder delivery is unavailable (no wake capability wired)."}
+
     rid = _make_id()
-    _schedule(ctx, rid, text, target)
+    _schedule(wake, ctx.chat_id, rid, text, target)
     _save()
 
     wait_secs = (target - _now()).total_seconds()
