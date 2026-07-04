@@ -215,6 +215,12 @@ collect(){ info "Configuration"
 write_env(){ info "Write secrets (chmod 600)"
   mkdir -p "$CFG_DIR" "$STATE_DIR" "$HOST_TOOLS_DIR"
   umask 077
+  # Preserve an optional tool-store contribution token (enables share_tool)
+  # across redeploys: take it from the env if given, else from the existing
+  # bot.env. Empty ⇒ contribution stays off (no hardcoded default).
+  local store_tok="${JAATO_TOOLSTORE_GH_TOKEN:-}"
+  [ -z "$store_tok" ] && [ -f "$BOT_ENV" ] && \
+    store_tok=$(sed -n 's/^JAATO_TOOLSTORE_GH_TOKEN=//p' "$BOT_ENV" | head -1)
   printf '%s' "$WS_TOKEN" > "$WS_TOKEN_FILE"
   { printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
     [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$EXEC_KEY"
@@ -226,6 +232,7 @@ write_env(){ info "Write secrets (chmod 600)"
     printf 'JAATO_TG_WORKSPACE=%s\n' "$WORKSPACE"
     printf 'JAATO_TG_HOST_TOOLS_DIR=%s\n' "$HOST_TOOLS_DIR"
     printf 'JAATO_TG_SESSION_STORE=%s\n' "$SESSION_STORE"
+    [ -n "$store_tok" ] && printf 'JAATO_TOOLSTORE_GH_TOKEN=%s\n' "$store_tok"
   } > "$BOT_ENV"
   chmod 600 "$WS_TOKEN_FILE" "$SERVER_ENV" "$BOT_ENV"
 }
