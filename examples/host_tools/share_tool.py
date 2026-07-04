@@ -161,8 +161,21 @@ async def execute(args: dict, ctx) -> dict:
             f"A maintainer reviews the code and merges — then everyone can install it."
         )}
     if st == 422:
+        # A PR already exists for this head branch — but we just committed the new
+        # code to that branch above, so the EXISTING PR is now updated. This is the
+        # normal path when re-running share_tool to address review feedback. Find
+        # the PR and report it as UPDATED (don't hand-roll the API — this did it).
+        st2, prs = _gh(
+            "GET", f"/repos/{_OWNER}/{_REPO}/pulls?head={owner}:{branch}&state=open", token,
+        )
+        if st2 == 200 and isinstance(prs, list) and prs:
+            return {"result": (
+                f"Updated the existing pull request for '{name}' with your latest "
+                f"changes:\n{prs[0]['html_url']}\n"
+                f"The maintainer will see the new commit."
+            )}
         return {"result": (
-            f"A pull request for '{name}' seems to already exist (or there's nothing "
-            f"new to propose). Check {_OWNER}/{_REPO} → Pull requests."
+            f"Pushed your changes to the '{name}' branch — a pull request already "
+            f"exists for it. Check {_OWNER}/{_REPO} → Pull requests."
         )}
     return {"error": f"Couldn't open the PR ({st}): {pr.get('message', '')}"}
