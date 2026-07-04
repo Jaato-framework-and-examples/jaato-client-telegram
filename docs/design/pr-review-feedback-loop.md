@@ -3,12 +3,24 @@
 **Status:** design only — nothing built. Raised 2026-07-04: jaato ships a webhook
 ingress that links an agent to a webhook, and GitHub can push PR-review events to
 a webhook, so a bot could react to reviewer comments on its store PR without a
-human relaying them. This note scopes that. **The blocking open question is now
-answered (2026-07-04, code-traced): the server `webhook` plugin CANNOT wake an
-idle or detached session, so delivery must target the always-on bot via
-`ctx.wake`, not the daemon.** The stateless relay + carriage-token + reachability
-decisions stand; only the delivery *tier* moved (server → client). See
-"Resolved: the idle-wake verdict" below.
+human relaying them. This note scopes that.
+
+**DIRECTION SET (2026-07-04):** Daniel wants the fix to be **client-agnostic**, not
+a Telegram shim — so the chosen path is **not** the client-side `ctx.wake` route
+(option B) but a **server-native daemon wake primitive** (option A2): a first-class
+`session.wake(session_id, text, source=USER)` daemon capability, ingress-agnostic,
+gated by #498 auth, that revives a cold/detached session and starts a USER turn. The
+HTTP webhook ingress is just one caller in front of it. **This is jaato-server work;
+Advisor (server owner) is designing A2** (handed off 2026-07-04). B is retained below
+only as the interim/fallback if a client-local stopgap is ever needed. Key layering:
+**wake** (start the turn, revive if cold) is generic/server-side; **render** (stream
+output to a human) stays per-client (the bot's normal job) — so the primitive runs
+headless, no client attached required.
+
+Prior blocking question, now answered (code-traced): the server `webhook` *plugin*
+CANNOT wake an idle/detached session (`SourceType.EVENT` = mid-turn only; listener
+dies on unload). See "Resolved: the idle-wake verdict" below — that verdict is
+exactly why A2 must live at the **daemon tier**, not the runner-bound plugin.
 
 ## The loop we want to automate
 
