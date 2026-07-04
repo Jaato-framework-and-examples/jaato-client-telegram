@@ -1,30 +1,41 @@
 """
-Scheduled Reminders Tool (persistent across restarts)
+Scheduled Reminders Tool (timezone-aware, persistent across restarts)
 
 Actions:
-  remind  – schedule a reminder (sends via Telegram when due)
+  set_tz  – set your IANA timezone once (e.g. "Europe/Madrid"); absolute-time
+            reminders are then interpreted in it
+  remind  – schedule a reminder; when it fires it WAKES the assistant
   list    – show all active reminders
   cancel  – cancel a reminder by its ID
 
-Reminders are persisted to a JSON file so they survive bot restarts.
-On load, any future reminders from the file are re-scheduled automatically.
+All scheduling math is done in UTC (the host clock may be UTC, e.g. on a VPS).
+An absolute ``time`` (HH:MM) is interpreted in the user's SAVED timezone — never
+the host's — so "07:00" means the user's 07:00. ``delay_minutes`` is relative and
+timezone-independent. Reminders persist to JSON and are re-armed at bot startup
+(see ``on_startup``), so they survive restarts.
 """
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 TOOL_SCHEMA = {
     "name": "remind",
-    "description": "Create, list, or cancel scheduled reminders. When a reminder fires it WAKES the assistant (resuming the session if it went idle) to tell the user and act on it — it doesn't just post a static message.",
+    "description": (
+        "Create, list, or cancel scheduled reminders. When a reminder fires it "
+        "WAKES the assistant (resuming the session if it went idle) to tell the "
+        "user and act on it — not a static message. An absolute 'time' (HH:MM) is "
+        "interpreted in the user's timezone; set it once with action='set_tz'."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["remind", "list", "cancel"],
-                "description": "What to do: 'remind' creates one, 'list' shows pending, 'cancel' removes one."
+                "enum": ["remind", "list", "cancel", "set_tz"],
+                "description": "'remind' creates one, 'list' shows pending, 'cancel' removes one, 'set_tz' saves your timezone."
             },
             "text": {
                 "type": "string",
@@ -32,11 +43,15 @@ TOOL_SCHEMA = {
             },
             "delay_minutes": {
                 "type": "integer",
-                "description": "Minutes from now to fire the reminder. Mutually exclusive with 'time'."
+                "description": "Minutes from now to fire (timezone-independent). Mutually exclusive with 'time'."
             },
             "time": {
                 "type": "string",
-                "description": "Time to fire, in 'HH:MM' 24h format. If that time has already passed today, it targets tomorrow."
+                "description": "Absolute time to fire, 'HH:MM' 24h, interpreted in your saved timezone (set_tz first). If already past today, targets tomorrow."
+            },
+            "timezone": {
+                "type": "string",
+                "description": "IANA timezone name (e.g. Europe/Madrid, America/New_York). Required for 'set_tz'."
             },
             "reminder_id": {
                 "type": "string",
@@ -48,6 +63,7 @@ TOOL_SCHEMA = {
 }
 
 STORE_PATH = Path(__file__).parent / "reminders.json"
+_TZ_PATH = Path(__file__).parent / "reminder_timezone.txt"
 
 _reminders: dict[str, asyncio.Task] = {}
 _next_id = 0
@@ -55,7 +71,21 @@ _ctx = None  # set on first execute call, used for re-scheduling after restart
 
 
 def _now() -> datetime:
-    return datetime.now()
+    """Current time as an AWARE UTC datetime — all scheduling math is in UTC, so
+    it never depends on the host's local timezone (UTC on the VPS)."""
+    return datetime.now(timezone.utc)
+
+
+def _load_tz() -> str:
+    try:
+        return _TZ_PATH.read_text().strip() if _TZ_PATH.exists() else ""
+    except OSError:
+        return ""
+
+
+def _save_tz(tz: str) -> None:
+    _TZ_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _TZ_PATH.write_text(tz)
 
 
 def _make_id() -> str:
@@ -68,13 +98,16 @@ def _target_from_delay(delay_minutes: int) -> datetime:
     return _now() + timedelta(minutes=delay_minutes)
 
 
-def _target_from_time(time_str: str) -> datetime:
-    now = _now()
+def _target_from_time(time_str: str, tz_str: str) -> datetime:
+    """Interpret HH:MM in the user's timezone, return an AWARE UTC datetime. If
+    that clock time already passed locally today, target tomorrow."""
+    tz = ZoneInfo(tz_str)
+    now_local = datetime.now(tz)
     hour, minute = map(int, time_str.split(":"))
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
+    target_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target_local <= now_local:
+        target_local += timedelta(days=1)
+    return target_local.astimezone(timezone.utc)
 
 
 def _save():
@@ -150,6 +183,8 @@ async def _restore(wake) -> int:
     for entry in _load():
         rid = entry["id"]
         target = datetime.fromisoformat(entry["target"])
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)  # legacy naive → assume UTC
         if target <= now:
             continue  # already expired, skip
         _schedule(wake, entry.get("chat_id", 0), rid, entry["text"], target)
@@ -219,6 +254,26 @@ async def execute(args: dict, ctx) -> dict:
             return {"result": f"Reminder {rid} cancelled."}
         return {"error": f"No active reminder with ID {rid}."}
 
+    # ---- SET_TZ ----
+    if action == "set_tz":
+        tz_str = (args.get("timezone") or "").strip()
+        if not tz_str:
+            return {"error": "'timezone' is required for set_tz (e.g. Europe/Madrid)."}
+        try:
+            ZoneInfo(tz_str)
+        except Exception:
+            return {"error": (
+                f"Invalid timezone: {tz_str!r}. Use IANA names like Europe/Madrid "
+                f"or America/New_York."
+            )}
+        _save_tz(tz_str)
+        now_local = datetime.now(ZoneInfo(tz_str))
+        return {"result": (
+            f"Timezone set to {tz_str} — your local time is "
+            f"{now_local.strftime('%H:%M, %d %b %Y')}. Absolute-time reminders "
+            f"('time') will use it."
+        )}
+
     # ---- REMIND ----
     text = args.get("text", "").strip()
     if not text:
@@ -234,8 +289,16 @@ async def execute(args: dict, ctx) -> dict:
         target = _target_from_delay(delay)
         label = f"in {delay} min"
     elif time_str:
-        target = _target_from_time(time_str)
-        label = f"at {time_str}"
+        tz_str = _load_tz()
+        if not tz_str:
+            return {"error": (
+                "No timezone set — I need it to interpret an absolute time "
+                "correctly (the host clock may be UTC). Set it once with "
+                "action='set_tz' (e.g. timezone='Europe/Madrid'), or use "
+                "delay_minutes instead."
+            )}
+        target = _target_from_time(time_str, tz_str)
+        label = f"at {time_str} ({tz_str})"
     else:
         return {"error": "Provide either delay_minutes or time."}
 
