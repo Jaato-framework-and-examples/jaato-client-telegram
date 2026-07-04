@@ -68,6 +68,10 @@ class FakeRenderer:
         self.completed: list[int] = []
         self.release: dict[int, asyncio.Event] = {}
         self.ctx: dict[int, _Ctx] = {}
+        self.awaiting = False
+
+    def is_awaiting_user(self, chat_id):
+        return self.awaiting
 
     def _ev(self, idx):
         return self.release.setdefault(idx, asyncio.Event())
@@ -81,7 +85,7 @@ class FakeRenderer:
 
 
 class FakeBot:
-    async def send_chat_action(self, chat_id, action):
+    async def send_chat_action(self, chat_id, action, **kw):
         pass
 
 
@@ -224,6 +228,7 @@ def test_welcome_prefix_applied_on_first_contact():
 class RecordingBot:
     def __init__(self):
         self.sent: list[dict] = []
+        self.typing = 0
 
     async def send_message(self, chat_id, text, message_thread_id=None, **kw):
         self.sent.append({"chat_id": chat_id, "text": text,
@@ -231,7 +236,8 @@ class RecordingBot:
         return SimpleNamespace(message_id=len(self.sent))
 
     async def send_chat_action(self, chat_id, action, **kw):
-        pass
+        if action == "typing":
+            self.typing += 1
 
     async def send_document(self, chat_id, document, message_thread_id=None, **kw):
         self.sent.append({"chat_id": chat_id, "document": document})
@@ -305,6 +311,33 @@ def test_ctx_wake_calls_wake_fn_and_noops_without():
         assert calls == [(5, "ping")]
         # no wake_fn wired -> silently no-op
         await ToolContext(bot=None, chat_id=5).wake("x")
+    asyncio.run(run())
+
+
+def test_keep_typing_pings_repeatedly_and_pauses_when_awaiting_user(monkeypatch):
+    async def run():
+        import jaato_client_telegram.chat_pump as cp
+        monkeypatch.setattr(cp, "_TYPING_INTERVAL", 0.01)
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend, RecordingBot())
+        bot = RecordingBot()
+        msg = SimpleNamespace(chat=SimpleNamespace(id=1), message_thread_id=None, bot=bot)
+        item = PumpItem(chat_id=1, message=msg, text="x")
+
+        t = asyncio.create_task(pump._keep_typing(item))
+        await asyncio.sleep(0.06)
+        assert bot.typing >= 2                     # keeps the indicator alive
+
+        rend.awaiting = True                        # bot is now waiting on the user
+        paused_at = bot.typing
+        await asyncio.sleep(0.06)
+        assert bot.typing == paused_at              # paused while awaiting user
+
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     asyncio.run(run())
 
 

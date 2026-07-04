@@ -45,6 +45,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A Telegram "typing…" chat action lasts ~5s; re-send a bit under that to keep it
+# continuous during a slow turn.
+_TYPING_INTERVAL = 4.0
+
 
 @dataclass
 class PumpItem:
@@ -158,6 +162,7 @@ class ChatPump:
         pending: list[PumpItem] = []
         get_task: asyncio.Task | None = None
         render: asyncio.Task | None = None
+        typing: asyncio.Task | None = None
         try:
             while True:
                 # Pick the next turn-STARTING item: drain deferred items first,
@@ -179,6 +184,9 @@ class ChatPump:
                         session_id, text, attachments=item.attachments
                     )
                     render = asyncio.create_task(self._render(item, session_id))
+                    # Keep a "typing…" indicator alive for the whole turn so a slow
+                    # model turn shows life instead of looking frozen.
+                    typing = asyncio.create_task(self._keep_typing(item))
 
                     # Drain the inbox WHILE the turn streams. A normal (user)
                     # message is injected into the LIVE turn (steering) and the
@@ -200,12 +208,17 @@ class ChatPump:
                         else:
                             await self._deliver_mid_turn(mid, session_id)
 
+                    typing.cancel()
+                    typing = None
                     ctx = render.result()
                     render = None
                     await self._post_turn(item, ctx)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 — turn boundary
+                    if typing is not None:
+                        typing.cancel()
+                        typing = None
                     render = None
                     await self._handle_error(item, e)
         except asyncio.CancelledError:
@@ -215,6 +228,8 @@ class ChatPump:
                 get_task.cancel()
             if render is not None and not render.done():
                 render.cancel()
+            if typing is not None and not typing.done():
+                typing.cancel()
 
     # ---- per-turn steps ----------------------------------------------------
 
@@ -264,6 +279,27 @@ class ChatPump:
             event_stream=await self._pool.events(session_id),
             thread_id_getter=lambda cid=item.chat_id: self._pool.current_thread(cid),
         )
+
+    async def _keep_typing(self, item: PumpItem) -> None:
+        """Re-send the 'typing…' chat action every few seconds while a turn runs,
+        so a slow model turn shows life instead of looking frozen. PAUSES while the
+        bot is awaiting the user (pending permission/clarification) — then it's the
+        user's turn to act, not the bot working. Best-effort; never crashes a turn."""
+        chat_id = item.chat_id
+        bot = item.message.bot
+        try:
+            while True:
+                if not self._renderer.is_awaiting_user(chat_id):
+                    try:
+                        await bot.send_chat_action(
+                            chat_id=chat_id, action="typing",
+                            message_thread_id=self._pool.current_thread(chat_id),
+                        )
+                    except Exception:  # noqa: BLE001 — typing is best-effort
+                        pass
+                await asyncio.sleep(_TYPING_INTERVAL)
+        except asyncio.CancelledError:
+            pass
 
     async def _post_turn(self, item: PumpItem, ctx) -> None:
         if ctx is not None and getattr(ctx, "stalled", False):

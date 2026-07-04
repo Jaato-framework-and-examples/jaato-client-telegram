@@ -463,6 +463,17 @@ class ResponseRenderer:
         for unit in units:
             await self._emit_one(initial_message, ctx, unit)
 
+    def is_awaiting_user(self, chat_id: int) -> bool:
+        """True if a permission or clarification is pending for this chat — i.e.
+        the bot is waiting on the USER, not working. Used to gate the stall timer
+        and to pause the typing indicator (the bot isn't typing, you are)."""
+        return (
+            (self._permission_handler is not None
+             and self._permission_handler.get_pending(chat_id) is not None)
+            or (self._clarification_handler is not None
+                and self._clarification_handler.get_pending(chat_id) is not None)
+        )
+
     async def stream_response(
         self,
         initial_message: Message,
@@ -505,12 +516,7 @@ class ResponseRenderer:
             # A pending permission/clarification means the server is waiting on the
             # USER, so silence is expected — don't treat it as a stall (use the long
             # await-user cap instead of the 120s runner-stall timeout).
-            awaiting_user = (
-                (self._permission_handler is not None
-                 and self._permission_handler.get_pending(chat_id) is not None)
-                or (self._clarification_handler is not None
-                    and self._clarification_handler.get_pending(chat_id) is not None)
-            )
+            awaiting_user = self.is_awaiting_user(chat_id)
             # A cold revive (INIT_PROGRESS seen, turn not yet producing output) can
             # be legitimately silent for >120s while plugins bootstrap — use the
             # generous revive cap there so we don't falsely stall the reviving turn.
