@@ -3,10 +3,12 @@
 **Status:** design only — nothing built. Raised 2026-07-04: jaato ships a webhook
 ingress that links an agent to a webhook, and GitHub can push PR-review events to
 a webhook, so a bot could react to reviewer comments on its store PR without a
-human relaying them. This note scopes that. The design settled on a **single
-push path** built on the server's `webhook` plugin, with a **stateless relay** for
-multi-bot routing and **reachability treated as an operator prerequisite**. One
-blocking open question remains (idle-wake of a cold session).
+human relaying them. This note scopes that. **The blocking open question is now
+answered (2026-07-04, code-traced): the server `webhook` plugin CANNOT wake an
+idle or detached session, so delivery must target the always-on bot via
+`ctx.wake`, not the daemon.** The stateless relay + carriage-token + reachability
+decisions stand; only the delivery *tier* moved (server → client). See
+"Resolved: the idle-wake verdict" below.
 
 ## The loop we want to automate
 
@@ -168,15 +170,59 @@ add-on, not a change to the core path.
 **Chosen:** carriage-token in PR → stateless relay (Action) → server webhook
 plugin, reachability as an operator prerequisite.
 
-## Blocking open question (verify before building)
+## Resolved: the idle-wake verdict (2026-07-04, code-traced)
 
-**Does an `EXTERNAL_EVENT` wake an *idle* session (spawn a fresh turn), or does it
-only surface while the agent is already subscribed/active?** The plugin's
-model-facing flow is agent-driven (`webhook_subscribe` + `subscribeToTasks`), and
-by review time the session is almost always cold. "React to a review while the bot
-sits idle" depends entirely on this. This is the server-side twin of the client
-`ctx.wake` idle-vs-mid-turn distinction. **Action:** read the event-bus delivery /
-runner-revive path in `jaato-server`, or confirm with Advisor, before committing.
+**The server `webhook` plugin cannot wake an idle or detached session.** Verdict is
+(B): `bus.publish(EXTERNAL_EVENT)` only lands in the runner's mid-turn message
+queue and is drained *while a turn is already running* — it never starts one. Three
+independent barriers in `jaato-server`:
+
+1. **`SourceType.EVENT` = mid-turn delivery only** — `event_bus_tools.py:349`
+   injects with `source_type=SourceType.EVENT` ("arrive at the next pause point
+   between tool calls"). Idle ⇒ no turn to land in.
+2. **Wake trigger disarmed between turns** — `jaato_session.py:1256` starts a turn
+   on inject only if `_on_continuation_needed` is set, and `rpc.py:2925/3040`
+   installs it *per active `send_message` RPC* and clears it in `finally`. Idle ⇒
+   `None` ⇒ inject just queues.
+3. **Post-turn drainer excludes EVENT** — `message_queue.py:195` `has_parent_messages`
+   matches only `USER, SYSTEM`, so a queued EXTERNAL_EVENT never itself kicks off
+   the next turn.
+
+And decisively for *our* scenario (review lands hours later, bot long detached):
+**idle-detach unloads the session** (`session_manager.py:6589`), destroying the
+runtime, bus, subscription, **and the webhook HTTP listener + its bound port**
+(`http_server.py:180`). Nothing is even listening.
+
+So the plugin is the right primitive for "an external event *during a live
+conversation*," and the wrong one for "wake me later about a review." Our case is
+the latter.
+
+### Consequence: deliver to the bot, not the daemon
+
+The always-on component that **survives detach is the bot process**, and idle-wake +
+cold-revive already exist there and are tested: `ctx.wake` → `ChatPump` starts a
+fresh turn when idle ([[message-flow-chat-pump]]); `SessionPool.get_or_create_session`
+re-attaches/revives the cold session by its persisted id ([[session-lifecycle]]).
+The daemon has no revive-and-inject-as-USER-on-inbound path today. So the delivery
+tier moves from the daemon `webhook` plugin to the **bot**, and the address
+simplifies from (daemon, session) to **(bot endpoint, chat_id)** — the bot owns the
+chat→session map and the revive logic.
+
+### The delivery-tier decision (operator's/maintainer's call)
+
+- **B — Relay → bot inbound endpoint → `ctx.wake(chat_id, review)` (recommended).**
+  Reuses fully-built, tested client machinery; no jaato-server change; the bot
+  inbound endpoint is the reverse-proxy prerequisite already accepted. Cost: a
+  small HMAC-verified inbound receiver on the bot (net-new client code).
+- **A — Daemon-tier webhook ingress that revives the session + injects as USER
+  (server-native, does not exist yet).** Keeps everything server-side, no bot port,
+  but requires new **jaato-server** work by Advisor (move the listener from runner
+  to the always-up daemon; add revive-by-session_id + a turn-*starting* USER inject)
+  and duplicates idle-wake logic the client already has.
+
+**Recommendation: B now, A as a later server-native evolution.** B ships on proven
+code; A is a real server project whose only win (no bot port) the reverse-proxy
+prerequisite already neutralizes.
 
 ## Remaining questions (decide before building)
 
