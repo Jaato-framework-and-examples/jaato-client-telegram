@@ -22,6 +22,57 @@ CANNOT wake an idle/detached session (`SourceType.EVENT` = mid-turn only; listen
 dies on unload). See "Resolved: the idle-wake verdict" below — that verdict is
 exactly why A2 must live at the **daemon tier**, not the runner-bound plugin.
 
+## Locked design (2026-07-04): the `session.wake` primitive
+
+Advisor designed A2 and Daniel greenlit it. This supersedes the option-A/B
+exploration further down (kept for the reasoning trail).
+
+**Server-side primitive** (Advisor's, jaato-server — transport-agnostic daemon
+command; the HTTP shim is one caller in front):
+```
+session.wake(session_id, text, source=USER):
+  1. dedup by event_id                       (per-session bounded LRU — GitHub redelivers)
+  2. resolve workspace via a daemon-owned session_id→workspace INDEX   (server-owned; Option 1)
+  3. if cold: resume_session(session_id, workspace)      (EXISTING — session_manager.py:5346, headless)
+  4. wrapped = wrap_untrusted_content(text, source="wake:<src>")   (EXPLICIT — inject bypasses #495 auto-wrap)
+  5. send_message_to_session(session_id, wrapped)       (EXISTING — session_manager.py:5030, headless USER turn)
+```
+Two of the pieces I'd flagged as net-new already exist: the headless USER
+turn-start (`send_message_to_session`, used by cascade-first-turn/reactor — one
+layer above the client-only `core.py::send_message` path I traced) and the
+headless revive (`resume_session`). **Net-new is just:** the `session.wake` command
++ the `session_id→workspace` index + dedup + the explicit untrusted-wrap-at-inject.
+
+**Security by construction (Advisor verified against real on-disk records):** the
+sandbox root comes from the persisted record's `state.workspace_path`, **never** the
+caller; `config_root` is saved-wins with a server `<workspace>/.jaato` fallback. So
+an authed-but-untrusted wake caller cannot revive under a weaker sandbox — the
+constraint I raised is met by design. (#469 persistence is what makes this hold.)
+
+**Auth:** the HTTP shim sits behind #498's `parse_webhook_request`
+(`webhook/routes.py:155-166`, fail-closed 401) — built ON it, one caller.
+
+**Client caller (mine, jaato-client-telegram + the store repo):**
+- Because workspace is server-owned via the index, the capability token embedded in
+  the PR only needs **(daemon, session_id)** — *not* workspace. Less to leak in a
+  public PR, simpler relay.
+- `share_tool` mints + embeds that token at share time (needs the chat's
+  `session_id` from `SessionPool` + the daemon's wake-shim endpoint from config).
+- The relay (GitHub Action on the store repo) resolves the token and POSTs the
+  review to the daemon shim.
+
+**One open joint question — relay→shim auth secret model** (settle with Advisor
+before its shim stage): #498 wants the inbound POST authenticated. Options: (a) the
+relay holds a per-daemon HMAC secret — trivial for a **single daemon** (Daniel's
+VPS bot), but a secret-sprawl problem at marketplace scale (N daemons); (b) the
+token is a **daemon-issued bearer capability** the shim self-verifies, so the relay
+forwards it and holds no per-daemon secret. (a) ships Daniel's case now; (b) is the
+general answer. Decide before building the relay.
+
+**Build staging:** Advisor stages server-side (index+command+wrap first, HTTP shim
+second). End-to-end is blocked on the shim (stage 2); the client token-mint in
+`share_tool` can start independently.
+
 ## The loop we want to automate
 
 The marketplace works end to end today, but with a **human in the middle of the
