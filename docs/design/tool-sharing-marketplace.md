@@ -121,14 +121,23 @@ No new credentials: read-only fetch from a public/curated store.
 4. A **human reviews + merges** (the gate). Now it's in the store, installable by
    everyone.
 
-New requirements (the bigger lift):
-- **A dedicated bot GitHub identity + token** (machine account), secret via
-  `pass://` / env — never inlined. Least-privilege: open PRs on a fork, no direct
-  write to the store's default branch.
-- **Fork-and-PR** (not a branch on the canonical repo) so a bot never needs write
-  access to the real store.
-- **Guardrails:** the model may only *propose*; every bot PR is clearly labelled
-  and provenance-stamped; a maintainer merges.
+**Identity model — bring-your-own token (open contribution).** The store is open:
+*any* bot may contribute. So there is **no central identity/key** — each
+contributing bot authenticates as **itself**, with **its owner's own GitHub token**
+(a classic PAT, `public_repo` scope) in `JAATO_TOOLSTORE_GH_TOKEN` (env/`pass://`,
+never inlined). The bot **forks the store and opens the PR as itself**; PRs are
+self-attributed; the store holds no contributor secrets; a leak is scoped to that
+one owner. This is the open-source flow, and it's why a single **GitHub App is the
+wrong fit** here — one app = one shared private key across all bots (insecure + no
+attribution) or every contributor registering their own app (heavy). A GitHub App
+suits a *closed* single-fleet automation, not open contributors.
+
+- **Fork-and-PR** (never a branch on the canonical store) so a bot needs no write
+  access to the real store. NB: an account that *already* has write to the store
+  (e.g. an org admin) can't fork it — such an owner must use a separate non-admin
+  bot account's token.
+- **Guardrails:** the model may only *propose*; every bot PR is provenance-stamped
+  ("model-authored — review before merge"); a maintainer merges (the trust gate).
 
 ## 5. Staged implementation
 
@@ -156,12 +165,16 @@ New requirements (the bigger lift):
   regenerates + commits `registry.json` on merge to `main` (path-filtered, no
   loop). Tools declare deps in-file via `TOOL_DEPS`.
 
+- **Contribution identity.** Open contribution ⇒ **bring-your-own token**: each
+  bot forks + PRs as its own owner's account (classic PAT, `public_repo`), in
+  `JAATO_TOOLSTORE_GH_TOKEN`. No central identity/key; not a GitHub App. (An
+  admin-of-the-store owner must use a separate non-admin bot account, since you
+  can't fork a repo you can already write to.)
+
 **Still open:**
 - **Install ref.** Pin installs to a tag/release, or track `main`@sha from the
   registry. (Registry currently carries per-file `sha256`; a top-level release tag
   would let the bot pin the whole store.)
-- **Bot identity (contribute side).** One shared machine account, or per-deployment
-  identities (better attribution, more setup).
 - **Update policy.** Notify-only, or offer one-tap updates (still user-accepted),
   by comparing an installed tool's `sha256` against the registry.
 - **Namespacing.** Contributed tools may collide on name; namespace by contributor,
