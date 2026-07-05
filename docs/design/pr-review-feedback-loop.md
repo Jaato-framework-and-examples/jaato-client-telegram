@@ -192,9 +192,20 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     own PRs (a global session keyring would be strictly *weaker*, so do NOT add one);
     (ii) the real same-binding multi-key need is **key rotation** — during an overlap
     window both old + new keys must verify, which a scalar can't express. Make it a
-    list from the start (scalar = the 1-element case). **Rotation also needs a
-    re-bind / update-key path** on the registry (add new → overlap → drop old) — a
-    PR-2 mechanic, since a PR bound last week still carries last week's key.
+    list from the start (scalar = the 1-element case). Advisor **bounds the set**
+    (~4-8) as DoS hygiene (cap expensive verifies/wake), not a real-use limit; OR-verify
+    is safe since every key is one the session itself declared.
+  - **Update path = idempotent upsert on `pr_ref` (Advisor v1):** re-calling
+    `bind_wake` refreshes a live binding — no separate update command. Semantics:
+    absent `pr_ref` → create; present **and caller's session == owner** → refresh
+    `trust_keys` + renew TTL (this is rotation: `bind_wake(pr_ref,[old,new])` then
+    later `[new]`); present **and caller != owner** → **REJECT (unauthorized)**.
+    `session_id`/`workspace` are **not** mutable via upsert (only `trust_keys` + TTL),
+    preserving the bind-runs-AS-caller ownership property. So `share_tool` refreshes a
+    week-old binding's key by just re-calling `bind_wake` — no migration.
+  - **v1 error/outcome modes** (Advisor pins verbatim at PR 2): `unknown-pr_ref` (at
+    wake), `unauthorized-caller` (upsert by non-owner), `TTL-expired`, `malformed-key`,
+    `bad-signature`, `too-many-keys`.
   - **Pass it UNCONDITIONALLY** on every `bind_wake`. It's API-optional (a pure
     single-tenant mTLS daemon doesn't need it), but passing it always makes the
     binding **mode-agnostic** — wakeable whether the daemon turns out A or B — so
