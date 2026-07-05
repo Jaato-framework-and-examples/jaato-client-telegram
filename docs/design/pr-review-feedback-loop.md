@@ -106,6 +106,25 @@ reverse proxy — a *TLS-terminating* proxy (Caddy/nginx-http/Cloudflare Tunnel)
 proxy) → mode A, zero new code. Operators who must front it with a terminating proxy
 need mode B. See the delivery-tier decision for Daniel below.
 
+**Trust anchor is SESSION-scoped, NOT daemon-global (Daniel, 2026-07-05).** The
+store's verify key (mode B pubkey / mode A store CA) must NOT be a daemon-level
+`RouteConfig` field: a daemon hosts many sessions/tenants, and a daemon-global
+"trust store X" would let store X's key wake *any* session on the box — a
+cross-tenant authorization leak. Being wakeable-by-store-X is the **session's**
+opt-in, not the operator's. Security asymmetry that makes this safe (and different
+from sandbox root): **sandbox root = server-owned, never caller-supplied**
+(caller-supplied = confinement escape); **wake-trust = session-owned, caller-supplied
+IS fine** — a session declaring its trust key can only make *itself* wakeable, zero
+cross-session blast radius. Practical consequence: **no daemon-operator provisioning,
+no daemon-global config.** The bot already trusts its store, so it supplies the store
+key as part of its own session opt-in — most cleanly **stored on the
+`WakeBindingRegistry` entry at `bind_wake` time** (which already runs *as* that
+session and captures `session_id` + `workspace_path`). The shim verifies:
+`pr_ref → binding → verify signature against THAT binding's declared key` — keyed by
+the target session's own trust, after resolution, never a route-global pubkey. This
+also dissolves the "how does the daemon learn the key" provisioning question — the
+session brings it.
+
 **Build staging:**
 - **PR #516 (UP, contract finalized 885be89b; awaits Daniel review + Copilot pass)**
   — core primitive: `session.wake` + `session_id→workspace` index + untrusted-wrap
