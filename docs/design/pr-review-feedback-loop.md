@@ -215,9 +215,9 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
   (GitHub→agent-subscribed events — route-global by nature, a different use case).
 
 **Build staging:**
-- **PR #516 (UP, contract finalized 885be89b; awaits Daniel review + Copilot pass)**
-  — core primitive: `session.wake` + `session_id→workspace` index + untrusted-wrap
-  + `event_id` dedup. (jaato repo.) **Locked shim contract:**
+- **PR #516 (MERGED — squash `cc5f1cdb` on `main`, 2026-07-05)** — core primitive:
+  `session.wake` + `session_id→workspace` index + untrusted-wrap + `event_id` dedup.
+  (jaato repo.) The gate the client half was parked on is **cleared.** **Locked shim contract:**
   `session.wake(session_id, text, source, event_id) → (WakeOutcome, detail)` with
   `WakeOutcome ∈ {OK, DUPLICATE, INVALID, UNRESOLVED, REVIVE_FAILED, NOT_DRIVABLE}`
   + `.is_success` (OK|DUPLICATE). The shim maps enum→HTTP with no prose matching:
