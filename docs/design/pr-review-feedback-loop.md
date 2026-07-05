@@ -99,6 +99,17 @@ Rejected (a) (per-daemon HMAC in the relay — secret sprawl) and naive-(b)
   client calls on PR merge/close. TTL is the safety net for the forgotten case; the
   client does not carry sole responsibility.
 
+**Framing: the daemon is a switchboard, not an actor (Daniel, 2026-07-05).** The wake
+BINDING is entirely per-session semantics — the session (callee) declares *"call me
+here, trusting key K, to wake me about this matter."* The daemon only **persists +
+routes + revives** (it must, because it's the always-up tier that survives session
+unload — the runner-bound listener died on unload; that's why we went daemon-tier at
+all). It authors nothing. Clean ownership split to hold onto:
+**workspace/sandbox root = SERVER-owned** (never caller-supplied — sandbox escape) —
+that's the one thing line-35's `session_id→workspace` index legitimately owns;
+**`wake_ref` + `trust_keys` = SESSION-owned** (declared by the callee, a contract with
+its caller). Different owners, each correct for its reason.
+
 **`wake_ref` form (Daniel, 2026-07-05) — general, NOT PR-specific.** A wake can come
 from *any* external player (cron, monitor, peer agent, a build hook), so the binding
 key is a general **wake reference**, renamed from `pr_ref`. Its form:
@@ -109,16 +120,19 @@ key is a general **wake reference**, renamed from `pr_ref`. Its form:
   `github-pr:owner/repo#42`, `cron:daily-digest`, `monitor:alert-9931`,
   `peer:advisor:build-done`. Prevents cross-source collisions; the registry treats
   the whole string as one opaque key.
-- **Caller-chosen OR daemon-minted** — `bind_wake(trust_keys, wake_ref=None)`: use
-  the caller's string if given (best when naturally derivable — GitHub's relay
-  reconstructs it from the webhook payload, so **nothing is minted/embedded in the
-  PR**), else the daemon mints a unique unguessable handle (best when there's no
-  natural id). **`bind_wake` RETURNS the effective `wake_ref`** (given-or-minted) —
-  that's the value the waker keys on; for a minted ref, `share_tool` forwards the
-  returned handle to its waker. (Unguessable minted refs are also what defeat
-  deliberate squat-DoS; guessable caller-chosen refs like GitHub's stay
-  squat-*deniable* only — acceptable + detectable, since a squatted bind rejects the
-  legit binder's `bind_wake` as a visible `unauthorized-caller` signal.)
+- **ALWAYS session-chosen — the daemon never mints (Daniel, 2026-07-05).** The
+  `wake_ref` is the **callee's** to define: the session says *"call me here to wake me
+  about this matter."* It is a contract between callee and caller (the session tells
+  its waker the ref out-of-band, or the caller derives it from public data — GitHub's
+  relay reconstructs it from the webhook payload, so nothing is embedded in the PR).
+  The daemon is a **switchboard**, not an author: it records + routes what the session
+  declared. If a session wants an *unguessable* ref (to defeat squat-DoS), **the
+  session generates a random string itself** (a UUID it invents) — it never needs the
+  daemon to mint one. So `bind_wake(wake_ref, trust_keys)` with `wake_ref` **always
+  supplied**; no `wake_ref=None → daemon-mints` branch. (Guessable caller-chosen refs
+  like GitHub's stay squat-*deniable* only — acceptable + detectable, since a squatted
+  bind rejects the legit binder's `bind_wake` as a visible `unauthorized-caller`
+  signal; a session wanting more picks a random ref.)
 - **Squat = denial, not hijack** — because the ref is routing and `trust_keys` is
   auth, a rogue pre-binding of someone's ref makes a legit wake verify against the
   *squatter's* key → `bad-signature` → refused. The attacker can't receive the wake
