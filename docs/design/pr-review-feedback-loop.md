@@ -187,6 +187,21 @@ targets. Therefore:
   the crypto dep isn't "topology-robustness," it's the only mechanism that can
   express per-session trust. **That is the real "why B."**
 
+**A/B RESOLVED — B-only from v1 (Daniel, 2026-07-05).** No mTLS fast-path; PR 2 is
+signature-in-body only. One auth model, not two, and multi-tenant-correct from the
+start. The crypto-dep cost that balanced against A is **moot**: `cryptography` (49.0.0,
+Ed25519 + RSA) is *already* in every jaato-server install (transitive via google-auth /
+pyspnego), so mode B is a new *import*, not a new *install* — the "ends stdlib-only"
+worry doesn't bite. Consequence: the relay **always signs**; there is no client-cert
+path and nothing to gate on daemon tenancy.
+- **Store keypair, two halves:** the **private** key lives with the **relay** (store-repo
+  Action secret) and signs each forwarded wake; the **public** key is what `share_tool`
+  passes in `trust_keys` at bind time (session-declared, per-binding). **Ed25519** is the
+  default (`store_pubkey` = an Ed25519 `SubjectPublicKeyInfo` PEM; RSA also verifies).
+- **Rotation** uses the banked `trust_keys` set: during overlap the relay signs with old
+  OR new, the binding carries `[old_pub, new_pub]`, Stage-B OR-verifies; re-call
+  `bind_wake` to refresh.
+
 **Shim layering (Advisor) — the wake shim is its OWN ingress**, NOT #498's
 route-level modes (reusing them would muddy what `allow_unauthenticated` means):
 - **Stage A = transport HYGIENE only** — IP allowlist, rate limit, body-size, TLS
