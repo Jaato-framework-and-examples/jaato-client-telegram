@@ -217,6 +217,14 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
         )
     )
 
+    # Start the review-wake observer (a persistent cascade observer that re-attaches
+    # + renders a daemon-woken cold session so the model can act on a PR review).
+    # None when unconfigured (no per-bot cid / no session store).
+    wake_observer = dp["wake_observer"]
+    if wake_observer is not None:
+        wake_observer.start()
+        log.info("Review-wake observer started")
+
     # Shutdown handler
     shutdown_event = asyncio.Event()
 
@@ -282,6 +290,10 @@ async def run(config_path: str | None, whitelist_path: str | None = None) -> Non
             await cleanup_task
         except asyncio.CancelledError:
             pass
+
+        # Stop the review-wake observer connection.
+        if wake_observer is not None:
+            await wake_observer.stop()
 
         # Stop the per-chat pump actors before disconnecting clients.
         await pump.shutdown()

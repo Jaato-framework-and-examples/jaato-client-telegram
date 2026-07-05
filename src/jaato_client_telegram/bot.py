@@ -29,6 +29,7 @@ from jaato_client_telegram.outbound_rate_limiter import OutboundRateLimiter
 from jaato_client_telegram.permissions import PermissionHandler
 from jaato_client_telegram.rate_limiter import RateLimiter
 from jaato_client_telegram.renderer import ResponseRenderer
+from jaato_client_telegram.wake_observer import WakeObserver
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.telemetry import TelemetryCollector
 from jaato_client_telegram.whitelist import WhitelistManager
@@ -120,6 +121,17 @@ def create_bot_and_dispatcher(
     # Let host tools reach the pump's wake() via ctx.wake (raise an event turn
     # that resumes an idle session, e.g. a reminder firing).
     pool.set_pump(pump)
+    # Review-wake render/act layer (docs/design/pr-review-feedback-loop.md): a
+    # persistent cascade observer so the daemon can wake one of this bot's COLD
+    # sessions (a reviewer commented on its store PR) → the bot re-attaches + renders
+    # the driven turn so the model can act (share_tool) with the bot present. Only
+    # when the pool has a per-bot cid (needs session_store_path — cross-restart wake
+    # needs persistent sessions). Started in __main__ once the loop runs; stopped on
+    # shutdown.
+    wake_observer = (
+        WakeObserver(pool._make_client, pool.bot_cid, pool, pump)
+        if pool.bot_cid else None
+    )
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications
 
     # Create rate limiter if enabled
@@ -162,6 +174,7 @@ def create_bot_and_dispatcher(
     dp["pool"] = pool
     dp["renderer"] = renderer
     dp["pump"] = pump
+    dp["wake_observer"] = wake_observer
     dp["whitelist"] = whitelist
     dp["permission_handler"] = permission_handler
     dp["clarification_handler"] = clarification_handler
