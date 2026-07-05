@@ -219,6 +219,19 @@ collect(){ info "Configuration"
     STORE_TOK=$(ask_secret "GitHub token (classic PAT, public_repo) — blank to skip")
   fi
 
+  # Optional: the daemon's PUBLIC wake URL so a maintainer's review on a shared-tool
+  # PR wakes the bot to address it (docs/design/pr-review-feedback-loop.md). Needs the
+  # daemon reachable from GitHub (public bind + the Ed25519 signature gate). Blank =
+  # ingress off. Non-interactive: from env. A blank on a redeploy leaves any existing
+  # wake.json untouched (so re-running without re-entering it won't disable the ingress).
+  WAKE_URL="${JAATO_WAKE_PUBLIC_URL:-}"
+  if [ -z "$WAKE_URL" ] && [ "$noninteractive" != "1" ]; then
+    printf '\n  %sReview-wake ingress (optional)%s — lets a review on a shared-tool PR\n' "${C_B:-}" "${C_0:-}"
+    printf '  wake the bot to address it. Needs a PUBLIC url the GitHub relay can POST\n'
+    printf '  to (this daemon, public bind, signature-gated).\n'
+    WAKE_URL=$(ask "Public wake URL (e.g. http://<this-host-ip>:9110/wake) — blank to skip" "")
+  fi
+
   WS_TOKEN=$("$PYV" -c 'import secrets;print(secrets.token_urlsafe(32))')
 }
 
@@ -395,11 +408,15 @@ YAML
 # (session-declared at bind_wake), so nothing is configured here. Empty
 # JAATO_WAKE_PUBLIC_URL => no wake.json => ingress stays disabled (the default).
 write_wake_json(){
-  local pub="${JAATO_WAKE_PUBLIC_URL:-}"
+  local pub="${WAKE_URL:-}"                   # from collect() (prompt or env)
   local port="${JAATO_WAKE_PORT:-9110}"
-  local wake_json="$HOME/.jaato/wake.json"   # daemon reads ~/.jaato/wake.json (Path.home())
+  local wake_json="$HOME/.jaato/wake.json"    # daemon reads ~/.jaato/wake.json (Path.home())
   if [ -z "$pub" ]; then
-    info "Review-wake ingress: JAATO_WAKE_PUBLIC_URL unset — ingress OFF (no wake.json)"
+    if [ -f "$wake_json" ]; then
+      info "Review-wake ingress: no URL given — keeping existing $wake_json unchanged"
+    else
+      info "Review-wake ingress: no URL given — ingress OFF (no wake.json)"
+    fi
     return 0
   fi
   info "Write wake ingress -> $wake_json (public bind 0.0.0.0:$port, signature-gated)"
