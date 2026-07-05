@@ -74,6 +74,38 @@ def resolve_host_ask(callback_data: str) -> bool:
     return False
 
 
+# ---- render-flush coordination (narration before an out-of-band tool prompt) ----
+# A host tool's ask_user()/ctx.ask() sends its prompt IMMEDIATELY via bot.send_message,
+# bypassing the renderer's throttled narration — so the prompt can reach Telegram before
+# the narration message even exists (prompt-before-narration). The renderer registers a
+# per-chat flush hook while it streams a turn; ask_user calls it before sending, so the
+# buffered narration lands FIRST. (The renderer's IN-STREAM permission path already
+# flushes; this closes the OUT-OF-BAND tool-prompt gap.)
+_FLUSH_HOOKS: "dict[int, Callable[[], Awaitable[None]]]" = {}
+
+
+def register_flush_hook(chat_id: int, hook: "Callable[[], Awaitable[None]]") -> None:
+    """Renderer: while streaming a chat's turn, register a coro that flushes its
+    pending narration. Overwrites any prior hook for the chat (last turn wins)."""
+    _FLUSH_HOOKS[chat_id] = hook
+
+
+def unregister_flush_hook(chat_id: int) -> None:
+    _FLUSH_HOOKS.pop(chat_id, None)
+
+
+async def flush_before_prompt(chat_id: int) -> None:
+    """Flush the chat's pending narration (if a renderer is streaming its turn) so an
+    out-of-band prompt sends AFTER it. No-op when nothing is registered."""
+    hook = _FLUSH_HOOKS.get(chat_id)
+    if hook is None:
+        return
+    try:
+        await hook()
+    except Exception:  # noqa: BLE001 — a flush fault must never block the prompt
+        logger.debug("flush_before_prompt failed for chat %d", chat_id, exc_info=True)
+
+
 async def ask_user(
     bot: Any, chat_id: int, text: str, options: list[str], timeout: float = 300.0,
 ) -> "str | None":
@@ -93,6 +125,9 @@ async def ask_user(
     fut: "asyncio.Future[int]" = asyncio.get_running_loop().create_future()
     _PENDING_ASKS[req_id] = fut
     try:
+        # Flush any pending narration FIRST so this prompt lands after it (the send
+        # otherwise races the renderer's throttled narration → prompt-before-narration).
+        await flush_before_prompt(chat_id)
         await bot.send_message(chat_id, text, reply_markup=kb)
         index = await asyncio.wait_for(fut, timeout=timeout)
         return options[index] if 0 <= index < len(options) else None
