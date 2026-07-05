@@ -121,6 +121,10 @@ def create_bot_and_dispatcher(
     # Let host tools reach the pump's wake() via ctx.wake (raise an event turn
     # that resumes an idle session, e.g. a reminder firing).
     pool.set_pump(pump)
+    # The renderer powers the pool's per-session wake watcher: it renders a
+    # daemon-driven wake turn (warm) / drive-on-reattach (cold) straight from the
+    # session's long-lived event stream. Without it, no wake watcher is started.
+    pool.set_renderer(renderer)
     # Review-wake render/act layer (docs/design/pr-review-feedback-loop.md): a
     # persistent cascade observer so the daemon can wake one of this bot's COLD
     # sessions (a reviewer commented on its store PR) → the bot re-attaches + renders
@@ -129,7 +133,7 @@ def create_bot_and_dispatcher(
     # needs persistent sessions). Started in __main__ once the loop runs; stopped on
     # shutdown.
     wake_observer = (
-        WakeObserver(pool._make_client, pool.bot_cid, pool, pump)
+        WakeObserver(pool._make_client, pool.bot_cid, pool)
         if pool.bot_cid else None
     )
     whitelist = WhitelistManager(whitelist_path, bot=bot)  # Pass bot for notifications

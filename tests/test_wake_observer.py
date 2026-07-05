@@ -1,5 +1,6 @@
-"""WakeObserver: routes SessionWokenEvent → chat re-attach, and registers as a
-cascade observer for the bot cid."""
+"""WakeObserver: on a cold SessionWokenEvent it RE-ATTACHES the mapped chat (which
+establishes the per-session wake watcher + triggers the daemon's deferred-turn drive
+— the watcher renders it). It registers as a cascade observer for the bot cid."""
 
 import asyncio
 from types import SimpleNamespace
@@ -11,31 +12,29 @@ from jaato_client_telegram.wake_observer import WakeObserver
 class _FakePool:
     def __init__(self, mapping):
         self._m = mapping
+        self.reattached: list[int] = []
 
     def chat_for_session(self, sid):
         return self._m.get(sid)
 
-
-class _FakePump:
-    def __init__(self):
-        self.rendered = []
-
-    def wake_render(self, chat_id):
-        self.rendered.append(chat_id)
+    async def get_or_create_session(self, chat_id):
+        self.reattached.append(chat_id)
+        return "sess"
 
 
-def test_on_woken_routes_to_chat_render():
-    pool = _FakePool({"s5": 5})
-    pump = _FakePump()
-    obs = WakeObserver(lambda: None, "bot-x", pool, pump)
+def test_on_woken_reattaches_mapped_chat():
+    async def run():
+        pool = _FakePool({"s5": 5})
+        obs = WakeObserver(lambda: None, "bot-x", pool)
 
-    obs._on_woken(SimpleNamespace(session_id="s5", wake_ref="github-pr:o/r#1",
-                                  source="github-pr"))
-    assert pump.rendered == [5]
-
-    obs._on_woken(SimpleNamespace(session_id="nope", wake_ref="", source=""))  # unknown
-    obs._on_woken(SimpleNamespace(session_id="", wake_ref="", source=""))      # empty
-    assert pump.rendered == [5]  # neither fired
+        obs._on_woken(SimpleNamespace(session_id="s5", wake_ref="github-pr:o/r#1",
+                                      source="github-pr"))
+        obs._on_woken(SimpleNamespace(session_id="nope", wake_ref="", source=""))  # unknown
+        obs._on_woken(SimpleNamespace(session_id="", wake_ref="", source=""))      # empty
+        # _on_woken schedules the re-attach via create_task — let those tasks run.
+        await asyncio.sleep(0.02)
+        assert pool.reattached == [5]  # only the known, non-empty session re-attached
+    asyncio.run(run())
 
 
 class _FakeClient:
@@ -64,7 +63,7 @@ def test_connect_registers_as_cascade_observer(monkeypatch):
 
     async def run():
         client = _FakeClient()
-        obs = WakeObserver(lambda: client, "bot-x", _FakePool({}), _FakePump())
+        obs = WakeObserver(lambda: client, "bot-x", _FakePool({}))
         await obs._connect_and_observe()
         from jaato_sdk.events import EventType
         assert EventType.SESSION_WOKEN in client.subscribed
