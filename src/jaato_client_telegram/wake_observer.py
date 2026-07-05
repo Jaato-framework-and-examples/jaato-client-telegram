@@ -82,8 +82,12 @@ class WakeObserver:
         logger.info("WakeObserver: observing cascade %s for SessionWokenEvent", self._cid)
         while not self._stopped and (client.is_connected or client.is_reconnecting):
             try:
+                # NOTE: cascade observers filter by the event CLASS NAME
+                # ("SessionWokenEvent"), NOT the EventType value ("session.woken").
+                # Registering the value silently drops the event at the cascade
+                # filter before it reaches our subscribe() handler.
                 await client.execute_command(
-                    "cascade.register", [self._cid, "observer", "session.woken"]
+                    "cascade.register", [self._cid, "observer", "SessionWokenEvent"]
                 )
             except Exception:  # noqa: BLE001 — transient; retry next cycle
                 logger.debug("WakeObserver: cascade.register failed", exc_info=True)

@@ -68,8 +68,10 @@ def test_connect_registers_as_cascade_observer(monkeypatch):
         await obs._connect_and_observe()
         from jaato_sdk.events import EventType
         assert EventType.SESSION_WOKEN in client.subscribed
+        # filter by the event CLASS NAME, not the EventType value (else the cascade
+        # tier drops it before our subscribe() handler)
         assert client.commands == [
-            ("cascade.register", ["bot-x", "observer", "session.woken"]),
+            ("cascade.register", ["bot-x", "observer", "SessionWokenEvent"]),
         ]
     asyncio.run(run())
 
