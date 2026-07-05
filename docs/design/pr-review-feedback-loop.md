@@ -543,6 +543,45 @@ So B stays the recommendation, with a firm requirement attached: **fail-closed H
 on the bot ingress + untrusted-content handling of the payload** — not optional
 hardening, it's the boundary the whole feature lives behind.
 
+## The render/act layer: waking a *detached* bot (Option 2, chosen 2026-07-05)
+
+Wake (server) is proven, but there's a client-side gap: a woken turn needs the
+**bot attached** to run host tools (`share_tool` executes *in the bot*) and to
+render — because host-tool dispatch (`tool.execute_request`) goes to the *attached*
+client. On a **cold/detached** session (the bot idle-detaches to free runners) the
+wake revives the session server-side, but the bot isn't attached, so the model can
+think but can't *act*. And a wake gives the bot no signal to re-attach.
+
+**Rejected — Option 1 (keep-warm):** don't idle-detach a wake-bound session. Client-
+only, ships fast, but holds a runner per open PR — an intermediary that gives up the
+cold-revive efficiency for those sessions. Daniel chose the final pattern instead.
+
+**Chosen — Option 2 (cascade-observer), the clean pattern:**
+- The bot creates its sessions with a **per-bot `cascade_driver_id`** — `session.new`
+  already accepts it (`command_router.py`), so **no server change** to make the bot's
+  standalone per-chat sessions observable.
+- The bot holds **one persistent cascade-observer connection**
+  (`cascade.register(cid, "observer", …)`, `command_router.py:651`) — a connected
+  client that receives the cascade's events *without attaching to any session*, so it
+  survives sessions going cold. **Scoped by CID**, so no cross-tenant visibility (the
+  problem raw daemon-broadcast would have had).
+- Server adds **one** new `SessionWokenEvent(session_id)`, emitted at the revive point
+  via the existing `_emit_to_session` path (the same tier `SessionTerminatedEvent`
+  already uses to reach cascade observers — `session_manager.py:3401`,
+  `runner_spawn.py:807`). It reaches the bot's observer even though it's detached.
+- On it, the bot **re-attaches that chat's session**; the daemon's **deferred-turn**
+  (revive → emit-to-observers → *await bounded re-attach* → **then** drive the turn)
+  ensures the turn runs only once the bot is present, so no host-tool dispatch fires
+  into the void.
+
+Split: **client** = per-bot CID + one observer connection + re-attach-on-woken;
+**server (Advisor)** = the `SessionWokenEvent` + deferred-turn. Small, self-contained,
+reuses existing cascade-observe + lifecycle-to-observers routing. **Pending Advisor
+pin** (before client wiring): `SessionWokenEvent` shape, deferred-turn timeout
+semantics (lean: persist + re-emit on next attach so a slow bot never loses a wake),
+per-bot-CID constraints + observer-reaping-on-teardown (a per-bot CID with continuous
+sessions never empties → safe).
+
 ## Remaining questions (decide before building)
 
 1. **Capability token** — format, where it lives in the PR (body marker vs a
