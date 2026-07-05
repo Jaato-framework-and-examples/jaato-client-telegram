@@ -40,7 +40,7 @@ def test_on_woken_reattaches_mapped_chat():
 class _FakeClient:
     def __init__(self):
         self.subscribed = []
-        self.commands = []
+        self.registrations = []
         self.is_connected = True
         self.is_reconnecting = False
 
@@ -50,8 +50,9 @@ class _FakeClient:
     def subscribe(self, event_type, cb):
         self.subscribed.append(event_type)
 
-    async def execute_command(self, cmd, args):
-        self.commands.append((cmd, args))
+    async def cascade_register(self, cid, role, event_types):
+        # record the CLASS NAMES the observer passed (the typed method derives them)
+        self.registrations.append((cid, role, [e.__name__ for e in event_types]))
         self.is_connected = False  # end the observe loop after one register
 
     async def disconnect(self):
@@ -67,10 +68,10 @@ def test_connect_registers_as_cascade_observer(monkeypatch):
         await obs._connect_and_observe()
         from jaato_sdk.events import EventType
         assert EventType.SESSION_WOKEN in client.subscribed
-        # filter by the event CLASS NAME, not the EventType value (else the cascade
-        # tier drops it before our subscribe() handler)
-        assert client.commands == [
-            ("cascade.register", ["bot-x", "observer", "SessionWokenEvent"]),
+        # cascade_register receives the event CLASS; it derives the class name (the
+        # cascade tier filters by class name, not the EventType value "session.woken")
+        assert client.registrations == [
+            ("bot-x", "observer", ["SessionWokenEvent"]),
         ]
     asyncio.run(run())
 

@@ -49,62 +49,60 @@ def test_ctx_unbind_wake_calls_unbind_fn_and_noops_without():
     asyncio.run(run())
 
 
-# ---- pool command (execute_command + WakeBindResult round-trip) ------------
+# ---- pool command (typed client.bind_wake/unbind_wake, jaato-sdk #525) ------
 
 class _FakeClient:
     def __init__(self, connected=True):
         self.is_connected = connected
         self.is_reconnecting = False
-        self.sent: list = []
-        self._cb = None
+        self.calls: list = []
 
-    def subscribe_once(self, event_type, cb):
-        self._cb = cb
-        return lambda: None
+    async def bind_wake(self, wake_ref, trust_keys):
+        self.calls.append(("bind", wake_ref, trust_keys))
+        # the typed method returns the daemon's WakeBindResultEvent (incl. the daemon-
+        # reported wake endpoint, which it knows from its own wake.json)
+        return SimpleNamespace(wake_ref=wake_ref, outcome="ok", expires_at=99.0,
+                               detail="bound", endpoint="https://daemon.example/wake")
 
-    async def execute_command(self, command, args):
-        self.sent.append((command, args))
-        # simulate the daemon replying with a WakeBindResultEvent (incl. the daemon-
-        # reported wake endpoint, which the daemon knows from its own wake.json)
-        self._cb(SimpleNamespace(
-            wake_ref=args[0], outcome="ok", expires_at=99.0, detail="bound",
-            endpoint="https://daemon.example/wake"))
+    async def unbind_wake(self, wake_ref):
+        self.calls.append(("unbind", wake_ref))
+        return SimpleNamespace(wake_ref=wake_ref, outcome="ok", expires_at=0.0,
+                               detail="unbound", endpoint="")
 
 
-def test_wake_binding_command_sends_and_returns_result():
+def test_wake_binding_calls_typed_method_and_returns_result():
     async def run():
         fc = _FakeClient()
         me = SimpleNamespace(_sessions={7: SimpleNamespace(client=fc)})
-        r = await SessionPool._wake_binding_command(
-            me, 7, "session.bind_wake", ["github-pr:o/r#1", "PEM"], "github-pr:o/r#1")
+        r = await SessionPool._wake_binding(me, 7, "github-pr:o/r#1", ["PEM"])
         assert r == {"outcome": "ok", "expires_at": 99.0, "detail": "bound",
                      "endpoint": "https://daemon.example/wake"}
-        assert fc.sent == [("session.bind_wake", ["github-pr:o/r#1", "PEM"])]
+        assert fc.calls == [("bind", "github-pr:o/r#1", ["PEM"])]
     asyncio.run(run())
 
 
-def test_wake_binding_command_no_live_session():
+def test_wake_binding_no_live_session():
     async def run():
         me = SimpleNamespace(_sessions={})
-        r = await SessionPool._wake_binding_command(me, 7, "session.bind_wake", ["r"], "r")
+        r = await SessionPool._wake_binding(me, 7, "r", ["k"])
         assert r["outcome"] == "no_session"
     asyncio.run(run())
 
 
-def test_bind_unbind_wrappers_format_args():
+def test_bind_unbind_wrappers_dispatch_to_binding():
     async def run():
         seen = []
 
-        async def fake_core(chat_id, command, args, wake_ref):
-            seen.append((command, args, wake_ref))
+        async def fake_binding(chat_id, wake_ref, trust_keys):
+            seen.append((chat_id, wake_ref, trust_keys))
             return {"outcome": "ok"}
 
-        me = SimpleNamespace(_wake_binding_command=fake_core)
+        me = SimpleNamespace(_wake_binding=fake_binding)
         await SessionPool.bind_wake_command(me, 7, "ref", ["k1", "k2"])
         await SessionPool.unbind_wake_command(me, 7, "ref")
         assert seen == [
-            ("session.bind_wake", ["ref", "k1", "k2"], "ref"),
-            ("session.unbind_wake", ["ref"], "ref"),
+            (7, "ref", ["k1", "k2"]),   # bind → trust_keys passed through
+            (7, "ref", None),           # unbind → None (dispatches to client.unbind_wake)
         ]
     asyncio.run(run())
 

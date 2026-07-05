@@ -26,7 +26,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
-from jaato_sdk.events import EventType
+from jaato_sdk.events import EventType, SessionWokenEvent
 
 if TYPE_CHECKING:
     from jaato_client_telegram.session_pool import SessionPool
@@ -79,13 +79,11 @@ class WakeObserver:
         logger.info("WakeObserver: observing cascade %s for SessionWokenEvent", self._cid)
         while not self._stopped and (client.is_connected or client.is_reconnecting):
             try:
-                # NOTE: cascade observers filter by the event CLASS NAME
-                # ("SessionWokenEvent"), NOT the EventType value ("session.woken").
-                # Registering the value silently drops the event at the cascade
-                # filter before it reaches our subscribe() handler.
-                await client.execute_command(
-                    "cascade.register", [self._cid, "observer", "SessionWokenEvent"]
-                )
+                # cascade_register takes the event CLASS and derives type().__name__
+                # internally (cascade observers filter by class name, NOT the EventType
+                # value "session.woken") — passing the class removes the wrong-string
+                # footgun the old execute_command("cascade.register", …) had.
+                await client.cascade_register(self._cid, "observer", [SessionWokenEvent])
             except Exception:  # noqa: BLE001 — transient; retry next cycle
                 logger.debug("WakeObserver: cascade.register failed", exc_info=True)
             await asyncio.sleep(_REREGISTER_INTERVAL)
