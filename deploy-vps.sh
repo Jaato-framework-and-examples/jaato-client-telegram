@@ -385,6 +385,41 @@ session:
 YAML
 }
 
+# ── 7b. Review-wake ingress (opt-in) ─────────────────────────────────────────
+# The daemon's HTTP wake ingress that the store's review-relay POSTs to, so a
+# reviewer comment on a shared-tool PR wakes the bot to address it
+# (docs/design/pr-review-feedback-loop.md). OPT-IN: only when the operator declares
+# the PUBLIC url the GitHub relay must reach. Public bind + the daemon's Stage-B
+# Ed25519 signature gate (a bad/missing signature is 401) + rate-limit — exposure is
+# safe, the same posture as any signed webhook; the trust key is per-binding
+# (session-declared at bind_wake), so nothing is configured here. Empty
+# JAATO_WAKE_PUBLIC_URL => no wake.json => ingress stays disabled (the default).
+write_wake_json(){
+  local pub="${JAATO_WAKE_PUBLIC_URL:-}"
+  local port="${JAATO_WAKE_PORT:-9110}"
+  local wake_json="$HOME/.jaato/wake.json"   # daemon reads ~/.jaato/wake.json (Path.home())
+  if [ -z "$pub" ]; then
+    info "Review-wake ingress: JAATO_WAKE_PUBLIC_URL unset — ingress OFF (no wake.json)"
+    return 0
+  fi
+  info "Write wake ingress -> $wake_json (public bind 0.0.0.0:$port, signature-gated)"
+  mkdir -p "$HOME/.jaato"
+  cat > "$wake_json" <<JSON
+{
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": $port,
+  "path": "/wake",
+  "public_url": "$pub",
+  "rate_limit_per_second": 5,
+  "replay_window_seconds": 300
+}
+JSON
+  chmod 600 "$wake_json"
+  if have ufw; then ufw allow "$port"/tcp >/dev/null 2>&1 && info "  ufw: allowed $port/tcp (wake ingress)" || true; fi
+  printf '  public_url=%s  bind=0.0.0.0:%s\n' "$pub" "$port"
+}
+
 # ── 8. systemd units (server + bot) — system-wide as root, else --user ───────
 install_units(){ info "Install systemd units ($SYSTEMD_MODE mode)"
   mkdir -p "$UNIT_DIR"
@@ -496,7 +531,7 @@ main(){
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
-  preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config
+  preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
   install_units; start_and_check
   printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
 }
