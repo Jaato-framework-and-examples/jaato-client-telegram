@@ -108,7 +108,10 @@ all). It authors nothing. Clean ownership split to hold onto:
 **workspace/sandbox root = SERVER-owned** (never caller-supplied — sandbox escape) —
 that's the one thing line-35's `session_id→workspace` index legitimately owns;
 **`wake_ref` + `trust_keys` = SESSION-owned** (declared by the callee, a contract with
-its caller). Different owners, each correct for its reason.
+its caller). Different owners, each correct for its reason. The load-bearing invariant
+(Advisor's phrasing): **the daemon owns what protects the session FROM the caller
+(sandbox); the session owns what invites the caller IN (`wake_ref` + `trust_keys`);
+nothing crosses.** Daemon = mechanism, session = policy — no leak either direction.
 
 **`wake_ref` form (Daniel, 2026-07-05) — general, NOT PR-specific.** A wake can come
 from *any* external player (cron, monitor, peer agent, a build hook), so the binding
