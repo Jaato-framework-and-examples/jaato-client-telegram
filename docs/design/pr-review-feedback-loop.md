@@ -184,6 +184,17 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     avoid; the binding must be self-contained) and **not a fingerprint** (can't
     verify a signature, only identify a key). So a new bot-config knob **`store_pubkey`
     (PEM text) alongside `JAATO_TOOLSTORE_GH_TOKEN`**.
+  - **Trust is a SET per binding, not a scalar (Daniel, 2026-07-05):**
+    `bind_wake(pr_ref, trust_keys: list[PEM])`, Stage-B verifies against **any** key
+    in the binding's set. Two motivations: (i) **multi-source is already handled by
+    per-binding trust** — a session with PRs across the public + a corporate store
+    just makes bindings with different keys; each key is least-privilege-scoped to its
+    own PRs (a global session keyring would be strictly *weaker*, so do NOT add one);
+    (ii) the real same-binding multi-key need is **key rotation** — during an overlap
+    window both old + new keys must verify, which a scalar can't express. Make it a
+    list from the start (scalar = the 1-element case). **Rotation also needs a
+    re-bind / update-key path** on the registry (add new → overlap → drop old) — a
+    PR-2 mechanic, since a PR bound last week still carries last week's key.
   - **Pass it UNCONDITIONALLY** on every `bind_wake`. It's API-optional (a pure
     single-tenant mTLS daemon doesn't need it), but passing it always makes the
     binding **mode-agnostic** — wakeable whether the daemon turns out A or B — so
