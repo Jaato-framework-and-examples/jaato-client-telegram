@@ -112,8 +112,13 @@ key is a general **wake reference**, renamed from `pr_ref`. Its form:
 - **Caller-chosen OR daemon-minted** — `bind_wake(trust_keys, wake_ref=None)`: use
   the caller's string if given (best when naturally derivable — GitHub's relay
   reconstructs it from the webhook payload, so **nothing is minted/embedded in the
-  PR**), else the daemon mints a unique opaque handle the session forwards to its
-  waker (best when there's no natural id).
+  PR**), else the daemon mints a unique unguessable handle (best when there's no
+  natural id). **`bind_wake` RETURNS the effective `wake_ref`** (given-or-minted) —
+  that's the value the waker keys on; for a minted ref, `share_tool` forwards the
+  returned handle to its waker. (Unguessable minted refs are also what defeat
+  deliberate squat-DoS; guessable caller-chosen refs like GitHub's stay
+  squat-*deniable* only — acceptable + detectable, since a squatted bind rejects the
+  legit binder's `bind_wake` as a visible `unauthorized-caller` signal.)
 - **Squat = denial, not hijack** — because the ref is routing and `trust_keys` is
   auth, a rogue pre-binding of someone's ref makes a legit wake verify against the
   *squatter's* key → `bad-signature` → refused. The attacker can't receive the wake
@@ -228,7 +233,7 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     preserving the bind-runs-AS-caller ownership property. So `share_tool` refreshes a
     week-old binding's key by just re-calling `bind_wake` — no migration.
   - **v1 error/outcome modes** (Advisor pins verbatim at PR 2): `unknown-wake_ref` (at
-    wake), `unauthorized-caller` (upsert by non-owner), `TTL-expired`, `malformed-key`,
+    wake), `unauthorized-caller` (upsert by non-owner / squat-collision), `TTL-expired`, `malformed-key`,
     `bad-signature`, `too-many-keys`.
   - **Pass it UNCONDITIONALLY** on every `bind_wake`. It's API-optional (a pure
     single-tenant mTLS daemon doesn't need it), but passing it always makes the
