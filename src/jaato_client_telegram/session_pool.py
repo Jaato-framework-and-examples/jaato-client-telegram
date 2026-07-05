@@ -233,6 +233,54 @@ class SessionPool:
         finally:
             unsub()
 
+    async def bind_wake_command(
+        self, chat_id: int, wake_ref: str, trust_keys: list,
+    ) -> dict:
+        """Register a wake binding (``session.bind_wake``) for this chat's session
+        and await the ``WakeBindResultEvent``. Owner-guarded upsert on the daemon:
+        binds ``wake_ref`` -> THIS session with ``trust_keys`` (PEM public keys), so
+        an external signer can later wake the session by presenting ``wake_ref`` + a
+        signature. Returns ``{outcome, expires_at, detail}``. Backs
+        ``ToolContext.bind_wake``."""
+        return await self._wake_binding_command(
+            chat_id, "session.bind_wake", [wake_ref, *trust_keys], wake_ref)
+
+    async def unbind_wake_command(self, chat_id: int, wake_ref: str) -> dict:
+        """Remove a wake binding (``session.unbind_wake``, owner-guarded). Backs
+        ``ToolContext.unbind_wake``."""
+        return await self._wake_binding_command(
+            chat_id, "session.unbind_wake", [wake_ref], wake_ref)
+
+    async def _wake_binding_command(
+        self, chat_id: int, command: str, args: list, wake_ref: str,
+    ) -> dict:
+        meta = self._sessions.get(chat_id)
+        if meta is None or not (meta.client.is_connected or meta.client.is_reconnecting):
+            return {"outcome": "no_session", "detail": "no live session for this chat"}
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _on_result(event) -> None:
+            # Per-chat turns are serialized (ChatPump), so at most one wake-binding
+            # command is in flight — take the first WAKE_BIND_RESULT.
+            if not future.done():
+                future.set_result(event)
+
+        unsub = meta.client.subscribe_once(EventType.WAKE_BIND_RESULT, _on_result)
+        try:
+            await meta.client.execute_command(command, args)
+            event = await asyncio.wait_for(future, timeout=15.0)
+        except asyncio.TimeoutError:
+            return {"outcome": "timeout",
+                    "detail": f"no WakeBindResult for {wake_ref!r} in time"}
+        finally:
+            unsub()
+        return {
+            "outcome": getattr(event, "outcome", "") or "",
+            "expires_at": getattr(event, "expires_at", 0.0),
+            "detail": getattr(event, "detail", "") or "",
+        }
+
     async def get_or_create_session(self, chat_id: int) -> str:
         async with self._lock:
             if chat_id in self._sessions:
@@ -396,6 +444,8 @@ class SessionPool:
                         t["execute"], tbot, chat_id,
                         wake=wake, workspace=self._ws_config.workspace,
                         host_tools_dir=str(htd) if htd is not None else "",
+                        bind_fn=self.bind_wake_command,
+                        unbind_fn=self.unbind_wake_command,
                     ),
                 })
         return tools

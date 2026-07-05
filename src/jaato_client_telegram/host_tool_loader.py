@@ -118,6 +118,11 @@ class ToolContext:
     # A tool that reads installed tool source (e.g. share_tool contributing one to
     # the store) reads from here.
     host_tools_dir: str = ""
+    # Injected by the bot: register / deregister a wake BINDING for THIS session over
+    # the live WS (session.bind_wake / unbind_wake). None when unavailable —
+    # ctx.bind_wake()/unbind_wake() then return outcome="disabled".
+    bind_fn: "Callable[[int, str, list], Awaitable[dict]] | None" = None
+    unbind_fn: "Callable[[int, str], Awaitable[dict]] | None" = None
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -138,6 +143,28 @@ class ToolContext:
         if self.wake_fn is None:
             return
         self.wake_fn(self.chat_id, text)
+
+    async def bind_wake(self, wake_ref: str, trust_keys: list) -> dict:
+        """Register a wake BINDING for this session: an external signer holding the
+        private half of a key whose PUBLIC half is in ``trust_keys`` (PEM) can later
+        wake this session by POSTing ``wake_ref`` + a signature to the daemon's wake
+        ingress. ``wake_ref`` is YOURS to choose — a routing handle you share with
+        your caller (e.g. ``"github-pr:owner/repo#42"``). Owner-guarded upsert:
+        re-call to refresh the key set (rotation). Returns ``{outcome, expires_at,
+        detail}`` — ``outcome`` ∈ ``ok`` / ``unauthorized`` / ``malformed_key`` /
+        ``too_many_keys`` / ``no_keys`` / ``no_session``. Returns
+        ``outcome="disabled"`` if the bot didn't wire wake binding."""
+        if self.bind_fn is None:
+            return {"outcome": "disabled", "detail": "wake binding not wired"}
+        return await self.bind_fn(self.chat_id, wake_ref, list(trust_keys))
+
+    async def unbind_wake(self, wake_ref: str) -> dict:
+        """Remove a wake binding you created (owner-guarded). Call when the matter
+        ends (e.g. your PR merged/closed). The daemon's TTL also expires a forgotten
+        binding. Returns ``{outcome, detail}`` (same disabled/no_session semantics)."""
+        if self.unbind_fn is None:
+            return {"outcome": "disabled", "detail": "wake binding not wired"}
+        return await self.unbind_fn(self.chat_id, wake_ref)
 
 
 def validate_name(name: str) -> None:
@@ -210,11 +237,14 @@ def make_executor(
     wake: "Callable[[int, str], None] | None" = None,
     workspace: str = "",
     host_tools_dir: str = "",
+    bind_fn: "Callable[[int, str, list], Awaitable[dict]] | None" = None,
+    unbind_fn: "Callable[[int, str], Awaitable[dict]] | None" = None,
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
     ctx = ToolContext(
         bot=bot, chat_id=chat_id, wake_fn=wake,
         workspace=workspace, host_tools_dir=host_tools_dir,
+        bind_fn=bind_fn, unbind_fn=unbind_fn,
     )
 
     async def executor(args: dict) -> dict:
