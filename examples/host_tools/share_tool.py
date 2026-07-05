@@ -47,6 +47,37 @@ def _token() -> str:
     return os.environ.get("JAATO_TOOLSTORE_GH_TOKEN", "")
 
 
+def _wake_config() -> "tuple[str, str]":
+    """(store PUBLIC signing key PEM, this bot's public wake-endpoint URL) from the
+    env. Both empty ⇒ review-wake binding is OFF — no default, empty = disabled."""
+    return (os.environ.get("JAATO_TOOLSTORE_WAKE_PUBKEY", ""),
+            os.environ.get("JAATO_WAKE_PUBLIC_ENDPOINT", ""))
+
+
+def _wake_ref(pr_number: int) -> str:
+    """Opaque routing handle for this PR — the store's review-relay reconstructs the
+    same string from the webhook payload (owner/repo/number). Session-chosen."""
+    return f"github-pr:{_OWNER}/{_REPO}#{pr_number}"
+
+
+async def _maybe_bind_wake(ctx, pr_number: int) -> str:
+    """Upsert a wake binding so a REVIEW on this PR can wake the session to address
+    it (session-scoped trust: we declare the store's PUBLIC key). OFF unless the
+    store pubkey + this bot's public wake endpoint are configured AND the host wired
+    ``ctx.bind_wake``. Returns a short note to append to the result message."""
+    pubkey, endpoint = _wake_config()
+    binder = getattr(ctx, "bind_wake", None)
+    if not (pubkey and endpoint) or binder is None:
+        return ""
+    res = await binder(_wake_ref(pr_number), [pubkey]) or {}
+    outcome = res.get("outcome", "")
+    if outcome == "ok":
+        return "\n\nReview comments on this PR will wake me to address them automatically."
+    if outcome == "disabled":
+        return ""
+    return f"\n\n(Couldn't arm review-wake for this PR: {outcome}.)"
+
+
 def _gh(method: str, path: str, token: str, body=None):
     """One GitHub REST call. Returns (status, json). Never raises on HTTP error."""
     url = path if path.startswith("http") else f"{_API}{path}"
@@ -157,11 +188,13 @@ async def execute(args: dict, ctx) -> dict:
     if st not in (200, 201):
         return {"error": f"Couldn't commit the tool to your fork ({st})."}
 
-    # A PR already existed → the commit above updated it. Report that (no new PR).
+    # A PR already existed → the commit above updated it. Refresh its wake binding
+    # (rotation/TTL renewal) and report (no new PR).
     if existing:
+        wake_note = await _maybe_bind_wake(ctx, existing["number"])
         return {"result": (
             f"Updated your existing pull request for '{name}' with the latest code:\n"
-            f"{existing['html_url']}\nThe maintainer will see the new commit."
+            f"{existing['html_url']}\nThe maintainer will see the new commit." + wake_note
         )}
 
     note = (args.get("note") or "").strip()
@@ -172,6 +205,13 @@ async def execute(args: dict, ctx) -> dict:
         f"\n\n_Contributed by @{owner} via a jaato Telegram bot. Model-authored — "
         f"please review the code before merging; the registry regenerates on merge._"
     )
+    # Non-secret routing marker so the store's review-relay knows which daemon to
+    # POST a wake to (the wake_ref it derives from the PR event itself). Embedded at
+    # creation; only when review-wake is configured. The endpoint is gated by the
+    # daemon's signature verify, so exposing the URL is safe.
+    pubkey, endpoint = _wake_config()
+    if pubkey and endpoint:
+        body += f"\n\n<!-- jaato-wake endpoint={endpoint} -->"
     st, pr = _gh("POST", f"/repos/{_OWNER}/{_REPO}/pulls", token, {
         "title": f"Add tool: {name}",
         "head": f"{owner}:{branch}",
@@ -180,9 +220,11 @@ async def execute(args: dict, ctx) -> dict:
         "maintainer_can_modify": True,
     })
     if st == 201 and pr.get("html_url"):
+        wake_note = await _maybe_bind_wake(ctx, pr["number"])
         return {"result": (
             f"Opened a pull request to contribute '{name}':\n{pr['html_url']}\n"
             f"A maintainer reviews the code and merges — then everyone can install it."
+            + wake_note
         )}
     if st == 422:
         # A PR already exists for this head branch — but we just committed the new
@@ -193,10 +235,11 @@ async def execute(args: dict, ctx) -> dict:
             "GET", f"/repos/{_OWNER}/{_REPO}/pulls?head={owner}:{branch}&state=open", token,
         )
         if st2 == 200 and isinstance(prs, list) and prs:
+            wake_note = await _maybe_bind_wake(ctx, prs[0]["number"])
             return {"result": (
                 f"Updated the existing pull request for '{name}' with your latest "
                 f"changes:\n{prs[0]['html_url']}\n"
-                f"The maintainer will see the new commit."
+                f"The maintainer will see the new commit." + wake_note
             )}
         return {"result": (
             f"Pushed your changes to the '{name}' branch — a pull request already "

@@ -40,7 +40,7 @@ def _fake_gh(calls):
         if method == "GET" and "/pulls?head=" in path:
             return 200, []  # no existing open PR for this head
         if method == "POST" and path.endswith("/pulls"):
-            return 201, {"html_url": "https://github.com/x/pull/1"}
+            return 201, {"html_url": "https://github.com/x/pull/1", "number": 1}
         return 500, {"message": f"unexpected {method} {path}"}
     return gh
 
@@ -156,6 +156,56 @@ def test_share_unsafe_name(tmp_path):
     g["_token"] = lambda: "tok"
     r = asyncio.run(g["execute"]({"name": "../evil"}, _ctx(tmp_path)))
     assert "error" in r and "Invalid" in r["error"]
+
+
+def test_share_arms_review_wake_when_configured(tmp_path, monkeypatch):
+    """With the store pubkey + a public wake endpoint set and ctx.bind_wake wired,
+    opening the PR ALSO binds the session's own wake_ref (session-scoped trust) and
+    embeds the non-secret routing marker in the PR body."""
+    monkeypatch.setenv("JAATO_TOOLSTORE_WAKE_PUBKEY", "PEMPUB")
+    monkeypatch.setenv("JAATO_WAKE_PUBLIC_ENDPOINT", "https://bot.example/wake")
+    htd = _with_tool(tmp_path)
+    g = _mod()
+    calls = []
+    g["_gh"] = _fake_gh(calls)
+    g["_token"] = lambda: "tok"
+
+    bound = []
+
+    async def bind_wake(wake_ref, keys):
+        bound.append((wake_ref, keys))
+        return {"outcome": "ok"}
+
+    ctx = _ctx(htd)
+    ctx.bind_wake = bind_wake
+    r = asyncio.run(g["execute"]({"name": "greeter"}, ctx))
+    assert "result" in r and "wake me to address" in r["result"]
+
+    # bound the PR-derived wake_ref with the store PUBLIC key (session declares trust)
+    assert bound == [
+        ("github-pr:Jaato-framework-and-examples/jaato-telegram-bot-tools-store#1",
+         ["PEMPUB"]),
+    ]
+    # the endpoint routing marker rides in the PR body (non-secret)
+    pr = next(c for c in calls if c[0] == "POST" and c[1].endswith("/pulls"))
+    assert "jaato-wake endpoint=https://bot.example/wake" in pr[2]["body"]
+
+
+def test_share_no_wake_binding_when_unconfigured(tmp_path, monkeypatch):
+    """No store pubkey / endpoint ⇒ share works, NO binding, NO marker (feature off)."""
+    monkeypatch.delenv("JAATO_TOOLSTORE_WAKE_PUBKEY", raising=False)
+    monkeypatch.delenv("JAATO_WAKE_PUBLIC_ENDPOINT", raising=False)
+    htd = _with_tool(tmp_path)
+    g = _mod()
+    calls = []
+    g["_gh"] = _fake_gh(calls)
+    g["_token"] = lambda: "tok"
+    ctx = _ctx(htd)
+    ctx.bind_wake = None  # even if a binder existed, config gates it off
+    r = asyncio.run(g["execute"]({"name": "greeter"}, ctx))
+    assert "result" in r and "pull/1" in r["result"]
+    pr = next(c for c in calls if c[0] == "POST" and c[1].endswith("/pulls"))
+    assert "jaato-wake" not in pr[2]["body"]
 
 
 if __name__ == "__main__":
