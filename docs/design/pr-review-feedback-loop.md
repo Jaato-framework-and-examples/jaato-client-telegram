@@ -574,13 +574,31 @@ cold-revive efficiency for those sessions. Daniel chose the final pattern instea
   ensures the turn runs only once the bot is present, so no host-tool dispatch fires
   into the void.
 
-Split: **client** = per-bot CID + one observer connection + re-attach-on-woken;
-**server (Advisor)** = the `SessionWokenEvent` + deferred-turn. Small, self-contained,
-reuses existing cascade-observe + lifecycle-to-observers routing. **Pending Advisor
-pin** (before client wiring): `SessionWokenEvent` shape, deferred-turn timeout
-semantics (lean: persist + re-emit on next attach so a slow bot never loses a wake),
-per-bot-CID constraints + observer-reaping-on-teardown (a per-bot CID with continuous
-sessions never empties → safe).
+**Durability catch (Advisor, from source, before building):** a cascade observer is
+**reaped after 300s** (`_cascade_client_idle_timeout`, sweep `session_manager.py:3798`)
+once its CID has no loaded/recent session — *regardless of connection liveness*. So the
+observer is **not durable as-is** for "cold for days"; it would silently require a
+session active every <5 min, i.e. the keep-warm workaround in disguise. **Fix
+(server-internal, client unchanged):** store the CID **in the wake binding** and
+**exempt a CID with a live wake binding from the sweep** (`has_live_binding_for_cid`) →
+**observer lifetime = binding lifetime** (survives exactly as long as a PR is in
+review). Correct by construction, no keep-warm.
+
+**Pinned contract (accepted 2026-07-05):**
+- `SessionWokenEvent` — `EventType "session.woken"`, payload `{session_id, wake_ref,
+  source}`. Client filters by `session_id`; **no** wake text in the notification (it
+  rides the driven turn), **no** `event_id` needed client-side (re-attach is idempotent;
+  the daemon owns wake dedup).
+- **Deferred-turn** = **persist-until-attach**: revive → emit → the turn is *pending*
+  until a client attaches, then drives; re-emit on observer (re)register; bounded by the
+  **binding's TTL** (days), not a short window; HTTP **200** for a deferred wake.
+- **Per-bot CID** = an opaque per-bot UUID; a bare observer registration, no
+  driver/owner session required.
+
+Split: **client** (mine) = per-bot CID on `session.new` + one persistent observer
+connection (`cascade.register(cid,"observer",["session.woken"])`, reconnect+re-register)
++ re-attach-the-chat on the event. **Server** (Advisor) = `session.woken` + deferred-turn
++ CID-in-binding + sweep-exemption. GREENLIT; I wire when Advisor pings it built.
 
 ## Remaining questions (decide before building)
 
