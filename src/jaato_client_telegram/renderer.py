@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
+from jaato_client_telegram.host_tool_loader import register_flush_hook, unregister_flush_hook
 from jaato_client_telegram.semantic_markup import render_semantic_markup
 
 from aiogram.exceptions import TelegramBadRequest
@@ -172,6 +173,11 @@ class StreamingContext:
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
+
+    # Serializes _emit_segments so an out-of-band flush (a host tool's ask_user, via
+    # the registered flush hook) never races the renderer's own segment emission on
+    # this ctx — both go through the same lock, no double-send / interleaved edit.
+    emit_lock: "asyncio.Lock" = field(default_factory=asyncio.Lock)
 
     # Returns the message_thread_id the bot should currently send into for this
     # chat (read live so an open_thread mid-turn is reflected). None => follow the
@@ -447,21 +453,22 @@ class ResponseRenderer:
         segment as its own message (see segment_stream_text). The in-progress tail
         is held back unless ``final``. This replaces the old "accumulate the whole
         turn, send once" behaviour at every model/tool/turn boundary."""
-        self._flush_text_buffer(ctx)
-        if not ctx.accumulated_text.strip():
-            ctx.accumulated_text = ""
-            return
-        units, remainder = segment_stream_text(
-            ctx.accumulated_text, flush=flush, final=final,
-        )
-        ctx.accumulated_text = remainder
-        if units:
-            logging.getLogger(__name__).debug(
-                "stream emit: flush=%s final=%s sizes=%s remainder=%dch",
-                flush, final, [len(u) for u in units], len(remainder),
+        async with ctx.emit_lock:
+            self._flush_text_buffer(ctx)
+            if not ctx.accumulated_text.strip():
+                ctx.accumulated_text = ""
+                return
+            units, remainder = segment_stream_text(
+                ctx.accumulated_text, flush=flush, final=final,
             )
-        for unit in units:
-            await self._emit_one(initial_message, ctx, unit)
+            ctx.accumulated_text = remainder
+            if units:
+                logging.getLogger(__name__).debug(
+                    "stream emit: flush=%s final=%s sizes=%s remainder=%dch",
+                    flush, final, [len(u) for u in units], len(remainder),
+                )
+            for unit in units:
+                await self._emit_one(initial_message, ctx, unit)
 
     def is_awaiting_user(self, chat_id: int) -> bool:
         """True if a permission or clarification is pending for this chat — i.e.
@@ -501,6 +508,16 @@ class ResponseRenderer:
         ctx = StreamingContext()
         ctx.thread_id_getter = thread_id_getter
         ctx.last_edit_time = time.monotonic()
+
+        # Register a per-chat narration-flush hook so an out-of-band tool prompt
+        # (ask_user / ctx.ask) flushes THIS ctx's buffered narration before it sends,
+        # keeping prompt-after-narration order. Unregistered before return; a leak on
+        # exception self-corrects (the chat's next turn overwrites it, and the hook is
+        # only ever invoked during an active turn, never between turns).
+        register_flush_hook(
+            initial_message.chat.id,
+            lambda: self._emit_segments(initial_message, ctx, flush=True, final=False),
+        )
 
         init_progress_count = 0
         # On re-attach the daemon emits AGENT_STATUS_CHANGED "idle" during the restore
@@ -911,6 +928,7 @@ class ResponseRenderer:
                 parse_mode=None,
             )
 
+        unregister_flush_hook(initial_message.chat.id)
         return ctx
 
     async def _send_with_typing_indicator(
