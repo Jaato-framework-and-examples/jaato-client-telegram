@@ -68,7 +68,7 @@ session (bounded by the untrusted-wrap + rate-limiting, but a real nuisance/DoS)
 the safe form of (b) puts **nothing secret in the PR**:
 - The PR carries only a **non-secret routing reference** — its branch
   (`share-<tool>`) or PR number (public anyway).
-- `share_tool` **registers `(pr_ref → session_id)` with its daemon** at share time
+- `share_tool` **registers `(wake_ref → session_id)` with its daemon** at share time
   (extends the `session_id→workspace` index).
 - Auth is a **store-level signature the daemon trusts** — the relay signs each
   forwarded wake with the **store's** single key; each daemon is configured once to
@@ -90,14 +90,38 @@ Rejected (a) (per-daemon HMAC in the relay — secret sprawl) and naive-(b)
   security-architecture decision for PR 2; mode A needs no such decision.
   *(GitHub→relay stays GitHub's `X-Hub-Signature-256` HMAC — the two hops are
   distinct.)*
-- **`pr_ref→session_id`: a separate `WakeBindingRegistry`, written via a new daemon
-  command `session.bind_wake(pr_ref)` that Advisor owns** — NOT raw index exposure.
-  The command binds `pr_ref → the caller's OWN session_id`, so a client can't hijack
+- **`wake_ref→session_id`: a separate `WakeBindingRegistry`, written via a new daemon
+  command `session.bind_wake(wake_ref)` that Advisor owns** — NOT raw index exposure.
+  The command binds `wake_ref → the caller's OWN session_id`, so a client can't hijack
   another PR's routing (authorizable by construction). Kept out of the core
   `session_id→workspace` index deliberately.
-- **Revocation: daemon TTL + explicit `session.unbind_wake(pr_ref)`** that the
+- **Revocation: daemon TTL + explicit `session.unbind_wake(wake_ref)`** that the
   client calls on PR merge/close. TTL is the safety net for the forgotten case; the
   client does not carry sole responsibility.
+
+**`wake_ref` form (Daniel, 2026-07-05) — general, NOT PR-specific.** A wake can come
+from *any* external player (cron, monitor, peer agent, a build hook), so the binding
+key is a general **wake reference**, renamed from `pr_ref`. Its form:
+- **An opaque, caller-defined string** — the routing handle the binder (session) and
+  the external waker agree on. GitHub PR review is *one* producer; the registry never
+  knows what a PR is. **Routing, not auth** (the `trust_keys` authenticate).
+- **Source-namespaced by convention** — `<source>:<ref>`, reusing the wake `source`:
+  `github-pr:owner/repo#42`, `cron:daily-digest`, `monitor:alert-9931`,
+  `peer:advisor:build-done`. Prevents cross-source collisions; the registry treats
+  the whole string as one opaque key.
+- **Caller-chosen OR daemon-minted** — `bind_wake(trust_keys, wake_ref=None)`: use
+  the caller's string if given (best when naturally derivable — GitHub's relay
+  reconstructs it from the webhook payload, so **nothing is minted/embedded in the
+  PR**), else the daemon mints a unique opaque handle the session forwards to its
+  waker (best when there's no natural id).
+- **Squat = denial, not hijack** — because the ref is routing and `trust_keys` is
+  auth, a rogue pre-binding of someone's ref makes a legit wake verify against the
+  *squatter's* key → `bad-signature` → refused. The attacker can't receive the wake
+  or forge the real one; source-namespacing removes accidental collisions, minting
+  removes deliberate squat-DoS if it ever matters.
+- **Client convention (mine):** how `share_tool` and the relay both derive the same
+  `wake_ref` from a PR is mine to define *on top of* this general contract
+  (e.g. `github-pr:<owner>/<repo>#<number>`).
 
 **Topology note (ours):** our reachability model exposes the shim via an operator
 reverse proxy — a *TLS-terminating* proxy (Caddy/nginx-http/Cloudflare Tunnel) would
@@ -120,14 +144,14 @@ no daemon-global config.** The bot already trusts its store, so it supplies the 
 key as part of its own session opt-in — most cleanly **stored on the
 `WakeBindingRegistry` entry at `bind_wake` time** (which already runs *as* that
 session and captures `session_id` + `workspace_path`). The shim verifies:
-`pr_ref → binding → verify signature against THAT binding's declared key` — keyed by
+`wake_ref → binding → verify signature against THAT binding's declared key` — keyed by
 the target session's own trust, after resolution, never a route-global pubkey. This
 also dissolves the "how does the daemon learn the key" provisioning question — the
 session brings it.
 
 **Session-scope COLLAPSES the A-vs-B choice (Advisor, 2026-07-05).** mTLS (mode A)
 verifies the client cert at the **TLS handshake** — per-connection, *before* the HTTP
-body (`pr_ref`) is read — so its trust CA is structurally **per-listener, not
+body (`wake_ref`) is read — so its trust CA is structurally **per-listener, not
 per-session**: at handshake the daemon doesn't yet know which session the request
 targets. Therefore:
 - **Mode A works ONLY for a single-tenant daemon**, where daemon-global trust *is*
@@ -136,7 +160,7 @@ targets. Therefore:
   fast path there, and it is *not a compromise* — it's correct for single-tenant.
 - **Mode B (signature-in-body) is REQUIRED for multi-tenant** — a hosted jaato
   serving many bots/stores on one daemon (Daniel's "hosted tenants" case). Only a
-  body signature can be verified *after* `pr_ref→binding` resolution against THAT
+  body signature can be verified *after* `wake_ref→binding` resolution against THAT
   session's declared key. So session-scoped trust is precisely what **forces** B —
   the crypto dep isn't "topology-robustness," it's the only mechanism that can
   express per-session trust. **That is the real "why B."**
@@ -146,7 +170,7 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
 - **Stage A = transport HYGIENE only** — IP allowlist, rate limit, body-size, TLS
   termination. DoS/abuse bounding, explicitly *not* authorization. Reuses the
   `http_server` chain.
-- **Stage B = the AUTHORITATIVE fail-closed gate** — resolve `pr_ref → binding →`
+- **Stage B = the AUTHORITATIVE fail-closed gate** — resolve `wake_ref → binding →`
   verify the body signature against `binding.trust_key`; **reject / never wake** on
   any of: no binding, no declared key, bad signature, TTL-expired. This is what
   "authenticated" means for the wake ingress.
@@ -175,8 +199,8 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
   Auth mode: **A (mTLS) for single-tenant** daemons, **B (signature-in-body) required
   for multi-tenant** (session-scope forces it). #516 stays auth-agnostic — auth is
   entirely the shim/binding layer.
-- **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref, trust_key)` at
-  share time and `session.unbind_wake(pr_ref)` on merge/close. **Two wiring
+- **Client (mine)** — `share_tool` calls `session.bind_wake(wake_ref, trust_key)` at
+  share time and `session.unbind_wake(wake_ref)` on merge/close. **Two wiring
   decisions pinned by Advisor (2026-07-05), buildable now:**
   - **`trust_key` = a PEM `SubjectPublicKeyInfo` blob** (the store's *public* key
     material itself), stored verbatim on the binding — **not a path** (would
@@ -185,7 +209,7 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     verify a signature, only identify a key). So a new bot-config knob **`store_pubkey`
     (PEM text) alongside `JAATO_TOOLSTORE_GH_TOKEN`**.
   - **Trust is a SET per binding, not a scalar (Daniel, 2026-07-05):**
-    `bind_wake(pr_ref, trust_keys: list[PEM])`, Stage-B verifies against **any** key
+    `bind_wake(wake_ref, trust_keys: list[PEM])`, Stage-B verifies against **any** key
     in the binding's set. Two motivations: (i) **multi-source is already handled by
     per-binding trust** — a session with PRs across the public + a corporate store
     just makes bindings with different keys; each key is least-privilege-scoped to its
@@ -195,15 +219,15 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     list from the start (scalar = the 1-element case). Advisor **bounds the set**
     (~4-8) as DoS hygiene (cap expensive verifies/wake), not a real-use limit; OR-verify
     is safe since every key is one the session itself declared.
-  - **Update path = idempotent upsert on `pr_ref` (Advisor v1):** re-calling
+  - **Update path = idempotent upsert on `wake_ref` (Advisor v1):** re-calling
     `bind_wake` refreshes a live binding — no separate update command. Semantics:
-    absent `pr_ref` → create; present **and caller's session == owner** → refresh
-    `trust_keys` + renew TTL (this is rotation: `bind_wake(pr_ref,[old,new])` then
+    absent `wake_ref` → create; present **and caller's session == owner** → refresh
+    `trust_keys` + renew TTL (this is rotation: `bind_wake(wake_ref,[old,new])` then
     later `[new]`); present **and caller != owner** → **REJECT (unauthorized)**.
     `session_id`/`workspace` are **not** mutable via upsert (only `trust_keys` + TTL),
     preserving the bind-runs-AS-caller ownership property. So `share_tool` refreshes a
     week-old binding's key by just re-calling `bind_wake` — no migration.
-  - **v1 error/outcome modes** (Advisor pins verbatim at PR 2): `unknown-pr_ref` (at
+  - **v1 error/outcome modes** (Advisor pins verbatim at PR 2): `unknown-wake_ref` (at
     wake), `unauthorized-caller` (upsert by non-owner), `TTL-expired`, `malformed-key`,
     `bad-signature`, `too-many-keys`.
   - **Pass it UNCONDITIONALLY** on every `bind_wake`. It's API-optional (a pure
@@ -213,7 +237,7 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     reliably know). **Zero conditional logic client-side.**
   - Relay (store-repo Action) presents the store client cert (mode A) / the store
     signs the body (mode B). **Still waits on PR 2's exact `bind_wake`/`unbind_wake`
-    contract** (arg names, return, error modes: unknown `pr_ref` / unauthorized-caller
+    contract** (arg names, return, error modes: unknown `wake_ref` / unauthorized-caller
     / TTL-expired / malformed-key / bad-signature) — Advisor pins it verbatim when it
     designs the shim. Then it's a small, unambiguous wire-up.
 
