@@ -492,6 +492,7 @@ class SessionPool:
         if existing is not None and not existing.done():
             return  # already watching this chat's (still-live) client
         stream = client.open_event_stream()  # eager subscribe — provably before attach
+        logger.info("wake stream opened + subscribed for chat %d (before attach)", chat_id)
         self._watchers[chat_id] = asyncio.create_task(
             self._wake_watcher(chat_id, stream)
         )
