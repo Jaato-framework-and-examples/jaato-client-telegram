@@ -125,6 +125,34 @@ the target session's own trust, after resolution, never a route-global pubkey. T
 also dissolves the "how does the daemon learn the key" provisioning question — the
 session brings it.
 
+**Session-scope COLLAPSES the A-vs-B choice (Advisor, 2026-07-05).** mTLS (mode A)
+verifies the client cert at the **TLS handshake** — per-connection, *before* the HTTP
+body (`pr_ref`) is read — so its trust CA is structurally **per-listener, not
+per-session**: at handshake the daemon doesn't yet know which session the request
+targets. Therefore:
+- **Mode A works ONLY for a single-tenant daemon**, where daemon-global trust *is*
+  the sole tenant's trust. **Daniel's VPS box qualifies** — many chats = many
+  sessions, but all one bot → one store → one trust anchor. A stays the zero-code
+  fast path there, and it is *not a compromise* — it's correct for single-tenant.
+- **Mode B (signature-in-body) is REQUIRED for multi-tenant** — a hosted jaato
+  serving many bots/stores on one daemon (Daniel's "hosted tenants" case). Only a
+  body signature can be verified *after* `pr_ref→binding` resolution against THAT
+  session's declared key. So session-scoped trust is precisely what **forces** B —
+  the crypto dep isn't "topology-robustness," it's the only mechanism that can
+  express per-session trust. **That is the real "why B."**
+
+**Shim layering (Advisor) — the wake shim is its OWN ingress**, NOT #498's
+route-level modes (reusing them would muddy what `allow_unauthenticated` means):
+- **Stage A = transport HYGIENE only** — IP allowlist, rate limit, body-size, TLS
+  termination. DoS/abuse bounding, explicitly *not* authorization. Reuses the
+  `http_server` chain.
+- **Stage B = the AUTHORITATIVE fail-closed gate** — resolve `pr_ref → binding →`
+  verify the body signature against `binding.trust_key`; **reject / never wake** on
+  any of: no binding, no declared key, bad signature, TTL-expired. This is what
+  "authenticated" means for the wake ingress.
+- #498's HMAC/mTLS route modes stay for the *generic* webhook-plugin ingress
+  (GitHub→agent-subscribed events — route-global by nature, a different use case).
+
 **Build staging:**
 - **PR #516 (UP, contract finalized 885be89b; awaits Daniel review + Copilot pass)**
   — core primitive: `session.wake` + `session_id→workspace` index + untrusted-wrap
@@ -137,12 +165,16 @@ session brings it.
   **REVIVE_FAILED/NOT_DRIVABLE→5xx** (transient/retry). (`source` stays a coarse
   provenance tag; rich attacker-influenceable context rides inside the wrapped
   `text`.)
-- **PR 2** — the HTTP shim + relay trust (mode A mTLS; mode B if Daniel approves) +
-  `WakeBindingRegistry` + `session.bind_wake` / `session.unbind_wake` commands. The
-  registry captures **(session_id + workspace_path)** at bind time (bind runs AS the
-  caller's session), so a bound session stays wakeable even if its id is AMBIGUOUS in
-  the core index — the collision class only bites *unbound* wakes, and the PR-review
-  path is always bound.
+- **PR 2** — the wake HTTP shim (its own ingress, Stage A hygiene + Stage B
+  authoritative session-scoped verify) + `WakeBindingRegistry` + `session.bind_wake`
+  / `session.unbind_wake` commands. The registry captures **(session_id +
+  workspace_path + trust_key)** at bind time (bind runs AS the caller's session), so
+  (a) a bound session stays wakeable even if its id is AMBIGUOUS in the core index
+  (collision only bites *unbound* wakes; the PR-review path is always bound), and (b)
+  the session's declared **trust_key** rides on the binding for the Stage-B verify.
+  Auth mode: **A (mTLS) for single-tenant** daemons, **B (signature-in-body) required
+  for multi-tenant** (session-scope forces it). #516 stays auth-agnostic — auth is
+  entirely the shim/binding layer.
 - **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref)` at share time
   and `session.unbind_wake(pr_ref)` on merge/close; the relay (store-repo Action)
   presents the store client cert. **Waits on PR 2's `bind_wake`/`unbind_wake`
