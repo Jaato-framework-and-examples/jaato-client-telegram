@@ -175,11 +175,25 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
   Auth mode: **A (mTLS) for single-tenant** daemons, **B (signature-in-body) required
   for multi-tenant** (session-scope forces it). #516 stays auth-agnostic — auth is
   entirely the shim/binding layer.
-- **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref)` at share time
-  and `session.unbind_wake(pr_ref)` on merge/close; the relay (store-repo Action)
-  presents the store client cert. **Waits on PR 2's `bind_wake`/`unbind_wake`
-  command signatures** — building against not-yet-existent commands is the
-  guess-first trap. Wire it the moment those land.
+- **Client (mine)** — `share_tool` calls `session.bind_wake(pr_ref, trust_key)` at
+  share time and `session.unbind_wake(pr_ref)` on merge/close. **Two wiring
+  decisions pinned by Advisor (2026-07-05), buildable now:**
+  - **`trust_key` = a PEM `SubjectPublicKeyInfo` blob** (the store's *public* key
+    material itself), stored verbatim on the binding — **not a path** (would
+    reintroduce daemon-local filesystem coupling the session-scoped model exists to
+    avoid; the binding must be self-contained) and **not a fingerprint** (can't
+    verify a signature, only identify a key). So a new bot-config knob **`store_pubkey`
+    (PEM text) alongside `JAATO_TOOLSTORE_GH_TOKEN`**.
+  - **Pass it UNCONDITIONALLY** on every `bind_wake`. It's API-optional (a pure
+    single-tenant mTLS daemon doesn't need it), but passing it always makes the
+    binding **mode-agnostic** — wakeable whether the daemon turns out A or B — so
+    `share_tool` never has to know the daemon's tenancy/auth mode (which it can't
+    reliably know). **Zero conditional logic client-side.**
+  - Relay (store-repo Action) presents the store client cert (mode A) / the store
+    signs the body (mode B). **Still waits on PR 2's exact `bind_wake`/`unbind_wake`
+    contract** (arg names, return, error modes: unknown `pr_ref` / unauthorized-caller
+    / TTL-expired / malformed-key / bad-signature) — Advisor pins it verbatim when it
+    designs the shim. Then it's a small, unambiguous wire-up.
 
 ## The loop we want to automate
 
