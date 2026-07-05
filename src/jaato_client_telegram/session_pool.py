@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from jaato_sdk import WSRecoveryClient
 from jaato_sdk.events import ClientType, EventType
+from jaato_sdk.plugins.model_provider.types import UNTRUSTED_OPEN
 
 from jaato_client_telegram.chat_session_store import ChatSessionStore
 from jaato_client_telegram.host_tool_loader import (
@@ -53,6 +54,27 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# The FIRST event of a daemon-driven wake turn is the source="user" echo, wrapped
+# as untrusted content tagged with the wake source. Match the EXPORTED open marker
+# (exotic Unicode — never hand-type ⟦) plus the " source=wake:" discriminator: other
+# untrusted content (web_fetch/MCP/…) reuses the same open marker with
+# source=<toolname>, so the "wake:" scope is what makes this a wake, and it spans
+# every wake subsource (wake:github-pr, wake:cron, …). Server wraps via
+# wrap_untrusted_content(text, source=f"wake:{source}") (session_manager.py).
+_WAKE_ECHO_PREFIX = f"{UNTRUSTED_OPEN} source=wake:"
+
+
+def _is_wake_echo(ev: object) -> bool:
+    """True for the user-echo that opens a daemon-driven wake turn — the mode-flip
+    trigger. It precedes any source=model output, so catching it renders the whole
+    turn. Duck-typed: only AGENT_OUTPUT events carry source + text."""
+    text = getattr(ev, "text", None)
+    return (
+        getattr(ev, "source", None) == "user"
+        and isinstance(text, str)
+        and text.startswith(_WAKE_ECHO_PREFIX)
+    )
 
 # Memory-write tools whose successful completion should trigger a raw->curated
 # drain (so the NEXT session's enrichment surfaces the memory). The model calls
@@ -134,6 +156,18 @@ class SessionPool:
         # the renderer). Host tools reach its wake() via ctx.wake — so a tool can
         # make the model act on an event even after the session went idle.
         self._pump = None
+        # The renderer, injected after construction (built after the pool in
+        # bot.py). The per-session wake watcher uses it to render a daemon-driven
+        # wake turn. Unset ⇒ no wake watcher (feature off).
+        self._renderer = None
+        # One long-lived "wake watcher" task per chat: a SECOND events() subscriber
+        # that stays subscribed for the whole client lifetime and, on the wake
+        # user-echo (⟦UNTRUSTED-EXTERNAL-CONTENT source=wake:…⟧), mode-flips the SAME
+        # iterator into the renderer. It must be subscribed BEFORE attach_session so
+        # the daemon's drive_pending_wake output (which has NO zero-subscriber buffer
+        # on the recovery client) can't be dropped. See docs/design/pr-review-
+        # feedback-loop.md ("the render/act layer").
+        self._watchers: dict[int, asyncio.Task] = {}
         # Whether the most recent get_or_create_session for a chat RE-ATTACHED to
         # a persisted session (vs created fresh / reused in-memory) — so the
         # handler can show a "Resumed" cue. Read via took_reattach().
@@ -195,6 +229,12 @@ class SessionPool:
         ctx.wake() for host tools — a tool can submit an event turn that resumes
         an idle session. Unset ⇒ ctx.wake() no-ops."""
         self._pump = pump
+
+    def set_renderer(self, renderer) -> None:
+        """Wire the renderer (built after the pool in bot.py). Enables the per-
+        session wake watcher to render a daemon-driven wake turn. Unset ⇒ no wake
+        watcher is started (the review-wake render/act layer is off)."""
+        self._renderer = renderer
 
     async def run_host_tool_startup(self) -> None:
         """Call each installed host tool's optional ``on_startup(wake)`` hook once
@@ -345,6 +385,7 @@ class SessionPool:
                     chat_id, meta.session_id,
                 )
                 self._sessions.pop(chat_id, None)
+                await self._stop_wake_watcher(chat_id)
                 try:
                     await meta.client.disconnect()
                 except Exception:
@@ -382,6 +423,14 @@ class SessionPool:
                     logger.info(
                         "Registered %d host tools for chat_id %d", len(client_tools), chat_id,
                     )
+
+                # Start the long-lived wake watcher NOW — BEFORE attach/create. The
+                # daemon can drive_pending_wake the instant it processes attach, and
+                # that turn's output has NO zero-subscriber buffer on the recovery
+                # client (recovery.py::_fanout), so a subscriber that isn't live yet
+                # loses it. open_event_stream() subscribes synchronously, so opening it
+                # before attach IS the subscribed-before-attach ordering guarantee.
+                self._start_wake_watcher(chat_id, client)
 
                 # Re-attach to this chat's persisted session if it still exists on
                 # the daemon (session.list = unified in-memory + on-disk view, so it
@@ -427,6 +476,75 @@ class SessionPool:
                 raise RuntimeError(
                     f"Failed to create session for chat_id {chat_id}: {e}"
                 ) from e
+
+    # ---- review-wake render/act layer: the long-lived per-session watcher ----
+
+    def _start_wake_watcher(self, chat_id: int, client: WSRecoveryClient) -> None:
+        """Open the chat's wake event stream and spawn its watcher. Called BEFORE
+        attach: ``open_event_stream()`` subscribes SYNCHRONOUSLY (the fan-out queue is
+        registered before it returns — jaato-sdk #524), so the daemon's drive on the
+        imminent attach can't fan out to no subscriber (the recovery client has NO
+        zero-subscriber buffer). No barrier / scheduling reasoning needed. No-op when
+        the renderer/bot aren't wired (feature off) or a live watcher already exists."""
+        if self._renderer is None or self._bot is None:
+            return
+        existing = self._watchers.get(chat_id)
+        if existing is not None and not existing.done():
+            return  # already watching this chat's (still-live) client
+        stream = client.open_event_stream()  # eager subscribe — provably before attach
+        self._watchers[chat_id] = asyncio.create_task(
+            self._wake_watcher(chat_id, stream)
+        )
+
+    async def _stop_wake_watcher(self, chat_id: int) -> None:
+        """Cancel + drop the chat's wake watcher (client recreate / shutdown)."""
+        task = self._watchers.pop(chat_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — teardown
+                pass
+
+    async def _wake_watcher(self, chat_id: int, stream) -> None:
+        """One long-lived event stream for a chat's session (subscribed eagerly at
+        ``open_event_stream()``). On the wake user-echo it flips the SAME stream into
+        the renderer (so the daemon-driven wake turn renders to Telegram), then resumes
+        watching. Non-wake events (ordinary user turns, which the pump renders on its
+        OWN subscription) are read and discarded here. ONE iterator is detector AND
+        renderer — a fresh post-detection subscription would (no zero-subscriber
+        buffer) miss the source=model output already delivered here."""
+        try:
+            async for ev in stream:
+                if _is_wake_echo(ev):
+                    await self._render_wake_turn(chat_id, stream)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — a fault here must not wedge the pool
+            logger.exception("wake watcher for chat %d faulted", chat_id)
+        finally:
+            try:
+                await stream.aclose()  # unsubscribe (idempotent)
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+
+    async def _render_wake_turn(self, chat_id: int, stream) -> None:
+        """Render a daemon-driven wake turn on the SAME stream that saw the marker.
+        No inbound Telegram message ⇒ an OutboundAnchor (sends via bot.send_message,
+        so it still funnels through the outbound rate limiter). stream_response
+        consumes source=model…AGENT_COMPLETED from ``stream`` and returns (break, not
+        close), leaving the watcher to resume on the next event."""
+        from jaato_client_telegram.chat_pump import OutboundAnchor
+
+        anchor = OutboundAnchor(self._bot, chat_id, self._thread_store.current(chat_id))
+        try:
+            await self._renderer.stream_response(
+                initial_message=anchor,
+                event_stream=stream,
+                thread_id_getter=lambda cid=chat_id: self._thread_store.current(cid),
+            )
+        except Exception:  # noqa: BLE001 — a render fault must not kill the watcher
+            logger.exception("wake render for chat %d failed", chat_id)
 
     def _wire_tools_venv(self) -> None:
         """Prepend the per-workspace tools venv's site-packages to this process's
@@ -726,6 +844,7 @@ class SessionPool:
     async def remove_client(self, chat_id: int) -> None:
         async with self._lock:
             session = self._sessions.pop(chat_id, None)
+            await self._stop_wake_watcher(chat_id)
             if session:
                 try:
                     await session.client.disconnect()

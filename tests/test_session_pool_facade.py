@@ -75,6 +75,8 @@ def _make_pool(client, *, store=None, workspace="/ws", profile="p", agent="a"):
     pool._last_reattach = {}
     pool._bot = None          # skip host-tool assembly for the lifecycle test
     pool._file_config = None
+    pool._renderer = None      # no wake watcher in the lifecycle test (feature off)
+    pool._watchers = {}
     pool._ws_config = SimpleNamespace(
         url="wss://x", secret_token="", tls=None, workspace=workspace,
         profile=profile, agent=agent, host_tools_dir="", keycloak_client_id="",

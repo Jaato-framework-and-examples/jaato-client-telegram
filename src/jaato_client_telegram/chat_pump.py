@@ -66,12 +66,6 @@ class PumpItem:
     # into a user's in-flight turn. A normal user message (defer=False) is
     # delivered mid-turn as a steer, per the pump's whole point.
     defer: bool = False
-    # A RENDER-ONLY item drives no input: the turn was already started server-side
-    # (the daemon's deferred-turn on a SessionWokenEvent re-attach). The pump only
-    # re-attaches (which triggers that drive) and renders the result — it does NOT
-    # send_message (the daemon already holds the wake as the turn's input). Used by
-    # wake_render() for the review-wake render/act layer.
-    render_only: bool = False
 
 
 class OutboundAnchor:
@@ -134,22 +128,6 @@ class ChatPump:
             apply_welcome=False, reply=False, defer=True,
         ))
 
-    def wake_render(self, chat_id: int) -> None:
-        """Render a DAEMON-DRIVEN woken turn (a SessionWokenEvent whose deferred-turn
-        the daemon drives on re-attach). Unlike wake(), sends NO text — the daemon
-        already holds the wake as the turn input; the pump only RE-ATTACHES (which
-        triggers the drive) and renders the result to Telegram. Deferred so it never
-        barges a user's in-flight turn. Requires a bot."""
-        if self._bot is None:
-            logger.warning("ChatPump.wake_render called but no bot configured — dropping")
-            return
-        thread = self._pool.current_thread(chat_id)
-        anchor = OutboundAnchor(self._bot, chat_id, thread)
-        self.submit(PumpItem(
-            chat_id=chat_id, message=anchor, text="",
-            apply_welcome=False, reply=False, defer=True, render_only=True,
-        ))
-
     def submit(self, item: PumpItem) -> None:
         """Enqueue a message and ensure the chat's actor is running.
 
@@ -202,10 +180,9 @@ class ChatPump:
                 try:
                     # ---- run a turn with `item` ----
                     session_id, text = await self._prepare_turn(item)
-                    if not item.render_only:
-                        await self._pool.send_message(
-                            session_id, text, attachments=item.attachments
-                        )
+                    await self._pool.send_message(
+                        session_id, text, attachments=item.attachments
+                    )
                     render = asyncio.create_task(self._render(item, session_id))
                     # Keep a "typing…" indicator alive for the whole turn so a slow
                     # model turn shows life instead of looking frozen.
@@ -261,13 +238,6 @@ class ChatPump:
         (session_id, text-to-send). Mirrors the old handlers' pre-send flow."""
         chat_id = item.chat_id
         self._pool.sync_thread(chat_id, item.message.message_thread_id)
-
-        if item.render_only:
-            # Daemon-driven woken turn: just re-attach (which drains the pending
-            # wake + drives the turn server-side) and render — no user-facing
-            # connecting/resuming chatter, no text to send.
-            session_id = await self._pool.get_or_create_session(chat_id)
-            return session_id, ""
 
         notify = item.message.reply if item.reply else item.message.answer
 

@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Any, Callable
 from jaato_sdk.events import EventType
 
 if TYPE_CHECKING:
-    from jaato_client_telegram.chat_pump import ChatPump
     from jaato_client_telegram.session_pool import SessionPool
 
 logger = logging.getLogger(__name__)
@@ -46,12 +45,10 @@ class WakeObserver:
         make_client: Callable[[], Any],
         cid: str,
         pool: "SessionPool",
-        pump: "ChatPump",
     ) -> None:
         self._make_client = make_client
         self._cid = cid
         self._pool = pool
-        self._pump = pump
         self._client: Any = None
         self._task: asyncio.Task | None = None
         self._stopped = False
@@ -94,8 +91,14 @@ class WakeObserver:
             await asyncio.sleep(_REREGISTER_INTERVAL)
 
     def _on_woken(self, event: Any) -> None:
-        """A cold session was woken (deferred-turn pending). Re-attach its chat so
-        the pump renders the driven turn with the bot present to serve host tools."""
+        """A COLD session was woken (deferred-turn pending). Just RE-ATTACH its chat:
+        ``get_or_create_session`` establishes the per-session wake watcher (subscribed
+        BEFORE attach, so the drive can't be dropped) and the attach itself triggers
+        the daemon's deferred-turn drive — the watcher then renders it with the bot
+        present to serve the turn's host tools. The observer is purely the cold
+        attach-nudge; warm wakes never emit this event (they render via the same
+        watcher, already attached). One render path; see docs/design/pr-review-
+        feedback-loop.md."""
         session_id = getattr(event, "session_id", "") or ""
         if not session_id:
             return
@@ -107,10 +110,16 @@ class WakeObserver:
             )
             return
         logger.info(
-            "WakeObserver: waking chat %s (session %s, %s) — re-attach + render",
+            "WakeObserver: cold wake for chat %s (session %s, %s) — re-attaching",
             chat_id, session_id, getattr(event, "wake_ref", ""),
         )
-        self._pump.wake_render(chat_id)
+        asyncio.create_task(self._reattach(chat_id))
+
+    async def _reattach(self, chat_id: int) -> None:
+        try:
+            await self._pool.get_or_create_session(chat_id)
+        except Exception:  # noqa: BLE001 — a failed re-attach must not kill the observer
+            logger.exception("WakeObserver: re-attach for chat %s failed", chat_id)
 
     async def stop(self) -> None:
         self._stopped = True
