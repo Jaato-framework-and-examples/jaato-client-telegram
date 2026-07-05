@@ -279,6 +279,9 @@ class SessionPool:
             "outcome": getattr(event, "outcome", "") or "",
             "expires_at": getattr(event, "expires_at", 0.0),
             "detail": getattr(event, "detail", "") or "",
+            # The daemon reports its own public wake endpoint (from wake.json) so the
+            # caller (share_tool) can advertise it — the URL is never bot-configured.
+            "endpoint": getattr(event, "endpoint", "") or "",
         }
 
     async def get_or_create_session(self, chat_id: int) -> str:

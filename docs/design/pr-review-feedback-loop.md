@@ -197,7 +197,9 @@ path and nothing to gate on daemon tenancy.
 - **Store keypair, two halves:** the **private** key lives with the **relay** (store-repo
   Action secret) and signs each forwarded wake; the **public** key is what `share_tool`
   passes in `trust_keys` at bind time (session-declared, per-binding). **Ed25519** is the
-  default (`store_pubkey` = an Ed25519 `SubjectPublicKeyInfo` PEM; RSA also verifies).
+  default (an Ed25519 `SubjectPublicKeyInfo` PEM; RSA also verifies). The bot does **not**
+  store the pubkey — it **fetches `wake-pubkey.pem` from the store** at publish time (see
+  "No bot-side config" below).
 - **Rotation** uses the banked `trust_keys` set: during overlap the relay signs with old
   OR new, the binding carries `[old_pub, new_pub]`, Stage-B OR-verifies; re-call
   `bind_wake` to refresh.
@@ -243,8 +245,14 @@ route-level modes (reusing them would muddy what `allow_unauthenticated` means):
     material itself), stored verbatim on the binding — **not a path** (would
     reintroduce daemon-local filesystem coupling the session-scoped model exists to
     avoid; the binding must be self-contained) and **not a fingerprint** (can't
-    verify a signature, only identify a key). So a new bot-config knob **`store_pubkey`
-    (PEM text) alongside `JAATO_TOOLSTORE_GH_TOKEN`**.
+    verify a signature, only identify a key).
+  - **No bot-side config (Daniel, 2026-07-05) — the pubkey + endpoint are auto-detected,
+    never env vars.** `share_tool` **fetches `wake-pubkey.pem` from the store** at publish
+    time (the same source browse/install read the registry + tool files from), and the
+    **daemon reports its own wake endpoint** in `WakeBindResultEvent.endpoint` (from its
+    `wake.json`), which `share_tool` PATCHes into the PR as the routing marker. No
+    `store_pubkey`/`endpoint` env vars, no `JAATO_*`-prefixed client config — that
+    hardcoding was removed and must not return.
   - **Trust is a SET per binding, not a scalar (Daniel, 2026-07-05):**
     `bind_wake(wake_ref, trust_keys: list[PEM])`, Stage-B verifies against **any** key
     in the binding's set. Two motivations: (i) **multi-source is already handled by

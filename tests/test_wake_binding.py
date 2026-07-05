@@ -64,9 +64,11 @@ class _FakeClient:
 
     async def execute_command(self, command, args):
         self.sent.append((command, args))
-        # simulate the daemon replying with a WakeBindResultEvent
+        # simulate the daemon replying with a WakeBindResultEvent (incl. the daemon-
+        # reported wake endpoint, which the daemon knows from its own wake.json)
         self._cb(SimpleNamespace(
-            wake_ref=args[0], outcome="ok", expires_at=99.0, detail="bound"))
+            wake_ref=args[0], outcome="ok", expires_at=99.0, detail="bound",
+            endpoint="https://daemon.example/wake"))
 
 
 def test_wake_binding_command_sends_and_returns_result():
@@ -75,7 +77,8 @@ def test_wake_binding_command_sends_and_returns_result():
         me = SimpleNamespace(_sessions={7: SimpleNamespace(client=fc)})
         r = await SessionPool._wake_binding_command(
             me, 7, "session.bind_wake", ["github-pr:o/r#1", "PEM"], "github-pr:o/r#1")
-        assert r == {"outcome": "ok", "expires_at": 99.0, "detail": "bound"}
+        assert r == {"outcome": "ok", "expires_at": 99.0, "detail": "bound",
+                     "endpoint": "https://daemon.example/wake"}
         assert fc.sent == [("session.bind_wake", ["github-pr:o/r#1", "PEM"])]
     asyncio.run(run())
 
