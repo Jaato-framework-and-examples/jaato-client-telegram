@@ -56,6 +56,17 @@ class ChatSessionStore:
         """Return the persisted session_id for ``chat_id``, or None."""
         return self._map.get(str(chat_id))
 
+    def chat_for(self, session_id: str) -> int | None:
+        """Reverse lookup: which chat_id owns ``session_id`` (or None). Used to
+        route a SessionWokenEvent(session_id) back to its chat for re-attach."""
+        for cid, sid in self._map.items():
+            if sid == session_id:
+                try:
+                    return int(cid)
+                except ValueError:
+                    return None
+        return None
+
     def set(self, chat_id: int, session_id: str) -> None:
         """Persist ``chat_id -> session_id`` (overwrites any prior mapping)."""
         self._map[str(chat_id)] = session_id

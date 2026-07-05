@@ -109,6 +109,35 @@ def test_bind_unbind_wrappers_format_args():
     asyncio.run(run())
 
 
+# ---- per-bot cascade id + reverse lookup (for the WakeObserver) ------------
+
+def test_bot_cid_stable_across_restart(tmp_path):
+    """The per-bot cascade id is generated once + persisted, so a restart reuses it
+    (else a new cid wouldn't observe pre-restart sessions)."""
+    p = str(tmp_path / "sessions.json")
+    c1 = SessionPool._load_or_create_bot_cid(p)
+    c2 = SessionPool._load_or_create_bot_cid(p)  # "restart"
+    assert c1 == c2 and c1.startswith("bot-")
+    assert (tmp_path / "bot_wake_cid").read_text(encoding="utf-8").strip() == c1
+
+
+def test_pool_chat_for_session_reverse(tmp_path):
+    """session_id -> chat_id, in-memory first then the persistent store."""
+    from jaato_client_telegram.chat_session_store import ChatSessionStore
+
+    pool = SessionPool.__new__(SessionPool)
+    pool._sessions = {5: SimpleNamespace(session_id="s5")}
+    pool._session_store = None
+    assert pool.chat_for_session("s5") == 5
+    assert pool.chat_for_session("absent") is None
+
+    store = ChatSessionStore(str(tmp_path / "s.json"))
+    store.set(9, "s9")
+    pool._sessions = {}
+    pool._session_store = store
+    assert pool.chat_for_session("s9") == 9
+
+
 if __name__ == "__main__":
     import sys
     import pytest

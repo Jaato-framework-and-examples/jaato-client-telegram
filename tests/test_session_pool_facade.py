@@ -57,7 +57,7 @@ class _FakeClient:
         self.calls.append(("attach_session", session_id))
         return True
 
-    async def create_session(self, profile=None, agent=None):
+    async def create_session(self, profile=None, agent=None, cascade_driver_id=None):
         self.calls.append(("create_session", profile, agent))
         return "fresh-sess"
 
@@ -71,6 +71,7 @@ def _make_pool(client, *, store=None, workspace="/ws", profile="p", agent="a"):
     pool._lock = asyncio.Lock()
     pool._max_concurrent = 50
     pool._session_store = store
+    pool._bot_cid = None      # no cascade id in the lifecycle test
     pool._last_reattach = {}
     pool._bot = None          # skip host-tool assembly for the lifecycle test
     pool._file_config = None

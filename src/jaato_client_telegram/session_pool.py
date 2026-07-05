@@ -17,6 +17,7 @@ import asyncio
 import logging
 import ssl
 import sys
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -106,6 +107,14 @@ class SessionPool:
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
+        # Per-BOT cascade id: every session this bot creates shares it, so ONE
+        # persistent cascade-observer (WakeObserver) hears SessionWokenEvent for all
+        # of them (the review-wake render/act layer — docs/design/pr-review-feedback-
+        # loop.md). Persisted next to the session store so it's STABLE across restarts
+        # (else a restart's new cid wouldn't observe pre-restart sessions). Only when
+        # re-attachment is enabled — cross-restart wake needs persistent sessions;
+        # None ⇒ standalone sessions, no observer.
+        self._bot_cid = self._load_or_create_bot_cid(session_store_path) if session_store_path else None
         # Per-chat Telegram thread continuity: the bot follows the user's thread
         # and host-tool sends stay in it (see thread_store / ThreadAwareBot).
         # Persisted next to the session store; in-memory when that's unconfigured.
@@ -141,6 +150,41 @@ class SessionPool:
         if self._session_store:
             logger.info("Session re-attachment enabled (store=%s)", session_store_path)
         self._wire_tools_venv()
+
+    @staticmethod
+    def _load_or_create_bot_cid(session_store_path: str) -> str:
+        """Load the stable per-bot cascade id from disk (next to the session store),
+        or generate + persist one on first run. Stable across restarts so the
+        WakeObserver's registration + all created sessions share one cid."""
+        path = Path(session_store_path).with_name("bot_wake_cid")
+        try:
+            cid = path.read_text(encoding="utf-8").strip()
+            if cid:
+                return cid
+        except OSError:
+            pass
+        cid = f"bot-{uuid.uuid4()}"
+        try:
+            path.write_text(cid, encoding="utf-8")
+        except OSError:
+            logger.warning("could not persist bot cascade id at %s — using in-memory", path)
+        return cid
+
+    @property
+    def bot_cid(self) -> "str | None":
+        """The per-bot cascade id the WakeObserver observes; None if unconfigured."""
+        return self._bot_cid
+
+    def chat_for_session(self, session_id: str) -> "int | None":
+        """Reverse of chat_id -> session_id: which chat owns this session (in-memory
+        first, then the persistent store). Used by the WakeObserver to route a
+        SessionWokenEvent(session_id) back to the chat it should re-attach."""
+        for cid, meta in self._sessions.items():
+            if meta.session_id == session_id:
+                return cid
+        if self._session_store:
+            return self._session_store.chat_for(session_id)
+        return None
 
     def set_bot(self, bot: "Bot", file_config: "FileSharingConfig | None" = None) -> None:
         self._bot = bot
@@ -361,6 +405,9 @@ class SessionPool:
                     session_id = await client.create_session(
                         profile=self._ws_config.profile or None,
                         agent=self._ws_config.agent or None,
+                        # Tag every session with the per-bot cascade id so the
+                        # WakeObserver can observe them all via one registration.
+                        cascade_driver_id=self._bot_cid,
                     )
                     if not session_id:
                         raise RuntimeError("create_session returned no session id")

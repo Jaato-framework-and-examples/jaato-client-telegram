@@ -282,6 +282,31 @@ def test_wake_on_idle_runs_immediately():
     asyncio.run(run())
 
 
+def test_wake_render_renders_without_sending():
+    """A daemon-driven woken turn: wake_render re-attaches + renders, and sends NO
+    message (the daemon already holds the wake as the turn input)."""
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend, RecordingBot())
+        pump.wake_render(1)
+        await _until(lambda: rend.started == [0])
+        assert pool.sent == []          # render-only: NO send_message
+        rend._ev(0).set()
+        await _until(lambda: rend.completed == [0])
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_wake_render_without_bot_noops():
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        pump = ChatPump(pool, rend)  # no bot
+        pump.wake_render(1)          # must not raise
+        await asyncio.sleep(0.01)
+        assert rend.started == [] and pool.sent == []
+    asyncio.run(run())
+
+
 def test_wake_without_bot_noops():
     async def run():
         pool, rend = FakePool(), FakeRenderer()
