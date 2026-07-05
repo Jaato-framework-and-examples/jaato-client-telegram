@@ -125,9 +125,9 @@ async def ask_user(
     fut: "asyncio.Future[int]" = asyncio.get_running_loop().create_future()
     _PENDING_ASKS[req_id] = fut
     try:
-        # Flush any pending narration FIRST so this prompt lands after it (the send
-        # otherwise races the renderer's throttled narration → prompt-before-narration).
-        await flush_before_prompt(chat_id)
+        # NOTE: narration is flushed for us — ask_user's `bot` is the tool's
+        # ThreadAwareBot, whose send_* wrapper calls flush_before_prompt before every
+        # send (ONE flush point for all out-of-band tool sends). No flush here.
         await bot.send_message(chat_id, text, reply_markup=kb)
         index = await asyncio.wait_for(fut, timeout=timeout)
         return options[index] if 0 <= index < len(options) else None

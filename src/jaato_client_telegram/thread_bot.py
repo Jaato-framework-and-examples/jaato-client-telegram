@@ -13,6 +13,8 @@ a different chat) is never overridden.
 
 from typing import Any, Callable, Optional
 
+from jaato_client_telegram.host_tool_loader import flush_before_prompt
+
 
 class ThreadAwareBot:
     """Proxy injecting the chat's current thread id into ``send_*`` calls.
@@ -35,14 +37,22 @@ class ThreadAwareBot:
             return attr
 
         async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            cid = kwargs.get("chat_id", args[0] if args else None)
+            to_this_chat = cid == self._chat_id
+            # Flush the renderer's pending narration BEFORE an out-of-band tool send to
+            # THIS chat, so the send lands AFTER the narration. Every host-tool send —
+            # send_to_telegram / show_image / ask_user / any dynamic ctx.bot.send_* —
+            # funnels through here, so this ONE flush point keeps prompt/result-after-
+            # narration order (the renderer's throttled narration otherwise loses the
+            # race to the tool's direct send). No-op when no renderer is streaming.
+            if to_this_chat:
+                await flush_before_prompt(self._chat_id)
             injected = False
-            if "message_thread_id" not in kwargs:
-                cid = kwargs.get("chat_id", args[0] if args else None)
-                if cid == self._chat_id:
-                    tid = self._thread_getter()
-                    if tid is not None:
-                        kwargs["message_thread_id"] = tid
-                        injected = True
+            if to_this_chat and "message_thread_id" not in kwargs:
+                tid = self._thread_getter()
+                if tid is not None:
+                    kwargs["message_thread_id"] = tid
+                    injected = True
             try:
                 return await attr(*args, **kwargs)
             except Exception as e:  # noqa: BLE001 — only swallow the thread case
