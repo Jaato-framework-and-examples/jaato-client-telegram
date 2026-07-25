@@ -26,6 +26,9 @@ class MockEvent:
     request_id: str | None = None
     tool_name: str | None = None
     formatted_text: str | None = None
+    # Mirrors the real TurnCompletedEvent field (jaato-server #544); default "stop"
+    # matches the SDK schema so a plain TURN_COMPLETED reads as a normal finish.
+    finish_reason: str = "stop"
 
 
 class TestResponseRenderer:
@@ -118,7 +121,6 @@ class TestEventStreaming:
         sent = " ".join(str(c.args[0]) for c in mock_message.answer.call_args_list if c.args)
         assert "Hello!" in sent
         assert "How can I help?" in sent
-        assert ctx.produced_output
         assert not ctx.accumulated_text
 
     @pytest.mark.asyncio
@@ -159,6 +161,73 @@ class TestEventStreaming:
         assert len(provisioned) == 1, f"system notice sent {len(provisioned)}x: {provisioned}"
         assert "<b>System</b>" in provisioned[0]     # converted (bold)
         assert "**System**" not in provisioned[0]    # not raw literal asterisks
+
+    @pytest.mark.asyncio
+    async def test_abnormal_finish_reason_surfaces_notice(self):
+        """A TURN_COMPLETED with an abnormal finish_reason (max_tokens/safety/
+        error) surfaces the exact server-parity notice — even though the model
+        DID produce output (the gap the old empty-output guard missed)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from jaato_client_telegram.renderer import ResponseRenderer
+
+        renderer = ResponseRenderer()
+        mock_message = MagicMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
+        mock_message.chat.id = 123
+
+        events = [
+            MockEvent(type="agent.output", source="model", mode="write",
+                      text="A partial answer that got cut"),
+            MockEvent(type="turn.completed", finish_reason="max_tokens"),
+            MockEvent(type="agent.completed"),
+        ]
+
+        async def event_generator():
+            for e in events:
+                yield e
+
+        await renderer.stream_response(mock_message, event_generator())
+
+        sends = [str(c.args[0]) for c in mock_message.answer.call_args_list if c.args]
+        notice = [s for s in sends if "Model stopped early" in s]
+        assert len(notice) == 1, f"abnormal notice sent {len(notice)}x: {notice}"
+        assert notice[0] == (
+            "Model stopped early: hit the output-token limit (max_tokens); "
+            "the response is truncated."
+        )
+
+    @pytest.mark.asyncio
+    async def test_normal_finish_reason_stays_silent(self):
+        """The normal finishes — "stop" (turn done) and "tool_use" (model is
+        calling a tool) — must NOT surface any abnormal-finish notice."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from jaato_client_telegram.renderer import ResponseRenderer
+
+        renderer = ResponseRenderer()
+        mock_message = MagicMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
+        mock_message.chat.id = 123
+
+        events = [
+            MockEvent(type="agent.output", source="model", mode="write", text="mid"),
+            MockEvent(type="turn.completed", finish_reason="tool_use"),
+            MockEvent(type="agent.output", source="model", mode="append", text=" and final"),
+            MockEvent(type="turn.completed", finish_reason="stop"),
+            MockEvent(type="agent.completed"),
+        ]
+
+        async def event_generator():
+            for e in events:
+                yield e
+
+        await renderer.stream_response(mock_message, event_generator())
+
+        sends = [str(c.args[0]) for c in mock_message.answer.call_args_list if c.args]
+        assert not [s for s in sends if "Model stopped early" in s]
 
     @pytest.mark.asyncio
     async def test_mid_turn_injection_starts_a_new_bubble(self):

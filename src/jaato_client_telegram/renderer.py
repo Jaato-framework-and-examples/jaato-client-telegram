@@ -168,7 +168,6 @@ class StreamingContext:
     permission_sent: bool = False  # Track if permission UI was sent as separate message
     content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
     last_final_text: str = ""   # Last text sent via send_final_response (dedups repeat TURN_COMPLETED)
-    produced_output: bool = False  # Did this turn render ANY non-empty content to the user?
     stalled: bool = False  # Did the stream go silent (no events) past the stall timeout?
 
     # Buffer for text chunks in arrival order
@@ -443,7 +442,6 @@ class ResponseRenderer:
             )
             if sent:
                 ctx.sent_message = sent
-            ctx.produced_output = True
 
     async def _emit_segments(
         self, initial_message: Message, ctx: StreamingContext,
@@ -659,6 +657,21 @@ class ResponseRenderer:
                 # replace, and the code already preferred accumulated text anyway.)
                 await self._emit_segments(initial_message, ctx, flush=True, final=False)
 
+                # Framework abnormal-finish signal (jaato-server #544): this turn's
+                # finish_reason carries the REAL stop cause, so we branch on data
+                # instead of inferring truncation from empty output. Normal finishes
+                # are "stop" (turn done) and "tool_use" (the model is calling a tool
+                # and will continue); anything else — max_tokens / safety / error — is
+                # an abnormal or truncated finish worth surfacing, even when the model
+                # DID produce output. Cancellation is NOT inferred here: it keeps its
+                # own "[Generation cancelled]" path and its turn may report "stop".
+                if event.finish_reason not in ("stop", "tool_use"):
+                    await self._safe_answer(
+                        initial_message,
+                        self._abnormal_finish_notice(event.finish_reason),
+                        parse_mode=None,
+                    )
+
                 # NOTE: Do NOT break on turn.completed!
                 # Multi-turn agentic flows have multiple turn.completed events
                 # before the final agent.completed. Breaking here would truncate
@@ -780,7 +793,6 @@ class ResponseRenderer:
                         f"{icon} **System**: {escape_html_content(msg)}"
                     )
                     await self._safe_answer(initial_message, formatted, parse_mode="HTML")
-                    ctx.produced_output = True
                     ctx.last_edit_time = time.monotonic()
 
             elif event_type == EventType.ERROR:
@@ -917,19 +929,28 @@ class ResponseRenderer:
         if not ctx.content_sent:
             await self._emit_segments(initial_message, ctx, flush=True, final=True)
 
-        # Empty-turn fallback: if the whole turn rendered NO visible content (e.g.
-        # interrupted before any output), the empty-send guards spare us a Telegram
-        # "message text is empty" error — but would leave the user with silence.
-        # Surface a calm notice instead.
-        if not ctx.produced_output and not ctx.stalled:
-            await self._safe_answer(
-                initial_message,
-                "⚠️ I didn't get a response — please try again, or /reset if it persists.",
-                parse_mode=None,
-            )
-
         unregister_flush_hook(initial_message.chat.id)
         return ctx
+
+    def _abnormal_finish_notice(self, finish_reason: str) -> str:
+        """Human-facing notice for a non-normal ``TurnCompleted.finish_reason``.
+
+        Wording is byte-identical to the server-side accessibility banner
+        (jaato-server #544) so every client surfaces the same finish with the
+        same sentence. The ``(other)`` form covers any future FinishReason value
+        without a hardcoded per-value fallback masking an unknown cause.
+        """
+        return {
+            "max_tokens": (
+                "Model stopped early: hit the output-token limit (max_tokens); "
+                "the response is truncated."
+            ),
+            "safety": (
+                "Model stopped early: the provider's safety filter triggered "
+                "(safety); the response may be incomplete."
+            ),
+            "error": "Model stopped early: the provider reported an error (error).",
+        }.get(finish_reason, f"Model stopped early: {finish_reason}.")
 
     async def _send_with_typing_indicator(
         self,
@@ -1063,8 +1084,6 @@ class ResponseRenderer:
         Instead, new content is sent as separate messages that appear after.
         """
         display_text = ctx.accumulated_text[: self._max_message_length]
-        if display_text.strip():
-            ctx.produced_output = True
 
         # Guard against truly empty messages - Telegram rejects them
         # Check both accumulated_text AND text_buffer
@@ -1127,7 +1146,6 @@ class ResponseRenderer:
             return
 
         text = streaming_context.accumulated_text
-        streaming_context.produced_output = True
         # Dedup: multi-turn agentic flows fire TURN_COMPLETED more than once (e.g.
         # after a host-tool call like show_image). Without this guard the SAME
         # accumulated text is sent again on the second TURN_COMPLETED — a visible
