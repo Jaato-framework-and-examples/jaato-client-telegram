@@ -230,6 +230,49 @@ class TestEventStreaming:
         assert not [s for s in sends if "Model stopped early" in s]
 
     @pytest.mark.asyncio
+    async def test_help_text_event_renders_help_body(self):
+        """A HELP_TEXT event (e.g. from `%<prompt> --help`) renders its (text,
+        style) pager lines as one monospace message. The daemon answers a pure
+        help-ref with a HelpTextEvent + synthetic TURN_COMPLETED (no model turn,
+        server PR #551); this case is what makes the help visible instead of an
+        empty/stalled turn."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from jaato_client_telegram.renderer import ResponseRenderer
+
+        renderer = ResponseRenderer()
+        mock_message = MagicMock()
+        mock_message.answer = AsyncMock(return_value=MagicMock())
+        mock_message.bot.send_chat_action = AsyncMock()
+        mock_message.chat.id = 123
+
+        events = [
+            SimpleNamespace(
+                type="help.text",
+                lines=[
+                    ("USAGE: %travel-plan-request <destination>", "bold"),
+                    ("  destination   where you want to go", ""),
+                ],
+            ),
+            MockEvent(type="turn.completed", finish_reason="stop"),
+            MockEvent(type="agent.completed"),
+        ]
+
+        async def event_generator():
+            for e in events:
+                yield e
+
+        await renderer.stream_response(mock_message, event_generator())
+
+        sends = [str(c.args[0]) for c in mock_message.answer.call_args_list if c.args]
+        help_msgs = [s for s in sends if "travel-plan-request" in s]
+        assert len(help_msgs) == 1, f"help sent {len(help_msgs)}x: {help_msgs}"
+        assert "<pre>" in help_msgs[0]                       # monospace block
+        assert "USAGE: %travel-plan-request" in help_msgs[0]  # header line text
+        assert "where you want to go" in help_msgs[0]         # param line text
+
+    @pytest.mark.asyncio
     async def test_mid_turn_injection_starts_a_new_bubble(self):
         """A mid-turn user steer: the model's reply must be its OWN bubble, not
         glued onto the tail of the narrative it interrupted. The
