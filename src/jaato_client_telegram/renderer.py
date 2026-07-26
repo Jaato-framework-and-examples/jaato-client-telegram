@@ -795,6 +795,24 @@ class ResponseRenderer:
                     await self._safe_answer(initial_message, formatted, parse_mode="HTML")
                     ctx.last_edit_time = time.monotonic()
 
+            elif event_type == EventType.HELP_TEXT:
+                # Prompt/command help, e.g. `%<name> --help`. The daemon answers
+                # a pure help-ref with a HelpTextEvent of (text, style) pager
+                # lines instead of a model turn — plus a synthetic TURN_COMPLETED
+                # (server PR #551) so the turn closes and stall detection resets.
+                # This case makes the help actually visible: render the line texts
+                # in a monospace block so USAGE / PARAMETERS columns stay aligned
+                # on mobile. `style` is an advisory hint we don't need here.
+                help_lines = getattr(event, "lines", []) or []
+                body = "\n".join(
+                    escape_html_content(str(text)) for text, _style in help_lines
+                ).rstrip()
+                if body:
+                    await self._safe_answer(
+                        initial_message, f"<pre>{body}</pre>", parse_mode="HTML"
+                    )
+                    ctx.last_edit_time = time.monotonic()
+
             elif event_type == EventType.ERROR:
                 # Error event - extract error details
                 error_msg = getattr(event, "error", "Unknown error")
