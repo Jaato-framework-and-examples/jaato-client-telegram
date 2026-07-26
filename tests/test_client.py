@@ -343,5 +343,35 @@ telegram:
             del os.environ["TEST_VAR"]
 
 
+class TestWorkspacePathResolution:
+    """send_to_telegram / show_image resolve a tool-supplied path against the
+    workspace: the confined runner (notebook/cli) emits workspace-relative paths
+    (e.g. `plan.pdf`), but this unconfined bot has a different CWD — so a raw
+    Path() would look in the wrong place and report a real file as 'not found'."""
+
+    def test_relative_path_resolves_against_workspace(self):
+        from pathlib import Path
+
+        from jaato_client_telegram.host_tools import _resolve_workspace_path
+
+        assert _resolve_workspace_path("plan.pdf", "/ws") == Path("/ws/plan.pdf")
+        assert _resolve_workspace_path("a/b/plan.pdf", "/ws") == Path("/ws/a/b/plan.pdf")
+
+    def test_absolute_path_used_as_is(self):
+        from pathlib import Path
+
+        from jaato_client_telegram.host_tools import _resolve_workspace_path
+
+        assert _resolve_workspace_path("/abs/plan.pdf", "/ws") == Path("/abs/plan.pdf")
+
+    def test_no_workspace_uses_path_as_is(self):
+        from pathlib import Path
+
+        from jaato_client_telegram.host_tools import _resolve_workspace_path
+
+        assert _resolve_workspace_path("plan.pdf", None) == Path("plan.pdf")
+        assert _resolve_workspace_path("plan.pdf", "") == Path("plan.pdf")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
