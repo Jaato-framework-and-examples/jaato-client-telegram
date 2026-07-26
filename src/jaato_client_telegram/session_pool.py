@@ -578,7 +578,9 @@ class SessionPool:
         tbot = ThreadAwareBot(
             self._bot, chat_id, lambda cid=chat_id: self._thread_store.current(cid)
         )
-        executors = create_tool_executors(tbot, chat_id, self._file_config)
+        executors = create_tool_executors(
+            tbot, chat_id, self._file_config, self._ws_config.workspace
+        )
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
         executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
 

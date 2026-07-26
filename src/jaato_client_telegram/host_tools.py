@@ -170,9 +170,11 @@ TOOL_CATEGORIES = {
 }
 
 
-def create_tool_executors(bot, chat_id: int, file_config) -> dict:
-    send_exec = make_send_to_telegram_executor(bot, chat_id, file_config)
-    show_exec = make_show_image_executor(bot, chat_id, file_config)
+def create_tool_executors(
+    bot, chat_id: int, file_config, workspace: "str | None" = None
+) -> dict:
+    send_exec = make_send_to_telegram_executor(bot, chat_id, file_config, workspace)
+    show_exec = make_show_image_executor(bot, chat_id, file_config, workspace)
     return {
         "send_to_telegram": send_exec,
         "telegram_notify": send_exec,
@@ -237,6 +239,7 @@ def make_send_to_telegram_executor(
     bot: "Bot",
     chat_id: int,
     file_config: FileSharingConfig,
+    workspace: "str | None" = None,
 ):
     """Create an executor for the send_to_telegram tool.
 
@@ -248,7 +251,9 @@ def make_send_to_telegram_executor(
 
         try:
             if file_path:
-                result = await _send_file(bot, chat_id, file_path, file_config)
+                result = await _send_file(
+                    bot, chat_id, file_path, file_config, workspace
+                )
                 return {"result": result}
 
             if message:
@@ -263,17 +268,34 @@ def make_send_to_telegram_executor(
     return executor
 
 
+def _resolve_workspace_path(file_path: str, workspace: "str | None") -> Path:
+    """Resolve a tool-supplied file path against the workspace.
+
+    The confined runner (notebook/cli/file tools) runs with the workspace as its
+    CWD, so it naturally emits workspace-RELATIVE paths (e.g. ``plan.pdf``). This
+    UNCONFINED bot has a different CWD, so the same relative path must be resolved
+    against the workspace to point at the same file — otherwise a file the model
+    just wrote reads as "not found" (the send_to_telegram/show_image failure).
+    Absolute paths are used as given; with no workspace configured, as-is.
+    """
+    path = Path(file_path)
+    if path.is_absolute() or not workspace:
+        return path
+    return Path(workspace) / path
+
+
 async def _send_file(
     bot: "Bot",
     chat_id: int,
     file_path: str,
     config: FileSharingConfig,
+    workspace: "str | None" = None,
 ) -> str:
     """Send a file to the Telegram user.  Returns a status string."""
-    path = Path(file_path)
+    path = _resolve_workspace_path(file_path, workspace)
 
     if not path.exists():
-        return f"File not found: {file_path}"
+        return f"File not found: {path}"
 
     if not config.enabled:
         return "File sharing is disabled"
@@ -299,6 +321,7 @@ def make_show_image_executor(
     bot: "Bot",
     chat_id: int,
     file_config: FileSharingConfig,
+    workspace: "str | None" = None,
 ):
     """Create an executor for the show_image tool.
 
@@ -326,7 +349,7 @@ def make_show_image_executor(
 
             if file_path:
                 return await _show_local_image(
-                    bot, chat_id, file_path, caption, file_config
+                    bot, chat_id, file_path, caption, file_config, workspace
                 )
 
             if url:
@@ -348,12 +371,13 @@ async def _show_local_image(
     file_path: str,
     caption: "str | None",
     config: FileSharingConfig,
+    workspace: "str | None" = None,
 ) -> dict:
     """Render a workspace image inline via send_photo. Returns a result dict."""
-    path = Path(file_path)
+    path = _resolve_workspace_path(file_path, workspace)
 
     if not path.exists():
-        return {"error": f"File not found: {file_path}"}
+        return {"error": f"File not found: {path}"}
     if not config.enabled:
         return {"error": "File sharing is disabled"}
 
