@@ -156,7 +156,10 @@ async def test_delivered_content_folded_when_tool_returns_status_only():
     executor, _ = _executor_for(execute)
     result = await executor({})
     assert result["status"] == "sent"
-    assert result["already_shown_to_user"] == ["On this day: X happened."]
+    fold = result["already_shown_to_user"]
+    assert fold["content"] == ["On this day: X happened."]
+    # leads with an imperative do-not-repeat directive the model reads as a value
+    assert "do not" in fold["note"].lower() and "already" in fold["note"].lower()
 
 
 @pytest.mark.asyncio
@@ -193,7 +196,7 @@ async def test_captures_caption_for_media_and_multiple_sends():
 
     executor, _ = _executor_for(execute)
     result = await executor({})
-    assert result["already_shown_to_user"] == ["line one", "a caption"]
+    assert result["already_shown_to_user"]["content"] == ["line one", "a caption"]
 
 
 @pytest.mark.asyncio
@@ -230,8 +233,8 @@ async def test_concurrent_executors_do_not_cross_contaminate():
     exec_a, _ = _executor_for(await make_tool("A"), chat_id=1)
     exec_b, _ = _executor_for(await make_tool("B"), chat_id=2)
     ra, rb = await asyncio.gather(exec_a({}), exec_b({}))
-    assert ra["already_shown_to_user"] == ["content-A"]
-    assert rb["already_shown_to_user"] == ["content-B"]
+    assert ra["already_shown_to_user"]["content"] == ["content-A"]
+    assert rb["already_shown_to_user"]["content"] == ["content-B"]
 
 
 @pytest.mark.asyncio

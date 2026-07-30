@@ -92,6 +92,12 @@ def resolve_host_ask(callback_data: str) -> bool:
 # tool calls in different chats never cross-contaminate. Set only on the dynamic-tool
 # path — the built-ins (send_to_telegram/show_image) are bot-authored and already return
 # proper results, so no recorder is active for them and record_delivery no-ops.
+#
+# The folded value is NOT a bare content list: a descriptive key alone did not stop a
+# weak model (gemini-2.5-flash) from re-emitting the captured text verbatim — it re-sent
+# a tool's whole output as its own reply, doubling it in the chat. So the value leads with
+# an imperative `note` the model reads (already-delivered → do NOT repeat, use only to
+# answer follow-ups), with the content nested under it.
 _DELIVERY_RECORDER: "contextvars.ContextVar[list[str] | None]" = contextvars.ContextVar(
     "host_tool_delivery_recorder", default=None
 )
@@ -355,10 +361,21 @@ def make_executor(
             _DELIVERY_RECORDER.reset(token)
         result = result if isinstance(result, dict) else {"result": result}
         if recorder:
-            # Fold in what was delivered to the user, under a key that tells the model
-            # this content is ALREADY shown (so it references it for follow-ups rather
-            # than resending). setdefault: never clobber a value the tool set itself.
-            result.setdefault("already_shown_to_user", list(recorder))
+            # Fold in what was delivered, led by an imperative note (a bare content list
+            # under a descriptive key was not enough — a weak model re-emitted it verbatim,
+            # doubling it in the chat). setdefault: never clobber a value the tool set itself.
+            result.setdefault(
+                "already_shown_to_user",
+                {
+                    "note": (
+                        "This content was ALREADY delivered to the user in this chat by "
+                        "this tool call — the user has already seen it. Do NOT repeat, "
+                        "resend, or restate it in your reply. Use it ONLY to answer the "
+                        "user's follow-up questions about it."
+                    ),
+                    "content": list(recorder),
+                },
+            )
         return result
 
     return executor
