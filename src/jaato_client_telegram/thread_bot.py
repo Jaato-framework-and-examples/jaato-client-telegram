@@ -13,7 +13,19 @@ a different chat) is never overridden.
 
 from typing import Any, Callable, Optional
 
-from jaato_client_telegram.host_tool_loader import flush_before_prompt
+from jaato_client_telegram.host_tool_loader import flush_before_prompt, record_delivery
+
+
+def _visible_text(method: str, args: tuple, kwargs: dict) -> str:
+    """The user-visible text a ``send_*`` call delivered: ``text`` for
+    ``send_message`` (positional or keyword), ``caption`` for media sends
+    (``send_photo``/``send_document``/…). ``""`` when there is none (e.g. a bare
+    photo) — record_delivery treats that as nothing to record."""
+    if method == "send_message":
+        text = kwargs.get("text", args[1] if len(args) > 1 else None)
+    else:
+        text = kwargs.get("caption")
+    return str(text) if text else ""
 
 
 class ThreadAwareBot:
@@ -54,14 +66,21 @@ class ThreadAwareBot:
                     kwargs["message_thread_id"] = tid
                     injected = True
             try:
-                return await attr(*args, **kwargs)
+                sent = await attr(*args, **kwargs)
             except Exception as e:  # noqa: BLE001 — only swallow the thread case
                 # A stale/invalid thread id we injected must not break a host-tool
                 # send (private chats give the bot no way to create a thread) —
                 # retry without it. Anything else propagates.
                 if injected and "thread not found" in str(e).lower():
                     kwargs.pop("message_thread_id", None)
-                    return await attr(*args, **kwargs)
-                raise
+                    sent = await attr(*args, **kwargs)
+                else:
+                    raise
+            # Record what a dynamic tool just delivered to its own chat so the model
+            # sees it even if the tool returned only a status (no-op unless a
+            # make_executor recorder is active — see host_tool_loader._DELIVERY_RECORDER).
+            if to_this_chat:
+                record_delivery(_visible_text(name, args, kwargs))
+            return sent
 
         return wrapped

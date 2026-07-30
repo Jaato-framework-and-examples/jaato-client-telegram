@@ -27,6 +27,7 @@ confined runner cannot write there) and are loaded at startup without re-prompt.
 """
 
 import asyncio
+import contextvars
 import importlib
 import logging
 import re
@@ -74,6 +75,37 @@ def resolve_host_ask(callback_data: str) -> bool:
     return False
 
 
+# ---- delivered-content capture (make a tool's chat sends visible to the model) ----
+# A model-authored host tool reaches the model ONLY through what its execute()
+# RETURNS (the daemon JSON-encodes the return value as the tool result). A tool that
+# renders straight to Telegram — ctx.bot.send_message(...) — and returns just a status
+# (or None) leaves the model blind to what it delivered, so it cannot answer follow-ups
+# about that content. That correctness must not depend on every model-authored tool
+# remembering to also return what it sent.
+#
+# This contextvar closes the gap at the harness level: make_executor sets a fresh
+# recorder around each execute() call; ThreadAwareBot appends the visible text of every
+# send that lands in the tool's chat (see thread_bot.record_delivery call); make_executor
+# then folds the captured lines into the returned dict under `already_shown_to_user`, so
+# the model always sees what its tool pushed — whatever the author remembered to return.
+# It is task-scoped (contextvars follow the awaited execute() coroutine), so concurrent
+# tool calls in different chats never cross-contaminate. Set only on the dynamic-tool
+# path — the built-ins (send_to_telegram/show_image) are bot-authored and already return
+# proper results, so no recorder is active for them and record_delivery no-ops.
+_DELIVERY_RECORDER: "contextvars.ContextVar[list[str] | None]" = contextvars.ContextVar(
+    "host_tool_delivery_recorder", default=None
+)
+
+
+def record_delivery(text: str) -> None:
+    """Append user-visible text a host tool just delivered to its chat to the active
+    per-call recorder. No-op when no recorder is set (outside a dynamic tool's execute,
+    e.g. a built-in executor's sends) or when ``text`` is empty."""
+    recorder = _DELIVERY_RECORDER.get()
+    if recorder is not None and text:
+        recorder.append(text)
+
+
 # ---- render-flush coordination (narration before an out-of-band tool prompt) ----
 # A host tool's ask_user()/ctx.ask() sends its prompt IMMEDIATELY via bot.send_message,
 # bypassing the renderer's throttled narration — so the prompt can reach Telegram before
@@ -107,7 +139,11 @@ async def flush_before_prompt(chat_id: int) -> None:
 
 
 async def ask_user(
-    bot: Any, chat_id: int, text: str, options: list[str], timeout: float = 300.0,
+    bot: Any,
+    chat_id: int,
+    text: str,
+    options: list[str],
+    timeout: float = 300.0,
 ) -> "str | None":
     """Send a single-choice question with inline buttons and AWAIT the answer —
     WITHOUT polling. The main bot's single getUpdates poll routes the button tap
@@ -118,10 +154,16 @@ async def ask_user(
     if not options:
         raise ValueError("ask_user requires at least one option")
     req_id = uuid.uuid4().hex[:12]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=str(opt)[:60], callback_data=f"{_HOST_CB_PREFIX}{req_id}:{i}")]
-        for i, opt in enumerate(options)
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=str(opt)[:60], callback_data=f"{_HOST_CB_PREFIX}{req_id}:{i}"
+                )
+            ]
+            for i, opt in enumerate(options)
+        ]
+    )
     fut: "asyncio.Future[int]" = asyncio.get_running_loop().create_future()
     _PENDING_ASKS[req_id] = fut
     try:
@@ -140,6 +182,7 @@ async def ask_user(
 @dataclass
 class ToolContext:
     """Runtime context handed to a dynamic tool's ``execute(args, ctx)``."""
+
     bot: Any
     chat_id: int
     # Injected by the bot: submit an agent-facing event turn to the chat's pump.
@@ -221,7 +264,9 @@ def tools_venv_site_packages(venv: Path) -> Path:
     entries at import time). The venv MUST be built with the bot's Python for the
     in-process import to be ABI-compatible; a mismatched version yields a path
     that never exists (feature stays off — no silent fallback)."""
-    return venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    return (
+        venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    )
 
 
 def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
@@ -244,7 +289,9 @@ def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
     module = types.ModuleType(f"host_tool__{path.stem}")
     module.__file__ = str(path)
     try:
-        exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102 — trusted, user-approved file
+        exec(
+            compile(source, str(path), "exec"), module.__dict__
+        )  # noqa: S102 — trusted, user-approved file
     except Exception as e:  # noqa: BLE001 — surface any load error as ValueError
         raise ValueError(f"{path.name}: failed to load: {e}") from e
 
@@ -268,7 +315,9 @@ def load_tool_file(path: Path) -> tuple[dict, Callable[..., Awaitable[Any]]]:
 
 
 def make_executor(
-    execute_fn: Callable[..., Awaitable[Any]], bot: Any, chat_id: int,
+    execute_fn: Callable[..., Awaitable[Any]],
+    bot: Any,
+    chat_id: int,
     wake: "Callable[[int, str], None] | None" = None,
     workspace: str = "",
     host_tools_dir: str = "",
@@ -277,9 +326,13 @@ def make_executor(
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
     ctx = ToolContext(
-        bot=bot, chat_id=chat_id, wake_fn=wake,
-        workspace=workspace, host_tools_dir=host_tools_dir,
-        bind_fn=bind_fn, unbind_fn=unbind_fn,
+        bot=bot,
+        chat_id=chat_id,
+        wake_fn=wake,
+        workspace=workspace,
+        host_tools_dir=host_tools_dir,
+        bind_fn=bind_fn,
+        unbind_fn=unbind_fn,
     )
 
     async def executor(args: dict) -> dict:
@@ -289,12 +342,24 @@ def make_executor(
         # was first scanned (empty) at startup — the "install then use it now"
         # case, e.g. moon_phase importing skyfield inside execute().
         importlib.invalidate_caches()
+        # Capture everything the tool renders to its chat during this call so the
+        # model sees it even when the tool returns only a status (see _DELIVERY_RECORDER).
+        recorder: list[str] = []
+        token = _DELIVERY_RECORDER.set(recorder)
         try:
             result = await execute_fn(args or {}, ctx)
         except Exception as e:  # noqa: BLE001 — tool boundary
             logger.exception("dynamic host tool execution failed")
             return {"error": str(e)}
-        return result if isinstance(result, dict) else {"result": result}
+        finally:
+            _DELIVERY_RECORDER.reset(token)
+        result = result if isinstance(result, dict) else {"result": result}
+        if recorder:
+            # Fold in what was delivered to the user, under a key that tells the model
+            # this content is ALREADY shown (so it references it for follow-ups rather
+            # than resending). setdefault: never clobber a value the tool set itself.
+            result.setdefault("already_shown_to_user", list(recorder))
+        return result
 
     return executor
 
