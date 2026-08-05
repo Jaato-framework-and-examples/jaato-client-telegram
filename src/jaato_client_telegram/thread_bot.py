@@ -13,7 +13,11 @@ a different chat) is never overridden.
 
 from typing import Any, Callable, Optional
 
-from jaato_client_telegram.host_tool_loader import flush_before_prompt, record_delivery
+from jaato_client_telegram.host_tool_loader import (
+    flush_before_prompt,
+    open_fold_slot,
+    record_delivery,
+)
 
 
 def _visible_text(method: str, args: tuple, kwargs: dict) -> str:
@@ -81,6 +85,15 @@ class ThreadAwareBot:
             # make_executor recorder is active — see host_tool_loader._DELIVERY_RECORDER).
             if to_this_chat:
                 record_delivery(_visible_text(name, args, kwargs))
+            # After an image lands in THIS chat, ask the renderer to open a fold slot
+            # right here so the turn's trailing narration edits into this position
+            # instead of appending below a reply the user slips in (no-op unless the
+            # renderer registered a fold hook — i.e. rendering.fold_post_image_text on).
+            # Scoped to send_photo (what show_image and image tools use); NOT send_document
+            # — that also carries PDFs/arbitrary files, which must not open an image fold.
+            # Images delivered as documents / media groups are a known gap, left for later.
+            if to_this_chat and name == "send_photo":
+                await open_fold_slot(self._chat_id)
             return sent
 
         return wrapped

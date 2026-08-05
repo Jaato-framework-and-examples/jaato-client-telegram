@@ -13,7 +13,12 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from jaato_client_telegram.host_tool_loader import register_flush_hook, unregister_flush_hook
+from jaato_client_telegram.host_tool_loader import (
+    register_flush_hook,
+    register_fold_hook,
+    unregister_flush_hook,
+    unregister_fold_hook,
+)
 from jaato_client_telegram.semantic_markup import render_semantic_markup
 
 from aiogram.exceptions import TelegramBadRequest
@@ -182,6 +187,13 @@ class StreamingContext:
     # chat (read live so an open_thread mid-turn is reflected). None => follow the
     # incoming message's thread via Message.answer() as before.
     thread_id_getter: "Callable[[], int | None] | None" = None
+
+    # Post-image fold (opt-in): after a host tool sends an image, the renderer drops a
+    # placeholder bubble in that position (fold_target) and folds the turn's remaining
+    # narration into it via edit, so it stays above a reply the user slips in. fold_text
+    # is the cumulative folded text; both reset when the fold closes / the turn ends.
+    fold_target: "Message | None" = None
+    fold_text: str = ""
 
 
 def _has_telegram_html(text: str) -> bool:
@@ -359,6 +371,11 @@ def segment_stream_text(
     return units, remainder
 
 
+# Placeholder text for a post-image fold slot (Telegram rejects an empty message, so the
+# reserved bubble carries a "still writing" cue until the trailing narration edits in).
+_FOLD_PLACEHOLDER = "✍️ …"
+
+
 class ResponseRenderer:
     """
     Renders jaato events as Telegram messages.
@@ -374,6 +391,7 @@ class ResponseRenderer:
         permission_handler: "PermissionHandler | None" = None,
         file_handler: "FileHandler | None" = None,
         clarification_handler: "ClarificationHandler | None" = None,
+        fold_post_image_text: bool = False,
     ):
         """
         Initialize the renderer.
@@ -390,6 +408,7 @@ class ResponseRenderer:
         self._permission_handler = permission_handler
         self._file_handler = file_handler
         self._clarification_handler = clarification_handler
+        self._fold_post_image = fold_post_image_text
 
     def _flush_text_buffer(self, ctx: StreamingContext) -> None:
         """
@@ -426,7 +445,32 @@ class ResponseRenderer:
 
     async def _emit_one(self, initial_message: Message, ctx: StreamingContext, text: str) -> None:
         """Send one segmented unit as its own Telegram message (splitting at 4096
-        if a single unit is huge, e.g. a giant code block)."""
+        if a single unit is huge, e.g. a giant code block).
+
+        When a post-image fold slot is open (ctx.fold_target, opt-in), the unit is
+        folded into that placeholder via edit instead — keeping the turn's trailing
+        narration in its position above a reply the user slipped in — until it would
+        exceed the message limit, at which point the fold closes and this and later
+        units send normally (overflow appends below)."""
+        # A whitespace-only unit carries nothing to show; skip it WITHOUT closing an open
+        # fold slot (segment_stream_text can yield these; the normal path below also
+        # guards them). Closing here would send the real narration that follows as its
+        # own bubble, defeating the fold.
+        if not text.strip():
+            return
+        if ctx.fold_target is not None:
+            candidate = f"{ctx.fold_text}\n\n{text}".strip() if ctx.fold_text else text.strip()
+            # Telegram limits the post-parse text in UTF-16 code units. The candidate's
+            # UTF-16 length is a safe upper bound on the rendered/parsed length (markdown
+            # only shrinks; HTML entities parse back to 1 char), so gate on it — a raw
+            # len() under-counts astral emoji and could let an edit fail silently, leaving
+            # the slot stuck (every later unit re-failing).
+            if (len(candidate.encode("utf-16-le")) // 2) <= self._max_message_length:
+                ctx.fold_text = candidate
+                await self._safe_edit(ctx.fold_target, markdown_to_telegram_html(candidate))
+                return
+            # Too big to fold: close the slot; this unit (and later ones) send normally.
+            ctx.fold_target = None
         tid = ctx.thread_id_getter() if ctx.thread_id_getter else None
         for chunk in split_preserving_paragraphs(text, self._max_message_length):
             if not chunk.strip():
@@ -467,6 +511,36 @@ class ResponseRenderer:
                 )
             for unit in units:
                 await self._emit_one(initial_message, ctx, unit)
+
+    async def _open_fold_slot(self, initial_message: Message, ctx: StreamingContext) -> None:
+        """Drop a placeholder bubble right after an image so the turn's trailing
+        narration folds into this position (see StreamingContext.fold_target). Invoked
+        from the tool-send funnel (ThreadAwareBot) AFTER an image lands; the pre-image
+        narration was already flushed by flush_before_prompt, so we only place the
+        marker here. Serialized on emit_lock against the renderer's own emission."""
+        async with ctx.emit_lock:
+            # A prior placeholder with nothing folded into it yet (image, no text, then
+            # a second image) would orphan a "writing…" cue — discard it before replacing.
+            await self._discard_fold_if_unused(ctx)
+            tid = ctx.thread_id_getter() if ctx.thread_id_getter else None
+            ctx.fold_target = await self._safe_answer(
+                initial_message, _FOLD_PLACEHOLDER, parse_mode=None, message_thread_id=tid,
+            )
+            ctx.fold_text = ""
+
+    async def _discard_fold_if_unused(self, ctx: StreamingContext) -> None:
+        """Close an open fold slot, deleting the placeholder if nothing was folded into
+        it (image was the turn's last output, or a reply/injection arrived before any
+        narration) so no stray "✍️ …" cue is left behind. Idempotent; always leaves
+        fold_target None. Every close-site (turn end, mid-turn injection, replacing a
+        slot) routes through here so none can leak a placeholder."""
+        if ctx.fold_target is not None and not ctx.fold_text:
+            try:
+                await ctx.fold_target.delete()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+        ctx.fold_target = None
+        ctx.fold_text = ""
 
     def is_awaiting_user(self, chat_id: int) -> bool:
         """True if a permission or clarification is pending for this chat — i.e.
@@ -516,6 +590,16 @@ class ResponseRenderer:
             initial_message.chat.id,
             lambda: self._emit_segments(initial_message, ctx, flush=True, final=False),
         )
+
+        # Opt-in: register a per-chat fold hook so ThreadAwareBot can, right after an
+        # image lands, ask this ctx to open a placeholder that the turn's trailing
+        # narration edits into (keeping it above a reply the user slips in). Off => the
+        # hook is never registered and open_fold_slot no-ops, leaving the default path.
+        if self._fold_post_image:
+            register_fold_hook(
+                initial_message.chat.id,
+                lambda: self._open_fold_slot(initial_message, ctx),
+            )
 
         init_progress_count = 0
         # On re-attach the daemon emits AGENT_STATUS_CHANGED "idle" during the restore
@@ -685,6 +769,11 @@ class ResponseRenderer:
                 # starts a FRESH bubble instead of gluing onto the tail of the
                 # narrative it interrupted.
                 await self._emit_segments(initial_message, ctx, flush=True, final=True)
+                # The reply to the injection is a new beat — close any open fold slot so
+                # it starts a fresh bubble instead of editing into the image placeholder.
+                # Route through the helper so an as-yet-unused placeholder is deleted, not
+                # orphaned (an image sent then steered before any narration folded in).
+                await self._discard_fold_if_unused(ctx)
                 log.debug("mid-turn prompt injected — flushed narration; reply starts a new bubble")
 
             elif event_type == EventType.AGENT_STATUS_CHANGED:
@@ -947,7 +1036,12 @@ class ResponseRenderer:
         if not ctx.content_sent:
             await self._emit_segments(initial_message, ctx, flush=True, final=True)
 
+        # Fold cleanup: discard an unused placeholder (image was the turn's last output)
+        # so it doesn't linger as a stray "writing…" cue.
+        await self._discard_fold_if_unused(ctx)
+
         unregister_flush_hook(initial_message.chat.id)
+        unregister_fold_hook(initial_message.chat.id)
         return ctx
 
     def _abnormal_finish_notice(self, finish_reason: str) -> str:

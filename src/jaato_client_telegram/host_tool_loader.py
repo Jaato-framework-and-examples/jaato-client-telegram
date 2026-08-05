@@ -144,6 +144,40 @@ async def flush_before_prompt(chat_id: int) -> None:
         logger.debug("flush_before_prompt failed for chat %d", chat_id, exc_info=True)
 
 
+# ---- post-image fold coordination (keep a turn's trailing narration above a reply) ----
+# An image is sent by a host tool (show_image / a dynamic tool's ctx.bot.send_photo) —
+# out-of-band, ahead of the renderer's throttled narration. If the model narrates AFTER
+# the image and the user replies to the image in that gap, the narration lands BELOW the
+# reply. The renderer (when rendering.fold_post_image_text is on) registers a per-chat
+# fold hook; ThreadAwareBot calls it right AFTER an image send, so the renderer drops a
+# placeholder bubble in that position and folds the turn's remaining text into it via
+# edit — keeping order without moving the user's message. No-op when unregistered (flag
+# off) so the default path is untouched.
+_FOLD_HOOKS: "dict[int, Callable[[], Awaitable[None]]]" = {}
+
+
+def register_fold_hook(chat_id: int, hook: "Callable[[], Awaitable[None]]") -> None:
+    """Renderer: while streaming a chat's turn (fold enabled), register a coro that
+    opens a fold slot. Overwrites any prior hook for the chat (last turn wins)."""
+    _FOLD_HOOKS[chat_id] = hook
+
+
+def unregister_fold_hook(chat_id: int) -> None:
+    _FOLD_HOOKS.pop(chat_id, None)
+
+
+async def open_fold_slot(chat_id: int) -> None:
+    """Ask the renderer to open a post-image fold slot for this chat. No-op when the
+    renderer isn't streaming with fold enabled (nothing registered)."""
+    hook = _FOLD_HOOKS.get(chat_id)
+    if hook is None:
+        return
+    try:
+        await hook()
+    except Exception:  # noqa: BLE001 — a fold fault must never block the tool
+        logger.debug("open_fold_slot failed for chat %d", chat_id, exc_info=True)
+
+
 async def ask_user(
     bot: Any,
     chat_id: int,
