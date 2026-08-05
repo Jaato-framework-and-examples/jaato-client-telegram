@@ -304,10 +304,6 @@ async def _send_file(
     if size_mb > config.max_file_size_mb:
         return f"File too large: {size_mb:.1f}MB > {config.max_file_size_mb}MB limit"
 
-    ext = path.suffix.lower()
-    if ext not in config.allowed_extensions:
-        return f"File type not supported: {ext}"
-
     from aiogram.types import FSInputFile
     await bot.send_document(
         chat_id=chat_id,

@@ -185,7 +185,7 @@ Connected all components in the dependency injection system.
 **Configuration:**
 - `link_threshold_kb` (default 100KB)
 - `max_file_size_mb` (default 10MB)
-- `allowed_extensions` (whitelist)
+- (no file-type allowlist — any type is sent; gated only by `enabled` + size)
 
 **Reasons:**
 - Small files: Instant access, no network needed
@@ -298,20 +298,7 @@ file_sharing:
   # Maximum file size in MB (Telegram bot limit is 50MB, default 10MB)
   max_file_size_mb: 10
 
-  # Allowed file extensions (lowercase with dots)
-  allowed_extensions:
-    - ".txt"
-    - ".csv"
-    - ".json"
-    - ".xml"
-    - ".yaml"
-    - ".yml"
-    - ".md"
-    - ".py"
-    - ".js"
-    - ".ts"
-    - ".html"
-    - ".css"
+  # (No file-type allowlist — any type is sent; gated only by enabled + size.)
 
   # Size threshold for determining delivery method (in KB)
   # Files < this size are ATTACHED as document attachments

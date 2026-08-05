@@ -82,20 +82,6 @@ class FileHandler:
                 )
                 return False
 
-            # Check file extension
-            file_ext = file_path_obj.suffix.lower()
-            if file_ext not in self._config.allowed_extensions:
-                logger.warning(
-                    f"File extension not allowed: {file_ext} "
-                    f"(allowed: {', '.join(self._config.allowed_extensions)})"
-                )
-                await message.answer(
-                    f"⚠️ File type not supported: `{file_ext}`\n"
-                    f"File path: `{file_path}`",
-                    parse_mode="HTML"
-                )
-                return False
-
             # Determine how to send the file based on size
             if file_size_kb < self._config.link_threshold_kb:
                 # Small file - send as document attachment
