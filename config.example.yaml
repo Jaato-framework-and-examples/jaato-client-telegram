@@ -172,33 +172,10 @@ file_sharing:
   # Maximum file size in MB (Telegram bot limit is 50MB, default 10MB)
   max_file_size_mb: 10
 
-  # Allowed file extensions (lowercase with dots)
-  # Add or remove extensions as needed for your use case
-  allowed_extensions:
-    - ".txt"
-    - ".csv"
-    - ".json"
-    - ".xml"
-    - ".yaml"
-    - ".yml"
-    - ".md"
-    - ".py"
-    - ".js"
-    - ".ts"
-    - ".html"
-    - ".css"
-    - ".java"
-    - ".kt"
-    - ".rs"
-    - ".go"
-    - ".sh"
-    - ".bash"
-    - ".zsh"
-    - ".cfg"
-    - ".conf"
-    - ".ini"
-    - ".toml"
-    - ".lock"
+  # Note: there is no file-type allowlist. send_document handles any type and the
+  # recipient is the chat owner. (If exfiltration is a concern for a multi-user
+  # deployment, the right control is workspace path confinement, not an extension
+  # gate — see docs/backlog.md.)
 
   # Size threshold for determining delivery method (in KB)
   # Files < this size are sent as document attachments

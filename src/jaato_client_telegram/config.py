@@ -198,9 +198,11 @@ class FileSharingConfig(BaseModel):
 
     enabled: bool = True
     max_file_size_mb: int = 10  # Telegram bot limit
-    allowed_extensions: list[str] = Field(
-        default_factory=lambda: [".txt", ".csv", ".json", ".xml", ".yaml", ".yml", ".md", ".py", ".js", ".ts", ".html", ".css"]
-    )
+    # No file-type allowlist: send_document handles any type, the recipient is the
+    # chat owner, and an extension check enforces nothing coherent (it's bypassable,
+    # permits secret-bearing .json/.yaml/.py, and does not confine the path). If
+    # exfiltration is a concern, the real control is workspace path confinement, not
+    # an extension gate — see docs/backlog.md. Removed deliberately (no hardcoded gate).
     # Size threshold for determining delivery method (in KB)
     # Files < this size are sent as document attachments
     # Files >= this size are sent as Telegram file hosting URLs
