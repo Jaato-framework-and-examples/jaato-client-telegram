@@ -128,6 +128,12 @@ rendering:
   # Throttle edits to respect rate limits (milliseconds)
   edit_throttle_ms: 500
 
+  # After a host tool sends an image, fold the turn's trailing narration into a
+  # placeholder bubble at the image's position (edit-in-place) so it stays above a
+  # reply you slip in during the gap, instead of landing below it. On by default;
+  # shows a brief "writing…" cue on every image. Set false to disable.
+  fold_post_image_text: true
+
   # Minimum gap between message-creating sends to the SAME chat (milliseconds),
   # so we stay under Telegram's ~1 message/second per-chat limit. A long reply
   # split into several messages paces out at this interval. 0 disables pacing
