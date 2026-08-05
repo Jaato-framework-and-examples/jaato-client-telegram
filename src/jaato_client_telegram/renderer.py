@@ -739,7 +739,19 @@ class ResponseRenderer:
                 # (The old formatted_text "delete streaming msg + resend" dance is
                 # gone — we stream discrete units, there is no single message to
                 # replace, and the code already preferred accumulated text anyway.)
-                await self._emit_segments(initial_message, ctx, flush=True, final=False)
+                #
+                # A "stop" finish is a genuine turn end; "tool_use" means the model
+                # continues this turn after a tool. Only at a real end do we finalize an
+                # open post-image fold and CLOSE it: this ctx persists across turns (it
+                # resets only at AGENT_COMPLETED), so a slot left open would bleed the
+                # NEXT turn's reply into this image's placeholder — and a later failed-
+                # image turn's error text into a stale one (the observed cross-turn bug).
+                # Only then do we flush final (fold the tail in); non-fold / tool_use
+                # turns keep holding the tail as before.
+                fold_close = event.finish_reason == "stop" and ctx.fold_target is not None
+                await self._emit_segments(initial_message, ctx, flush=True, final=fold_close)
+                if fold_close:
+                    await self._discard_fold_if_unused(ctx)
 
                 # Framework abnormal-finish signal (jaato-server #544): this turn's
                 # finish_reason carries the REAL stop cause, so we branch on data

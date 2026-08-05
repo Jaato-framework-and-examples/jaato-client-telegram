@@ -429,6 +429,56 @@ async def test_discard_fold_keeps_used_placeholder_but_closes_slot():
     assert ctx.fold_target is None  # but the slot is closed
 
 
+@pytest.mark.asyncio
+async def test_turn_completed_closes_fold_so_next_turn_does_not_bleed():
+    # The cross-turn bug: the ctx persists across turns (resets only at AGENT_COMPLETED),
+    # so an image turn's placeholder must be closed at TURN_COMPLETED(stop) — else the
+    # NEXT turn's reply folds into it. Drive two turns through the real stream loop.
+    from unittest.mock import AsyncMock, MagicMock
+    from jaato_client_telegram.renderer import ResponseRenderer, _FOLD_PLACEHOLDER
+    from jaato_client_telegram.host_tool_loader import open_fold_slot
+
+    sent = []
+
+    def _mk(*a, **k):
+        m = MagicMock()
+        m.edit_text = AsyncMock()
+        m.delete = AsyncMock()
+        m._init_text = a[0] if a else k.get("text")
+        sent.append(m)
+        return m
+
+    msg = MagicMock()
+    msg.chat.id = 1
+    msg.is_topic_message = False
+    msg.message_thread_id = None
+    msg.answer = AsyncMock(side_effect=_mk)
+    msg.bot.send_chat_action = AsyncMock()
+    msg.bot.send_message = AsyncMock(side_effect=_mk)
+
+    class Ev:
+        def __init__(self, **k):
+            self.__dict__.update(k)
+
+    async def gen():
+        yield Ev(type="agent.output", source="model", mode="write", text="Here is an image.\n\n")
+        await open_fold_slot(1)  # a host tool sent an image → placeholder opens
+        yield Ev(type="agent.output", source="model", mode="write", text="I hope it displays.\n\n")
+        yield Ev(type="turn.completed", finish_reason="stop")  # turn A ends here
+        yield Ev(type="agent.output", source="model", mode="write", text="Excellent, glad it worked!\n\n")
+        yield Ev(type="agent.completed")
+
+    await ResponseRenderer(fold_post_image_text=True).stream_response(
+        msg, gen(), thread_id_getter=lambda: None
+    )
+
+    ph = next(m for m in sent if m._init_text == _FOLD_PLACEHOLDER)
+    folded = " ".join(str(c.args[0]) for c in ph.edit_text.await_args_list)
+    assert "displays" in folded  # turn A's narration folded into the placeholder
+    assert "Excellent" not in folded  # turn B did NOT bleed into it (fold closed at TURN_COMPLETED)
+    ph.delete.assert_not_awaited()  # placeholder had content → kept, not orphaned
+
+
 # ── renderer follows the store's current thread (+ stale-thread guard) ────────
 
 
