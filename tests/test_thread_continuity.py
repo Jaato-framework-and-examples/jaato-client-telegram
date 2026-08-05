@@ -248,6 +248,151 @@ async def test_error_in_tool_returns_error_not_capture():
     assert result == {"error": "boom"}
 
 
+# ── post-image fold (rendering.fold_post_image_text) ──────────────────────────
+# After a host tool sends an image, the turn's trailing narration should fold (edit)
+# into a placeholder dropped at the image's position, so it stays above a reply the
+# user slips into the gap — instead of appending a new message below it.
+
+
+def _fold_renderer(max_len=4096):
+    from jaato_client_telegram.renderer import ResponseRenderer
+
+    return ResponseRenderer(max_message_length=max_len, fold_post_image_text=True)
+
+
+def _mock_initial(chat_id=1):
+    from unittest.mock import AsyncMock, MagicMock
+
+    m = MagicMock()
+    m.chat.id = chat_id
+    m.is_topic_message = False
+    m.message_thread_id = None
+    m.bot.send_chat_action = AsyncMock()
+
+    def _make_msg(*a, **k):
+        sm = MagicMock()
+        sm.edit_text = AsyncMock()
+        sm.delete = AsyncMock()
+        return sm
+
+    m.answer = AsyncMock(side_effect=_make_msg)
+    return m
+
+
+@pytest.mark.asyncio
+async def test_open_fold_slot_creates_placeholder():
+    from jaato_client_telegram.renderer import _FOLD_PLACEHOLDER
+
+    r, ctx, initial = _fold_renderer(), _mk_ctx(), _mock_initial()
+    await r._open_fold_slot(initial, ctx)
+    assert ctx.fold_target is not None and ctx.fold_text == ""
+    assert initial.answer.await_args.args[0] == _FOLD_PLACEHOLDER  # the "writing…" cue
+
+
+@pytest.mark.asyncio
+async def test_emit_one_folds_via_edit_not_new_message():
+    r, ctx, initial = _fold_renderer(), _mk_ctx(), _mock_initial()
+    ph = _mk_ph()
+    ctx.fold_target = ph
+    await r._emit_one(initial, ctx, "I have searched. Can you see it now?")
+    ph.edit_text.assert_awaited()  # folded via edit
+    assert "searched" in ctx.fold_text
+    initial.answer.assert_not_awaited()  # no new bubble below
+
+
+@pytest.mark.asyncio
+async def test_emit_one_fold_accumulates_multiple_units():
+    r, ctx, initial = _fold_renderer(), _mk_ctx(), _mock_initial()
+    ph = _mk_ph()
+    ctx.fold_target = ph
+    await r._emit_one(initial, ctx, "first")
+    await r._emit_one(initial, ctx, "second")
+    assert "first" in ctx.fold_text and "second" in ctx.fold_text
+    assert ph.edit_text.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_emit_one_fold_overflow_closes_and_sends_normally():
+    r, ctx, initial = _fold_renderer(max_len=40), _mk_ctx(), _mock_initial()
+    ph = _mk_ph()
+    ctx.fold_target = ph
+    ctx.fold_text = "x" * 38
+    await r._emit_one(initial, ctx, "this pushes the fold well over the 40-char limit")
+    assert ctx.fold_target is None  # fold closed on overflow
+    ph.edit_text.assert_not_awaited()  # overflow unit not folded
+    initial.answer.assert_awaited()  # sent normally instead
+
+
+@pytest.mark.asyncio
+async def test_open_fold_slot_deletes_prior_unused_placeholder():
+    r, ctx, initial = _fold_renderer(), _mk_ctx(), _mock_initial()
+    await r._open_fold_slot(initial, ctx)
+    first = ctx.fold_target
+    await r._open_fold_slot(initial, ctx)  # nothing folded into first → replace it
+    first.delete.assert_awaited()
+    assert ctx.fold_target is not first
+
+
+def _mk_ctx():
+    from jaato_client_telegram.renderer import StreamingContext
+
+    return StreamingContext()
+
+
+def _mk_ph():
+    from unittest.mock import AsyncMock, MagicMock
+
+    ph = MagicMock()
+    ph.edit_text = AsyncMock()
+    ph.delete = AsyncMock()
+    return ph
+
+
+@pytest.mark.asyncio
+async def test_send_photo_triggers_open_fold_slot():
+    from jaato_client_telegram.host_tool_loader import register_fold_hook, unregister_fold_hook
+
+    called = []
+
+    async def hook():
+        called.append("opened")
+
+    register_fold_hook(1, hook)
+    try:
+        tb = ThreadAwareBot(_RecBot(), chat_id=1, thread_getter=lambda: None)
+        await tb.send_photo(1, "file_id")
+        assert called == ["opened"]
+    finally:
+        unregister_fold_hook(1)
+
+
+@pytest.mark.asyncio
+async def test_send_message_and_other_chat_do_not_open_fold():
+    from jaato_client_telegram.host_tool_loader import register_fold_hook, unregister_fold_hook
+
+    called = []
+
+    async def hook():
+        called.append("x")
+
+    register_fold_hook(1, hook)
+    try:
+        tb = ThreadAwareBot(_RecBot(), chat_id=1, thread_getter=lambda: None)
+        await tb.send_message(chat_id=1, text="hi")  # not a photo → no fold
+        await tb.send_photo(2, "file_id")  # other chat → no fold
+        assert called == []
+    finally:
+        unregister_fold_hook(1)
+
+
+@pytest.mark.asyncio
+async def test_send_photo_noops_without_fold_hook():
+    # Flag off ⇒ renderer never registers a fold hook ⇒ open_fold_slot no-ops and the
+    # image send still succeeds unchanged.
+    tb = ThreadAwareBot(_RecBot(), chat_id=1, thread_getter=lambda: None)
+    assert await tb.send_photo(1, "file_id") == "ok"
+
+
 # ── renderer follows the store's current thread (+ stale-thread guard) ────────
 
 

@@ -146,6 +146,12 @@ class RenderingConfig(BaseModel):
     stream_edits: bool = True
     typing_indicator: bool = True
     edit_throttle_ms: int = 500
+    # When on: after a host tool sends an image, the turn's remaining narration is
+    # folded (edit-in-place) into a placeholder bubble dropped right after the image,
+    # instead of appended as a new message below any reply the user slips in during
+    # the gap. Keeps causal order without moving the user's message. Off by default
+    # (opt-in) — the placeholder shows a brief "writing…" cue on every image.
+    fold_post_image_text: bool = False
     # Minimum gap between message-creating sends to the SAME chat, so we stay
     # under Telegram's ~1 message/second per-chat limit (proactive outbound rate
     # limiting; see outbound_rate_limiter.py). 0 disables pacing (429s are still

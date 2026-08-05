@@ -50,6 +50,7 @@ def _create_renderer(
         permission_handler=permission_handler,
         file_handler=file_handler,
         clarification_handler=clarification_handler,
+        fold_post_image_text=config.rendering.fold_post_image_text,
     )
 
 
