@@ -452,9 +452,20 @@ class ResponseRenderer:
         narration in its position above a reply the user slipped in — until it would
         exceed the message limit, at which point the fold closes and this and later
         units send normally (overflow appends below)."""
+        # A whitespace-only unit carries nothing to show; skip it WITHOUT closing an open
+        # fold slot (segment_stream_text can yield these; the normal path below also
+        # guards them). Closing here would send the real narration that follows as its
+        # own bubble, defeating the fold.
+        if not text.strip():
+            return
         if ctx.fold_target is not None:
             candidate = f"{ctx.fold_text}\n\n{text}".strip() if ctx.fold_text else text.strip()
-            if candidate and len(candidate) <= self._max_message_length:
+            # Telegram limits the post-parse text in UTF-16 code units. The candidate's
+            # UTF-16 length is a safe upper bound on the rendered/parsed length (markdown
+            # only shrinks; HTML entities parse back to 1 char), so gate on it — a raw
+            # len() under-counts astral emoji and could let an edit fail silently, leaving
+            # the slot stuck (every later unit re-failing).
+            if (len(candidate.encode("utf-16-le")) // 2) <= self._max_message_length:
                 ctx.fold_text = candidate
                 await self._safe_edit(ctx.fold_target, markdown_to_telegram_html(candidate))
                 return
@@ -509,17 +520,27 @@ class ResponseRenderer:
         marker here. Serialized on emit_lock against the renderer's own emission."""
         async with ctx.emit_lock:
             # A prior placeholder with nothing folded into it yet (image, no text, then
-            # a second image) would orphan a "writing…" cue — delete it before replacing.
-            if ctx.fold_target is not None and not ctx.fold_text:
-                try:
-                    await ctx.fold_target.delete()
-                except Exception:  # noqa: BLE001 — best-effort cleanup
-                    pass
+            # a second image) would orphan a "writing…" cue — discard it before replacing.
+            await self._discard_fold_if_unused(ctx)
             tid = ctx.thread_id_getter() if ctx.thread_id_getter else None
             ctx.fold_target = await self._safe_answer(
                 initial_message, _FOLD_PLACEHOLDER, parse_mode=None, message_thread_id=tid,
             )
             ctx.fold_text = ""
+
+    async def _discard_fold_if_unused(self, ctx: StreamingContext) -> None:
+        """Close an open fold slot, deleting the placeholder if nothing was folded into
+        it (image was the turn's last output, or a reply/injection arrived before any
+        narration) so no stray "✍️ …" cue is left behind. Idempotent; always leaves
+        fold_target None. Every close-site (turn end, mid-turn injection, replacing a
+        slot) routes through here so none can leak a placeholder."""
+        if ctx.fold_target is not None and not ctx.fold_text:
+            try:
+                await ctx.fold_target.delete()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+        ctx.fold_target = None
+        ctx.fold_text = ""
 
     def is_awaiting_user(self, chat_id: int) -> bool:
         """True if a permission or clarification is pending for this chat — i.e.
@@ -750,7 +771,9 @@ class ResponseRenderer:
                 await self._emit_segments(initial_message, ctx, flush=True, final=True)
                 # The reply to the injection is a new beat — close any open fold slot so
                 # it starts a fresh bubble instead of editing into the image placeholder.
-                ctx.fold_target = None
+                # Route through the helper so an as-yet-unused placeholder is deleted, not
+                # orphaned (an image sent then steered before any narration folded in).
+                await self._discard_fold_if_unused(ctx)
                 log.debug("mid-turn prompt injected — flushed narration; reply starts a new bubble")
 
             elif event_type == EventType.AGENT_STATUS_CHANGED:
@@ -1013,14 +1036,9 @@ class ResponseRenderer:
         if not ctx.content_sent:
             await self._emit_segments(initial_message, ctx, flush=True, final=True)
 
-        # Fold cleanup: a placeholder with nothing folded into it (image was the turn's
-        # last output) would linger as a stray "writing…" cue — delete it.
-        if ctx.fold_target is not None and not ctx.fold_text:
-            try:
-                await ctx.fold_target.delete()
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-        ctx.fold_target = None
+        # Fold cleanup: discard an unused placeholder (image was the turn's last output)
+        # so it doesn't linger as a stray "writing…" cue.
+        await self._discard_fold_if_unused(ctx)
 
         unregister_flush_hook(initial_message.chat.id)
         unregister_fold_hook(initial_message.chat.id)

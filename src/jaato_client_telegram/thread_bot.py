@@ -89,6 +89,9 @@ class ThreadAwareBot:
             # right here so the turn's trailing narration edits into this position
             # instead of appending below a reply the user slips in (no-op unless the
             # renderer registered a fold hook — i.e. rendering.fold_post_image_text on).
+            # Scoped to send_photo (what show_image and image tools use); NOT send_document
+            # — that also carries PDFs/arbitrary files, which must not open an image fold.
+            # Images delivered as documents / media groups are a known gap, left for later.
             if to_this_chat and name == "send_photo":
                 await open_fold_slot(self._chat_id)
             return sent

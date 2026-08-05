@@ -393,6 +393,42 @@ async def test_send_photo_noops_without_fold_hook():
     assert await tb.send_photo(1, "file_id") == "ok"
 
 
+@pytest.mark.asyncio
+async def test_emit_one_whitespace_unit_keeps_fold_open():
+    # A whitespace-only segment must NOT close the slot (else the real narration that
+    # follows sends as its own bubble below a reply — the bug the feature fixes).
+    r, ctx, initial = _fold_renderer(), _mk_ctx(), _mock_initial()
+    ph = _mk_ph()
+    ctx.fold_target = ph
+    await r._emit_one(initial, ctx, "   \n  ")
+    assert ctx.fold_target is ph  # slot still open
+    ph.edit_text.assert_not_awaited()
+    initial.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discard_fold_deletes_unused_placeholder():
+    # The mid-turn-injection / turn-end close path must delete an unused placeholder,
+    # not orphan a stray "✍️ …" bubble.
+    r, ctx = _fold_renderer(), _mk_ctx()
+    ph = _mk_ph()
+    ctx.fold_target = ph  # fold_text == "" → unused
+    await r._discard_fold_if_unused(ctx)
+    ph.delete.assert_awaited()
+    assert ctx.fold_target is None
+
+
+@pytest.mark.asyncio
+async def test_discard_fold_keeps_used_placeholder_but_closes_slot():
+    r, ctx = _fold_renderer(), _mk_ctx()
+    ph = _mk_ph()
+    ctx.fold_target = ph
+    ctx.fold_text = "already folded narration"
+    await r._discard_fold_if_unused(ctx)
+    ph.delete.assert_not_awaited()  # real content stays in place
+    assert ctx.fold_target is None  # but the slot is closed
+
+
 # ── renderer follows the store's current thread (+ stale-thread guard) ────────
 
 
