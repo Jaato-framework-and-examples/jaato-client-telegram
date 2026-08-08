@@ -16,9 +16,9 @@ apparmor: true
 # google/gemini-2.5-flash (zhipuai glm-4.5v hallucinates, so it's not used).
 # When a user-message image arrives, the content gate nudges the agent to
 # enter_tier('vision'); switch_tier swaps to the cached gemini provider that
-# actually sees the image, then switches back. The OpenRouter key is resolved
-# from the GPG `pass` store via the pass:// secret URI in plugin_configs below
-# (the daemon resolves it; the key is never inlined here).
+# actually sees the image, then switches back. The OpenRouter key is read from
+# ${JAATO_OPENROUTER_API_KEY} (env-var interpolation) in plugin_configs below
+# (public-checkout friendly; pass:// would need jaato-premium — see the README).
 model_tiers:
   # Pin the provider explicitly: switching BACK from a tier that set its own
   # provider (vision -> openrouter) would otherwise inherit openrouter and try the
@@ -73,10 +73,14 @@ plugin_configs:
     api_params:
       temperature: 0.7
   openrouter:
-    # OpenRouter key for the vision tier — the intended provider-config surface,
-    # resolved daemon-side from the GPG `pass` store (HOME-matched; doctor
-    # --secret confirms it resolves). Never inline the raw key here.
-    api_key: "pass://jaato/openrouter/api-key"
+    # OpenRouter key for the vision tier — the intended provider-config surface.
+    # Env-var interpolation (public-checkout friendly): set JAATO_OPENROUTER_API_KEY
+    # in the workspace .env (git-ignored), forwarded to the daemon via env_file.
+    # This used to be "pass://jaato/openrouter/api-key"; that secret-URI scheme is
+    # resolved only by the private jaato-premium package and fails SILENTLY on a
+    # public checkout (the literal URI is sent as the key). If you have
+    # jaato-premium, prefer pass:// (the key never touches the workspace).
+    api_key: "${JAATO_OPENROUTER_API_KEY}"
   memory:
     # Write-side scope gate (server PR #468): the bot has a SINGLE workspace
     # shared across all of a user's chats, so "project" scope already spans every

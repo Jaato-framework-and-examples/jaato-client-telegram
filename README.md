@@ -121,7 +121,7 @@ Top-level blocks: `telegram`, `jaato_ws`, `session`, `rendering`, `permissions`,
 
 ```yaml
 telegram:
-  bot_token: "${TELEGRAM_BOT_TOKEN}"   # never inline secrets; use ${ENV} / pass://
+  bot_token: "${TELEGRAM_BOT_TOKEN}"   # never inline secrets; use ${ENV} (pass:// needs jaato-premium)
   mode: "polling"                       # or "webhook"
 
 jaato_ws:
@@ -140,6 +140,31 @@ session:
 ```
 
 > **No hardcoded fallbacks.** An empty config string means a feature is deliberately disabled (e.g. `host_tools_dir`, `session_store_path`, `workspace`, `profile`). The bot never invents default paths. `host_tools_dir` **must** be outside the workspace so the server's confined runner cannot tamper with installed tool code.
+
+### ⚠️ Provider API keys (read before running)
+
+The `telegram_chat` profile (`runtime/.jaato/profiles/telegram_chat.yaml`) is
+cross-provider: a cheap **ZhipuAI** text tier plus a **OpenRouter** vision tier.
+Each references its credential via **env-var interpolation**, so the profile runs
+against a public checkout with nothing else installed:
+
+| tier | provider | env var to set |
+|---|---|---|
+| text (`executor`, default) | zhipuai | `ZHIPUAI_API_KEY` |
+| vision | openrouter | `JAATO_OPENROUTER_API_KEY` (`sk-or-…`) |
+
+Set them in the workspace `.env` (git-ignored) so the daemon forwards them into
+the session; `deploy-vps.sh` also prompts for provider/model/keys.
+
+> **`pass://` needs jaato-premium.** The OpenRouter key used to be referenced as
+> `api_key: "pass://jaato/openrouter/api-key"`. That secret-URI scheme is served
+> by a resolver registered through the `jaato.premium` entry point, which ships
+> only in the private **jaato-premium** package. On a public checkout it fails
+> **silently**: jaato logs a warning and then sends the literal `pass://…` string
+> to the provider *as the API key*, so you get an auth error that never mentions
+> secret resolution (and the config validates clean). The `${…}` form above
+> avoids that. See the
+> [org-wide note](https://github.com/Jaato-framework-and-examples/.github/blob/main/profile/README.md#-providers-and-api-keys-in-these-examples--read-this-first).
 
 ### Whitelist (optional)
 
