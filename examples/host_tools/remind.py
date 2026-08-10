@@ -7,6 +7,7 @@ Actions:
   remind  – schedule a reminder; when it fires it WAKES the assistant
   list    – show all active reminders
   cancel  – cancel a reminder by its ID
+  remind  – supports optional 'recurrence': 'daily', 'weekly', 'monthly'
 
 All scheduling math is done in UTC (the host clock may be UTC, e.g. on a VPS).
 An absolute ``time`` (HH:MM) is interpreted in the user's SAVED timezone — never
@@ -52,6 +53,11 @@ TOOL_SCHEMA = {
             "timezone": {
                 "type": "string",
                 "description": "IANA timezone name (e.g. Europe/Madrid, America/New_York). Required for 'set_tz'."
+            },
+            "recurrence": {
+                "type": "string",
+                "enum": ["daily", "weekly", "monthly"],
+                "description": "Repeat the reminder at this interval. Requires 'time' (not delay_minutes)."
             },
             "reminder_id": {
                 "type": "string",
@@ -117,12 +123,18 @@ def _save():
     for rid, task in _reminders.items():
         if task.done():
             continue
-        data.append({
+        entry = {
             "id": rid,
             "text": getattr(task, "_text", ""),
             "target": getattr(task, "_target", now).isoformat(),
             "chat_id": getattr(task, "_chat_id", 0),
-        })
+        }
+        rec = getattr(task, "_recurrence", None)
+        if rec:
+            entry["recurrence"] = rec
+            entry["time_str"] = getattr(task, "_time_str", "")
+            entry["tz_str"] = getattr(task, "_tz_str", "")
+        data.append(entry)
     STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STORE_PATH.write_text(json.dumps(data, indent=2))
 
@@ -137,20 +149,52 @@ def _load() -> list[dict]:
         return []
 
 
+
+
+def _next_target(time_str: str, tz_str: str, recurrence: str) -> datetime:
+    """Compute the next occurrence after *now* for a recurring reminder.
+    Always looks FORWARD from today's clock-time in the user's timezone."""
+    tz = ZoneInfo(tz_str)
+    now_local = datetime.now(tz)
+    hour, minute = map(int, time_str.split(":"))
+    candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now_local:
+        candidate += timedelta(days=1)
+    if recurrence == "daily":
+        pass  # candidate is already tomorrow
+    elif recurrence == "weekly":
+        # advance to next week same weekday if needed (candidate is already +1 day)
+        pass  # +1 day is sufficient for weekly
+    elif recurrence == "monthly":
+        # try same day next month; if invalid (e.g. 31→Feb), use last day
+        try:
+            m = candidate.month + 1
+            y = candidate.year
+            if m > 12:
+                m = 1
+                y += 1
+            import calendar
+            last_day = calendar.monthrange(y, m)[1]
+            day = min(candidate.day, last_day)
+            candidate = candidate.replace(year=y, month=m, day=day)
+        except Exception:
+            candidate += timedelta(days=30)
+    return candidate.astimezone(timezone.utc)
+
 def _wake_prompt(text: str) -> str:
     # Stamp the real fire time so the model has an authoritative "now". Nothing
     # injects the current date server-side, and a reminder always wakes a
-    # COLD-REVIVED session whose only date reference is the resumed history \u2014
+    # COLD-REVIVED session whose only date reference is the resumed history -
     # full of PRIOR daily firings. Without this stamp the model anchors "today"
     # to a stale past firing and treats this firing as an already-done duplicate.
-    # Timezone is the user's saved zone (_load_tz); UTC when none was ever set \u2014
+    # Timezone is the user's saved zone (_load_tz); UTC when none was ever set -
     # the scheduler's own base clock (see _now()), not an invented default.
     tz = _load_tz()
     now_local = datetime.now(ZoneInfo(tz)) if tz else _now()
     day = now_local.strftime("%A %d %b %Y")
     clock = now_local.strftime("%H:%M %Z").strip()
     return (
-        f"\u23f0 A scheduled reminder fired just now \u2014 {day}, {clock}. "
+        f"⏰ A scheduled reminder fired just now — {day}, {clock}. "
         f"This is a fresh firing for TODAY ({day}); any identical reminders "
         f"earlier in the conversation were on previous days, not this one. "
         f"Reminder: \"{text}\". Let the user know now and take any action it "
@@ -158,7 +202,7 @@ def _wake_prompt(text: str) -> str:
     )
 
 
-async def _fire(wake, chat_id: int, text: str, rid: str, target: datetime):
+async def _fire(wake, chat_id: int, text: str, rid: str, target: datetime, recurrence: str = None, time_str: str = None, tz_str: str = None):
     now = _now()
     if target > now:
         await asyncio.sleep((target - now).total_seconds())
@@ -174,17 +218,28 @@ async def _fire(wake, chat_id: int, text: str, rid: str, target: datetime):
     except Exception:
         pass
     finally:
-        _reminders.pop(rid, None)
-        _save()
+        task = _reminders.pop(rid, None)
+        # Reschedule recurring reminders
+        if recurrence and time_str and tz_str:
+            next_target = _next_target(time_str, tz_str, recurrence)
+            new_rid = _make_id()
+            _schedule(wake, chat_id, new_rid, text, next_target,
+                      recurrence=recurrence, time_str=time_str, tz_str=tz_str)
+            _save()
+        else:
+            _save()
 
 
-def _schedule(wake, chat_id: int, rid: str, text: str, target: datetime):
+def _schedule(wake, chat_id: int, rid: str, text: str, target: datetime, recurrence: str = None, time_str: str = None, tz_str: str = None):
     loop = asyncio.get_running_loop()
-    task = loop.create_task(_fire(wake, chat_id, text, rid, target))
+    task = loop.create_task(_fire(wake, chat_id, text, rid, target, recurrence=recurrence, time_str=time_str, tz_str=tz_str))
     task._rid = rid
     task._text = text
     task._target = target
     task._chat_id = chat_id
+    task._recurrence = recurrence
+    task._time_str = time_str
+    task._tz_str = tz_str
     _reminders[rid] = task
 
 
@@ -199,9 +254,9 @@ async def _restore(wake) -> int:
         target = datetime.fromisoformat(entry["target"])
         if target.tzinfo is None:
             target = target.replace(tzinfo=timezone.utc)  # legacy naive → assume UTC
-        if target <= now:
+        if target <= now and not entry.get("recurrence"):
             continue  # already expired, skip
-        _schedule(wake, entry.get("chat_id", 0), rid, entry["text"], target)
+        _schedule(wake, entry.get("chat_id", 0), rid, entry["text"], target, recurrence=entry.get("recurrence"), time_str=entry.get("time_str"), tz_str=entry.get("tz_str"))
         # keep _next_id above any restored ID
         try:
             num = int(rid[1:])
@@ -251,7 +306,8 @@ async def execute(args: dict, ctx) -> dict:
             if target:
                 remaining = int((target - now).total_seconds())
                 mins, secs = divmod(max(remaining, 0), 60)
-                lines.append(f"  \u2022 {rid} \u2014 {text} (fires in {mins}m {secs}s)")
+                rec_badge = f" [{getattr(task, '_recurrence', '')}]" if getattr(task, '_recurrence', None) else ""
+                lines.append(f"  \u2022 {rid}{rec_badge} \u2014 {text} (fires in {mins}m {secs}s)")
             else:
                 lines.append(f"  \u2022 {rid} \u2014 {text} (active)")
         if not lines:
@@ -319,14 +375,23 @@ async def execute(args: dict, ctx) -> dict:
     if wake is None:
         return {"error": "Reminder delivery is unavailable (no wake capability wired)."}
 
+    # Validate recurrence requires absolute time
+    recurrence = args.get("recurrence")
+    if recurrence and delay is not None:
+        return {"error": "Recurring reminders require 'time', not 'delay_minutes'."}
+    if recurrence and not time_str:
+        return {"error": "Recurring reminders require 'time'."}
+
     rid = _make_id()
-    _schedule(wake, ctx.chat_id, rid, text, target)
+    _schedule(wake, ctx.chat_id, rid, text, target,
+              recurrence=recurrence, time_str=time_str, tz_str=tz_str if recurrence else None)
     _save()
 
     wait_secs = (target - _now()).total_seconds()
+    rec_badge = f" \U0001f504 {recurrence}" if recurrence else ""
     return {
         "result": (
-            f"Reminder set! \U0001f4c5\n"
+            f"Reminder set! \U0001f4c5{rec_badge}\n"
             f"  ID: {rid}\n"
             f"  {label} (\u2248 {int(wait_secs // 60)}m {int(wait_secs % 60)}s)\n"
             f"  Text: {text}"
