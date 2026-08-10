@@ -138,9 +138,23 @@ def _load() -> list[dict]:
 
 
 def _wake_prompt(text: str) -> str:
+    # Stamp the real fire time so the model has an authoritative "now". Nothing
+    # injects the current date server-side, and a reminder always wakes a
+    # COLD-REVIVED session whose only date reference is the resumed history \u2014
+    # full of PRIOR daily firings. Without this stamp the model anchors "today"
+    # to a stale past firing and treats this firing as an already-done duplicate.
+    # Timezone is the user's saved zone (_load_tz); UTC when none was ever set \u2014
+    # the scheduler's own base clock (see _now()), not an invented default.
+    tz = _load_tz()
+    now_local = datetime.now(ZoneInfo(tz)) if tz else _now()
+    day = now_local.strftime("%A %d %b %Y")
+    clock = now_local.strftime("%H:%M %Z").strip()
     return (
-        f"\u23f0 A scheduled reminder just fired: \"{text}\". "
-        f"Let the user know now, and take any action it implies."
+        f"\u23f0 A scheduled reminder fired just now \u2014 {day}, {clock}. "
+        f"This is a fresh firing for TODAY ({day}); any identical reminders "
+        f"earlier in the conversation were on previous days, not this one. "
+        f"Reminder: \"{text}\". Let the user know now and take any action it "
+        f"implies, treating the date above as \"today\"."
     )
 
 
