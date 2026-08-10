@@ -101,6 +101,34 @@ def test_absolute_time_without_tz_errors(tmp_path):
     asyncio.run(run())
 
 
+def test_next_target_interval_per_recurrence(tmp_path):
+    """Regression: a 'weekly' reminder must advance a full week, not one day.
+
+    With time '00:00' the clock has already passed today, so _next_target steps
+    the interval once. daily → +1d, weekly → +7d (the bug returned +1d), monthly
+    → same day next month. All strictly in the future, at the anchored HH:MM.
+    """
+    g = _load(tmp_path)
+    tz = ZoneInfo("Europe/Madrid")
+    today = datetime.now(tz).date()
+
+    daily = g["_next_target"]("00:00", "Europe/Madrid", "daily").astimezone(tz)
+    weekly = g["_next_target"]("00:00", "Europe/Madrid", "weekly").astimezone(tz)
+    assert daily.date() == today + timedelta(days=1)
+    assert weekly.date() == today + timedelta(days=7)          # not +1 (the bug)
+    assert (daily.hour, weekly.hour) == (0, 0)
+
+
+def test_add_month_clamps_day_and_rolls_year(tmp_path):
+    """Jan 31 → Feb 28 (2026 is not a leap year); Dec → Jan next year."""
+    g = _load(tmp_path)
+    tz = ZoneInfo("Europe/Madrid")
+    jan31 = datetime(2026, 1, 31, 7, 0, tzinfo=tz)
+    dec15 = datetime(2026, 12, 15, 7, 0, tzinfo=tz)
+    assert g["_add_month"](jan31) == datetime(2026, 2, 28, 7, 0, tzinfo=tz)
+    assert g["_add_month"](dec15) == datetime(2027, 1, 15, 7, 0, tzinfo=tz)
+
+
 if __name__ == "__main__":
     import sys
 

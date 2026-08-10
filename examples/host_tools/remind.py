@@ -17,6 +17,7 @@ timezone-independent. Reminders persist to JSON and are re-armed at bot startup
 """
 
 import asyncio
+import calendar
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -147,38 +148,36 @@ def _load() -> list[dict]:
         return json.loads(STORE_PATH.read_text())
     except (json.JSONDecodeError, KeyError):
         return []
-
-
+def _add_month(dt: datetime) -> datetime:
+    """``dt`` advanced by one calendar month, clamping the day to the target
+    month's last valid day (e.g. Jan 31 → Feb 28/29). No fallback branch:
+    ``calendar.monthrange`` always yields a length for a valid (year, month),
+    so ``min(day, last)`` is always in range."""
+    m = dt.month + 1
+    y = dt.year
+    if m > 12:
+        m = 1
+        y += 1
+    last_day = calendar.monthrange(y, m)[1]
+    return dt.replace(year=y, month=m, day=min(dt.day, last_day))
 
 
 def _next_target(time_str: str, tz_str: str, recurrence: str) -> datetime:
-    """Compute the next occurrence after *now* for a recurring reminder.
-    Always looks FORWARD from today's clock-time in the user's timezone."""
+    """Next occurrence STRICTLY after now, at the recurrence interval, anchored
+    to the just-fired clock time in the user's timezone. Called right after a
+    firing, so it normally steps exactly once; the loop also self-heals if the
+    bot was down across several intervals. Returns an AWARE UTC datetime."""
     tz = ZoneInfo(tz_str)
     now_local = datetime.now(tz)
     hour, minute = map(int, time_str.split(":"))
     candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= now_local:
-        candidate += timedelta(days=1)
-    if recurrence == "daily":
-        pass  # candidate is already tomorrow
-    elif recurrence == "weekly":
-        # advance to next week same weekday if needed (candidate is already +1 day)
-        pass  # +1 day is sufficient for weekly
-    elif recurrence == "monthly":
-        # try same day next month; if invalid (e.g. 31→Feb), use last day
-        try:
-            m = candidate.month + 1
-            y = candidate.year
-            if m > 12:
-                m = 1
-                y += 1
-            import calendar
-            last_day = calendar.monthrange(y, m)[1]
-            day = min(candidate.day, last_day)
-            candidate = candidate.replace(year=y, month=m, day=day)
-        except Exception:
-            candidate += timedelta(days=30)
+    while candidate <= now_local:
+        if recurrence == "weekly":
+            candidate += timedelta(weeks=1)
+        elif recurrence == "monthly":
+            candidate = _add_month(candidate)
+        else:  # daily
+            candidate += timedelta(days=1)
     return candidate.astimezone(timezone.utc)
 
 def _wake_prompt(text: str) -> str:
