@@ -479,6 +479,55 @@ async def test_turn_completed_closes_fold_so_next_turn_does_not_bleed():
     ph.delete.assert_not_awaited()  # placeholder had content → kept, not orphaned
 
 
+@pytest.mark.asyncio
+async def test_bootstrap_notices_fold_into_one_status_message():
+    # The pump pre-seeds ctx.sent_message with its status message; the renderer's
+    # INIT_PROGRESS and the apparmor SYSTEM_MESSAGE then EDIT that same message
+    # (latest-only) instead of sending new ones. The reply streams separately.
+    from unittest.mock import AsyncMock, MagicMock
+    from jaato_client_telegram.renderer import ResponseRenderer
+
+    sent = []
+
+    def _mk(*a, **k):
+        m = MagicMock(); m.edit_text = AsyncMock(); m.delete = AsyncMock()
+        m._init_text = a[0] if a else k.get("text"); sent.append(m); return m
+
+    msg = MagicMock()
+    msg.chat.id = 1
+    msg.is_topic_message = False
+    msg.message_thread_id = None
+    msg.answer = AsyncMock(side_effect=_mk)
+    msg.bot.send_chat_action = AsyncMock()
+    msg.bot.send_message = AsyncMock(side_effect=_mk)
+
+    status = MagicMock()          # the pump's status message, handed to the renderer
+    status.edit_text = AsyncMock()
+    status.delete = AsyncMock()
+
+    class Ev:
+        def __init__(self, **k):
+            self.__dict__.update(k)
+
+    async def gen():
+        yield Ev(type="init.progress", step="Loading plugins", status="running")
+        yield Ev(type="system.message",
+                 message="[apparmor] profile provisioned; runner spawned", style="info")
+        yield Ev(type="agent.output", source="model", mode="write", text="Hello there!\n\n")
+        yield Ev(type="agent.completed")
+
+    await ResponseRenderer().stream_response(
+        msg, gen(), thread_id_getter=lambda: None, status_message=status,
+    )
+
+    edits = " ".join(str(c.args[0]) for c in status.edit_text.await_args_list)
+    assert "Initializing" in edits          # INIT_PROGRESS folded into the status line
+    assert "apparmor" in edits               # the apparmor notice too — same message
+    # Neither bootstrap notice spawned a NEW message; only the reply used answer().
+    new_texts = [str(m._init_text) for m in sent]
+    assert not any("apparmor" in t or "Initializing" in t for t in new_texts)
+
+
 # ── renderer follows the store's current thread (+ stale-thread guard) ────────
 
 

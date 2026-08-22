@@ -179,11 +179,11 @@ class ChatPump:
 
                 try:
                     # ---- run a turn with `item` ----
-                    session_id, text = await self._prepare_turn(item)
+                    session_id, text, status_msg = await self._prepare_turn(item)
                     await self._pool.send_message(
                         session_id, text, attachments=item.attachments
                     )
-                    render = asyncio.create_task(self._render(item, session_id))
+                    render = asyncio.create_task(self._render(item, session_id, status_msg))
                     # Keep a "typing…" indicator alive for the whole turn so a slow
                     # model turn shows life instead of looking frozen.
                     typing = asyncio.create_task(self._keep_typing(item))
@@ -233,20 +233,29 @@ class ChatPump:
 
     # ---- per-turn steps ----------------------------------------------------
 
-    async def _prepare_turn(self, item: PumpItem) -> tuple[str, str]:
+    async def _prepare_turn(self, item: PumpItem) -> tuple[str, str, "Any | None"]:
         """Session setup + feedback for a turn-STARTING message. Returns
-        (session_id, text-to-send). Mirrors the old handlers' pre-send flow."""
+        (session_id, text-to-send, status_message). Mirrors the old handlers'
+        pre-send flow."""
         chat_id = item.chat_id
         self._pool.sync_thread(chat_id, item.message.message_thread_id)
 
         notify = item.message.reply if item.reply else item.message.answer
 
+        # One bootstrap STATUS message, edited in place through the setup steps
+        # (Connecting → Resuming here, then Initializing / sandbox in the renderer)
+        # so the user sees a single updating line instead of a stack of one-shot
+        # notices. Handed to the renderer (seeds ctx.sent_message) so its
+        # INIT_PROGRESS / apparmor notices keep editing this SAME message. Stays
+        # None for a warm session with no setup delay.
+        status_msg = None
+
         is_first = self._pool.get_session_info(chat_id) is None
         if is_first:
-            await notify(
+            status_msg = await self._set_status(
+                notify, None,
                 "⏳ Connecting to your session...\n"
                 "(First message takes a few seconds to initialize)",
-                parse_mode=None,
             )
         else:
             try:
@@ -256,12 +265,26 @@ class ChatPump:
 
         session_id = await self._pool.get_or_create_session(chat_id)
         if self._pool.took_reattach(chat_id):
-            await notify("⏳ Resuming your previous conversation…", parse_mode=None)
+            status_msg = await self._set_status(
+                notify, status_msg, "⏳ Resuming your previous conversation…"
+            )
 
         text = item.text
         if item.apply_welcome and self._pool.claim_first_contact(chat_id):
             text = WELCOME_PREFIX + text
-        return session_id, text
+        return session_id, text, status_msg
+
+    async def _set_status(self, notify, status_msg, text):
+        """Show ``text`` on the single bootstrap status message: edit it in place if
+        it already exists, else create it via ``notify``. Best-effort — a failed
+        edit/send (e.g. the user deleted the message) never breaks the turn."""
+        try:
+            if status_msg is not None:
+                await status_msg.edit_text(text, parse_mode=None)
+                return status_msg
+            return await notify(text, parse_mode=None)
+        except Exception:  # noqa: BLE001 — status UI is best-effort
+            return status_msg
 
     async def _deliver_mid_turn(self, item: PumpItem, session_id: str) -> None:
         """Inject a message into a LIVE turn. The server treats a send during an
@@ -274,11 +297,12 @@ class ChatPump:
             text = WELCOME_PREFIX + text
         await self._pool.send_message(session_id, text, attachments=item.attachments)
 
-    async def _render(self, item: PumpItem, session_id: str):
+    async def _render(self, item: PumpItem, session_id: str, status_message=None):
         return await self._renderer.stream_response(
             initial_message=item.message,
             event_stream=await self._pool.events(session_id),
             thread_id_getter=lambda cid=item.chat_id: self._pool.current_thread(cid),
+            status_message=status_message,
         )
 
     async def _keep_typing(self, item: PumpItem) -> None:
