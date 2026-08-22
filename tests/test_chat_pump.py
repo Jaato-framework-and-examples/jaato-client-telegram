@@ -76,7 +76,8 @@ class FakeRenderer:
     def _ev(self, idx):
         return self.release.setdefault(idx, asyncio.Event())
 
-    async def stream_response(self, initial_message, event_stream, thread_id_getter=None):
+    async def stream_response(self, initial_message, event_stream, thread_id_getter=None,
+                              status_message=None):
         idx = len(self.started)
         self.started.append(idx)
         await self._ev(idx).wait()          # block the turn until the test releases it
@@ -346,3 +347,29 @@ if __name__ == "__main__":
 
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_set_status_edits_one_message_in_place():
+    """The bootstrap status: the first cue CREATES a message; every later cue EDITS
+    that same message (one updating line, not a stack of one-shot notices)."""
+    async def run():
+        pump = ChatPump(FakePool(), FakeRenderer())
+        edits: list[str] = []
+        created: list[str] = []
+
+        class Status:
+            async def edit_text(self, text, parse_mode=None):
+                edits.append(text)
+
+        async def notify(text, parse_mode=None):
+            created.append(text)
+            return Status()
+
+        s1 = await pump._set_status(notify, None, "Connecting")
+        assert created == ["Connecting"] and isinstance(s1, Status)  # created once
+        s2 = await pump._set_status(notify, s1, "Resuming")
+        assert s2 is s1                       # SAME message reused
+        assert edits == ["Resuming"]          # edited in place
+        assert created == ["Connecting"]      # no second message sent
+
+    asyncio.run(run())

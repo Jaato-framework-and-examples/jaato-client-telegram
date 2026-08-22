@@ -558,6 +558,7 @@ class ResponseRenderer:
         initial_message: Message,
         event_stream,  # AsyncIterator[Event] from SDK
         thread_id_getter: "Callable[[], int | None] | None" = None,
+        status_message: "Message | None" = None,
     ) -> StreamingContext:
         """
         Stream events progressively, editing the message in place.
@@ -580,6 +581,11 @@ class ResponseRenderer:
         ctx = StreamingContext()
         ctx.thread_id_getter = thread_id_getter
         ctx.last_edit_time = time.monotonic()
+        # Continue editing the bootstrap status message the pump already created
+        # (Connecting/Resuming), so the INIT_PROGRESS / apparmor notices update that
+        # SAME single line in place rather than sending fresh messages.
+        if status_message is not None:
+            ctx.sent_message = status_message
 
         # Register a per-chat narration-flush hook so an out-of-band tool prompt
         # (ask_user / ctx.ask) flushes THIS ctx's buffered narration before it sends,
@@ -812,55 +818,21 @@ class ResponseRenderer:
                         break
 
             elif event_type == EventType.INIT_PROGRESS:
-                # Initialization progress - show to user with in-place updates
+                # Initialization progress — update the single bootstrap status line
+                # in place (latest step only). Kept OUT of accumulated_text so the
+                # model's reply that streams afterwards never has to have it filtered
+                # back out.
                 init_progress_count += 1
                 step = getattr(event, "step", "")
                 status = getattr(event, "status", "running")
-                
-                # Only show progress every 10 events to avoid spam
-                if init_progress_count % 10 == 0 or status == "done":
-                    # Update the initialization progress in-place
-                    if status == "done":
-                        # Don't show "Ready!" - just remove all progress messages
-                        # The system messages and agent response will follow
-                        if "⏳ Initializing..." in ctx.accumulated_text:
-                            # Remove all progress messages
-                            lines = ctx.accumulated_text.split('\n')
-                            filtered_lines = [
-                                line for line in lines 
-                                if not line.strip().startswith("⏳ Initializing...")
-                                and not line.strip() == "✅ Ready!"
-                            ]
-                            ctx.accumulated_text = '\n'.join(filtered_lines).strip()
-                    else:
-                        # Show current step
-                        progress_text = f"⏳ Initializing... {step}" if step else "⏳ Initializing..."
-                        
-                        # Find and remove previous progress text
-                        if "⏳ Initializing..." in ctx.accumulated_text:
-                            # Split by lines and filter out old progress messages
-                            lines = ctx.accumulated_text.split('\n')
-                            filtered_lines = [
-                                line for line in lines 
-                                if not line.strip().startswith("⏳ Initializing...")
-                            ]
-                            # Reconstruct with new progress at the end
-                            ctx.accumulated_text = '\n'.join(filtered_lines)
-                            if ctx.accumulated_text:
-                                ctx.accumulated_text += f"\n{progress_text}"
-                            else:
-                                ctx.accumulated_text = progress_text
-                        else:
-                            # First time showing progress
-                            if ctx.accumulated_text:
-                                ctx.accumulated_text += f"\n\n{progress_text}"
-                            else:
-                                ctx.accumulated_text = progress_text
-                    
-                    # Only update if we have content
-                    if ctx.accumulated_text.strip():
-                        await self._edit_or_send(initial_message, ctx)
-                        ctx.last_edit_time = time.monotonic()
+
+                # Show the first event promptly, then throttle to avoid edit spam.
+                # "done" leaves the last step showing — the reply streams as its own
+                # messages right after.
+                if status != "done" and (init_progress_count == 1 or init_progress_count % 10 == 0):
+                    progress_text = f"⏳ Initializing... {step}" if step else "⏳ Initializing..."
+                    await self._set_bootstrap_status(initial_message, ctx, progress_text)
+                    ctx.last_edit_time = time.monotonic()
 
             elif event_type == EventType.SYSTEM_MESSAGE:
                 # System message - add to output
@@ -882,18 +854,24 @@ class ResponseRenderer:
                     msg = ""
 
                 if msg:
-                    # Render the notice as ONE standalone, markdown-converted
-                    # message. Previously this appended to accumulated_text AND
-                    # sent it raw via _edit_or_send, while the segment-emit path
-                    # (markdown_to_telegram_html) later re-emitted the SAME text
-                    # converted — a visible duplicate: one "**System**" (plain,
-                    # literal asterisks) + one "<b>System</b>" (HTML). Seen on the
-                    # "[apparmor] profile provisioned" notice on a session revive.
+                    # Markdown-convert once. Previously this appended to
+                    # accumulated_text AND sent it raw via _edit_or_send, while the
+                    # segment-emit path later re-emitted the SAME text converted — a
+                    # visible duplicate: one "**System**" (plain) + one "<b>System</b>"
+                    # (HTML). Seen on the "[apparmor] profile provisioned" notice.
                     icon = {"error": "❌", "warning": "⚠️", "success": "✅"}.get(style, "ℹ️")
                     formatted = markdown_to_telegram_html(
                         f"{icon} **System**: {escape_html_content(msg)}"
                     )
-                    await self._safe_answer(initial_message, formatted, parse_mode="HTML")
+                    # During bootstrap (before any model output), fold the notice —
+                    # e.g. the "[apparmor] profile provisioned" line — into the single
+                    # status message (latest-only) instead of sending a new one. Once
+                    # the reply has started, a system notice (error/warning) stands on
+                    # its own so it never overwrites streamed content.
+                    if not ctx.seen_model_output and ctx.sent_message is not None:
+                        await self._set_bootstrap_status(initial_message, ctx, formatted)
+                    else:
+                        await self._safe_answer(initial_message, formatted, parse_mode="HTML")
                     ctx.last_edit_time = time.monotonic()
 
             elif event_type == EventType.HELP_TEXT:
@@ -1195,6 +1173,21 @@ class ResponseRenderer:
                 except TelegramBadRequest:
                     pass
             # else: 'message is not modified' / other — ignore
+
+    async def _set_bootstrap_status(
+        self, initial_message: Message, ctx: StreamingContext, text: str
+    ) -> None:
+        """Show ``text`` on the single bootstrap status message, latest-only: edit
+        ctx.sent_message in place if it exists, else create it. Deliberately does
+        NOT touch accumulated_text — the status line is kept separate from the
+        model's reply, which streams as its own messages afterwards (so nothing has
+        to be filtered back out of the reply)."""
+        if ctx.sent_message is not None:
+            await self._safe_edit(ctx.sent_message, text)
+        else:
+            ctx.sent_message = await self._safe_answer(
+                initial_message, text, parse_mode="HTML"
+            )
 
     async def _edit_or_send(
         self,
