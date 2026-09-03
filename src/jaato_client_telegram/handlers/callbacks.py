@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery
 from jaato_client_telegram.permissions import PermissionHandler, format_tool_params
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.session_pool import SessionPool
-from jaato_client_telegram.host_tool_loader import resolve_host_ask
+from jaato_client_telegram.host_tool_loader import resolve_button_tap, resolve_host_ask
 
 
 logger = logging.getLogger(__name__)
@@ -58,11 +58,7 @@ async def handle_clarification_callback(
 
     request_id, question_index, choice_ordinal = parsed
     pending = clarification_handler.get_pending(chat_id)
-    if (
-        not pending
-        or pending.request_id != request_id
-        or pending.current != question_index
-    ):
+    if not pending or pending.request_id != request_id or pending.current != question_index:
         await query.answer("❌ Clarification not found or already answered")
         return
 
@@ -71,7 +67,11 @@ async def handle_clarification_callback(
     # Reflect the chosen option in the question message
     current_q = pending.questions[pending.current]
     choices = current_q.get("choices") or []
-    chosen = choices[choice_ordinal - 1].get("text", "") if 1 <= choice_ordinal <= len(choices) else str(choice_ordinal)
+    chosen = (
+        choices[choice_ordinal - 1].get("text", "")
+        if 1 <= choice_ordinal <= len(choices)
+        else str(choice_ordinal)
+    )
     try:
         await query.message.edit_text(
             f"❓ <i>{html.escape(current_q.get('text', ''), quote=False)}</i>\n"
@@ -84,7 +84,12 @@ async def handle_clarification_callback(
     # Answer is the 1-based ordinal as a string (server channel parser expects it)
     status, payload = clarification_handler.record_answer(chat_id, str(choice_ordinal))
     await advance_clarification(
-        query.message, chat_id, status, payload, clarification_handler, pool,
+        query.message,
+        chat_id,
+        status,
+        payload,
+        clarification_handler,
+        pool,
     )
 
 
@@ -147,12 +152,12 @@ async def handle_permission_callback(
         "",
         f"🔧 <code>{pending.tool_name}</code>",
     ]
-    
+
     # Add tool parameters if available
     if pending.tool_args:
         param_lines = format_tool_params(pending.tool_args, max_width=40)
         result_lines.extend(param_lines)
-    
+
     result_lines.extend(["", "⏳ Sending response to jaato..."])
     result_text = "\n".join(result_lines)
 
@@ -175,32 +180,32 @@ async def handle_permission_callback(
             request_id=request_id,
             response=option_key,
         )
-        
+
         logger.info(
             f"Permission response sent: request_id={request_id}, "
             f"response={option_key}, chat_id={chat_id}"
         )
-        
+
         # Update message to show success
         success_lines = [
             f"{action_emoji} <b>Decision</b>: {option_label}",
             "",
             f"🔧 <code>{pending.tool_name}</code>",
         ]
-        
+
         # Add tool parameters if available
         if pending.tool_args:
             param_lines = format_tool_params(pending.tool_args, max_width=40)
             success_lines.extend(param_lines)
-        
+
         success_lines.extend(["", "✅ Response sent to jaato"])
         success_text = "\n".join(success_lines)
-        
+
         try:
             await query.message.edit_text(success_text, parse_mode="HTML")
         except Exception as e:
             logger.warning(f"Failed to update success message: {e}")
-        
+
         # Store approved tool info so renderer can format output with parameters
         # (deny key is "n"; y/a/t are allow variants)
         if option_key != "n":
@@ -209,24 +214,24 @@ async def handle_permission_callback(
                 tool_name=pending.tool_name,
                 tool_args=pending.tool_args or {},
             )
-        
+
     except Exception as e:
         logger.error(f"Failed to send permission response: {e}")
-        
+
         # Update message to show error with tool parameters (HTML format)
         error_lines = [
             f"{action_emoji} <b>Decision</b>: {option_label}",
             "",
             f"🔧 <code>{pending.tool_name}</code>",
         ]
-        
+
         if pending.tool_args:
             param_lines = format_tool_params(pending.tool_args, max_width=40)
             error_lines.extend(param_lines)
-        
+
         error_lines.extend(["", f"❌ Failed to send response: {e}"])
         error_text = "\n".join(error_lines)
-        
+
         try:
             await query.message.edit_text(error_text, parse_mode="HTML")
         except Exception as e2:
@@ -270,3 +275,21 @@ async def handle_host_tool_callback(query: CallbackQuery) -> None:
     except Exception:
         logger.debug("host-tool callback edit failed", exc_info=True)
 
+
+def _is_button_channel_callback(callback_query: CallbackQuery) -> bool:
+    """A dynamic host tool's ctx.buttons() interactive-keyboard tap (btn:<id>:<index>)."""
+    return bool(callback_query.data) and callback_query.data.startswith("btn:")
+
+
+@router.callback_query(_is_button_channel_callback)
+async def handle_button_channel_callback(query: CallbackQuery) -> None:
+    """Feed a ctx.buttons() tap onto its channel's queue — the single-poller-safe
+    way for a tool to receive taps on a live keyboard it is driving. Unlike a
+    one-shot ctx.ask(), the tool owns the redraw, so this handler only acks the
+    tap (clears the client spinner) and never edits the message itself."""
+    chat_id = query.message.chat.id if query.message else None
+    matched = resolve_button_tap(query.data or "", chat_id)
+    try:
+        await query.answer() if matched else await query.answer("Expired")
+    except Exception:
+        logger.debug("button-channel callback answer failed", exc_info=True)

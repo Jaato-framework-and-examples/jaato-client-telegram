@@ -75,6 +75,68 @@ def resolve_host_ask(callback_data: str) -> bool:
     return False
 
 
+# --- Interactive button CHANNELS (multi-tap / custom keyboards) ----------------
+# ctx.ask() above is one-shot single-select: the first tap resolves a Future and
+# the interaction ends. A ButtonSession generalizes that to a live channel — the
+# same single-poll routing, but a per-request Queue instead of a one-shot Future —
+# so a tool can drive a keyboard whose taps arrive one after another (multi-select
+# toggles, a Done button, a wizard) while the tool owns the state machine and the
+# redraws. The bot still owns every load-bearing piece: the ONE getUpdates poll,
+# the callback_query router, the fast ack, and cleanup. A tool NEVER polls itself.
+_BTN_CB_PREFIX = "btn:"
+_BUTTON_CHANNELS: "dict[str, _ButtonChannel]" = {}
+# Reserved button value for ask_multi's Done control (won't collide with an option).
+_ASK_MULTI_DONE = "\x00__ask_multi_done__"
+
+
+@dataclass
+class Tap:
+    """One button press delivered to a ``ButtonSession``. ``value`` is the opaque
+    string the tool attached to the tapped button (its identity); ``label`` is the
+    text shown; ``index`` is its flat position in the last-rendered keyboard."""
+
+    value: str
+    label: str
+    index: int
+
+
+class _ButtonChannel:
+    """Bot-side state for one live ButtonSession: the tap queue plus the
+    index→(value, label) map of the CURRENTLY rendered keyboard. The router looks
+    up the tapped index against this map at tap-arrival time, so a tool that edits
+    the keyboard between taps always resolves taps against what the user is seeing."""
+
+    def __init__(self, req_id: str, chat_id: int) -> None:
+        self.req_id = req_id
+        self.chat_id = chat_id
+        self.queue: "asyncio.Queue[Tap]" = asyncio.Queue()
+        self.values: list[tuple[str, str]] = []  # index -> (value, label)
+
+
+def resolve_button_tap(callback_data: str, chat_id: "int | None") -> bool:
+    """Resolve a ``btn:<req_id>:<index>`` callback onto its channel's tap queue.
+    Returns True iff it matched a live channel for THIS chat. Called by the main
+    bot's callback_query router (the single poller) — the same single-poll-safe path
+    ``resolve_host_ask`` uses, so a tool receives taps without polling. The chat
+    guard means a button can only ever drive the channel of the chat it was sent
+    to."""
+    if not callback_data or not callback_data.startswith(_BTN_CB_PREFIX):
+        return False
+    try:
+        _, req_id, idx = callback_data.split(":", 2)
+        index = int(idx)
+    except (ValueError, AttributeError):
+        return False
+    channel = _BUTTON_CHANNELS.get(req_id)
+    if channel is None or channel.chat_id != chat_id:
+        return False
+    if not (0 <= index < len(channel.values)):
+        return False
+    value, label = channel.values[index]
+    channel.queue.put_nowait(Tap(value=value, label=label, index=index))
+    return True
+
+
 # ---- delivered-content capture (make a tool's chat sends visible to the model) ----
 # A model-authored host tool reaches the model ONLY through what its execute()
 # RETURNS (the daemon JSON-encodes the return value as the tool result). A tool that
@@ -219,6 +281,113 @@ async def ask_user(
         _PENDING_ASKS.pop(req_id, None)
 
 
+class ButtonSession:
+    """A live interactive-keyboard channel a tool drives over the bot's single poll.
+
+    Obtained from ``ctx.buttons()`` and used as an async context manager. The tool
+    owns the interaction: ``send`` renders a keyboard, ``taps`` yields presses as
+    they arrive, ``edit`` redraws in place. The bot owns the plumbing — routing,
+    the fast callback ack, and cleanup (on exit the last keyboard's buttons are
+    stripped so nothing stale is tappable).
+
+    Rows are ``list[list[(label, value)]]``: ``label`` is the button text, ``value``
+    an opaque identity string echoed back on ``Tap.value``. Only the index rides in
+    Telegram's 64-byte callback_data; the bot maps it back to ``value`` here.
+
+    A session drives ONE live keyboard at a time — ``send`` once, then ``edit``.
+    Set a matching long ``"timeout"`` (ms) in your tool's TOOL_SCHEMA so the runner
+    waits for the human instead of giving up at the 30s default.
+
+        async with ctx.buttons(timeout=300) as ui:
+            await ui.send("Pick players:", render(selected))
+            async for tap in ui.taps():
+                if tap.value == "done":
+                    break
+                toggle(selected, tap.value)
+                await ui.edit(rows=render(selected))
+    """
+
+    def __init__(self, bot: Any, chat_id: int, timeout: float = 300.0) -> None:
+        self._bot = bot
+        self._chat_id = chat_id
+        self._timeout = timeout
+        self._channel: "_ButtonChannel | None" = None
+        self._message_id: "int | None" = None
+
+    async def __aenter__(self) -> "ButtonSession":
+        req_id = uuid.uuid4().hex[:12]
+        self._channel = _ButtonChannel(req_id, self._chat_id)
+        _BUTTON_CHANNELS[req_id] = self._channel
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        if self._channel is not None:
+            _BUTTON_CHANNELS.pop(self._channel.req_id, None)
+        if self._message_id is not None:
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=self._chat_id, message_id=self._message_id, reply_markup=None
+                )
+            except Exception:  # noqa: BLE001 — cleanup must never mask the tool's result
+                logger.debug("button session cleanup edit failed", exc_info=True)
+        return False
+
+    def _markup(self, rows: "list[list[tuple[str, str]]]") -> InlineKeyboardMarkup:
+        assert self._channel is not None
+        flat: list[tuple[str, str]] = []
+        kb_rows = []
+        for row in rows:
+            kb_row = []
+            for label, value in row:
+                idx = len(flat)
+                flat.append((str(value), str(label)))
+                kb_row.append(
+                    InlineKeyboardButton(
+                        text=str(label)[:60],
+                        callback_data=f"{_BTN_CB_PREFIX}{self._channel.req_id}:{idx}",
+                    )
+                )
+            kb_rows.append(kb_row)
+        self._channel.values = flat
+        return InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    async def send(self, text: str, rows: "list[list[tuple[str, str]]]") -> Any:
+        """Render the initial keyboard and return the sent Message."""
+        kb = self._markup(rows)
+        msg = await self._bot.send_message(chat_id=self._chat_id, text=text, reply_markup=kb)
+        self._message_id = getattr(msg, "message_id", None)
+        return msg
+
+    async def edit(
+        self,
+        message: Any = None,
+        text: "str | None" = None,
+        rows: "list[list[tuple[str, str]]] | None" = None,
+    ) -> Any:
+        """Redraw the keyboard in place (and optionally the text). Edits the
+        session's own message by default; pass ``message`` to target another."""
+        mid = getattr(message, "message_id", None) or self._message_id
+        kb = self._markup(rows) if rows is not None else None
+        if text is not None:
+            return await self._bot.edit_message_text(
+                chat_id=self._chat_id, message_id=mid, text=text, reply_markup=kb
+            )
+        return await self._bot.edit_message_reply_markup(
+            chat_id=self._chat_id, message_id=mid, reply_markup=kb
+        )
+
+    async def taps(self):
+        """Yield ``Tap``s as the user presses buttons. Ends when no tap arrives
+        within ``timeout`` seconds (inactivity window, reset by each tap)."""
+        assert self._channel is not None
+        while True:
+            try:
+                tap = await asyncio.wait_for(self._channel.queue.get(), timeout=self._timeout)
+            except asyncio.TimeoutError:
+                return
+            yield tap
+
+
 @dataclass
 class ToolContext:
     """Runtime context handed to a dynamic tool's ``execute(args, ctx)``."""
@@ -249,6 +418,46 @@ class ToolContext:
         ``"timeout"`` (ms) in your tool's TOOL_SCHEMA so the runner waits for the
         human rather than giving up at the 30s default."""
         return await ask_user(self.bot, self.chat_id, text, options, timeout)
+
+    def buttons(self, timeout: float = 300.0) -> "ButtonSession":
+        """Open an interactive inline-keyboard channel (see :class:`ButtonSession`):
+        render a keyboard, receive taps one-by-one, redraw in place. Use for any UI
+        beyond a single-choice question — multi-select, wizards, paginated pickers.
+        Routed through the bot's single poll (NO polling of your own). Set a matching
+        long ``"timeout"`` (ms) in your tool's TOOL_SCHEMA so the runner waits."""
+        return ButtonSession(self.bot, self.chat_id, timeout)
+
+    async def ask_multi(
+        self,
+        text: str,
+        options: list[str],
+        timeout: float = 300.0,
+        done_label: str = "✅ Done",
+    ) -> list[str]:
+        """Ask the user to pick SEVERAL options: a toggle keyboard (tap to tick/untick)
+        plus a Done button. Returns the chosen options in ``options`` order (possibly
+        empty), or whatever was ticked if the window times out. A thin wrapper over
+        ``ctx.buttons()`` for the common multi-select case."""
+        selected: list[str] = []
+
+        def render() -> "list[list[tuple[str, str]]]":
+            rows: list[list[tuple[str, str]]] = [
+                [(("☑️ " if opt in selected else "⬜ ") + opt, opt)] for opt in options
+            ]
+            rows.append([(done_label, _ASK_MULTI_DONE)])
+            return rows
+
+        async with self.buttons(timeout=timeout) as ui:
+            await ui.send(text, render())
+            async for tap in ui.taps():
+                if tap.value == _ASK_MULTI_DONE:
+                    break
+                if tap.value in selected:
+                    selected.remove(tap.value)
+                else:
+                    selected.append(tap.value)
+                await ui.edit(rows=render())
+        return [opt for opt in options if opt in selected]
 
     async def wake(self, text: str) -> None:
         """Make the MODEL act on an event this tool is raising (e.g. a reminder
