@@ -95,7 +95,14 @@ TOOL_SCHEMAS = [
             "workspace — a module-level TOOL_SCHEMA dict (name = the file stem, "
             "description, JSON-schema parameters) plus `async def execute(args, "
             "ctx)` returning a dict; ctx.bot and ctx.chat_id let it talk to "
-            "Telegram. (2) SHOW the user the code. (3) call register_tool(name). "
+            "Telegram. For interactive input, use ctx.ask(text, options) for a "
+            "single choice, ctx.ask_multi(text, options) to pick several, or "
+            "ctx.buttons() for a custom inline-keyboard flow (multi-select, "
+            "wizards) — these route taps back over the bot's single poll; do NOT "
+            "hand-roll your own keyboard callback_data or start your own poller "
+            "(the taps never reach you). For a long wait, set a matching "
+            '"timeout" (ms) in TOOL_SCHEMA. (2) SHOW the user the code. (3) call '
+            "register_tool(name). "
             "To MODIFY an EXISTING installed tool — whose source is NOT in your "
             "workspace, because installed tools live outside your sandbox — first "
             "call register_tool(name, action='edit'): the bot copies the tool's "
@@ -152,7 +159,7 @@ TOOL_SCHEMAS = [
                 "args": {
                     "type": "object",
                     "description": "Arguments to invoke the tool with at session start, "
-                    "e.g. {\"action\": \"start\"}. Used by 'add'; defaults to {}.",
+                    'e.g. {"action": "start"}. Used by \'add\'; defaults to {}.',
                 },
             },
             "required": ["action"],
@@ -170,9 +177,7 @@ TOOL_CATEGORIES = {
 }
 
 
-def create_tool_executors(
-    bot, chat_id: int, file_config, workspace: "str | None" = None
-) -> dict:
+def create_tool_executors(bot, chat_id: int, file_config, workspace: "str | None" = None) -> dict:
     send_exec = make_send_to_telegram_executor(bot, chat_id, file_config, workspace)
     show_exec = make_show_image_executor(bot, chat_id, file_config, workspace)
     return {
@@ -191,6 +196,7 @@ def make_service_manifest_executor(workspace: "str | None"):
     host_tools_dir, which is outside the workspace where the runner-confined
     prefetch can't read it); closes over the configured workspace path.
     """
+
     def _path() -> Path:
         if not workspace:
             raise RuntimeError("workspace not configured (set jaato_ws.workspace)")
@@ -219,7 +225,11 @@ def make_service_manifest_executor(workspace: "str | None"):
                 entries = [e for e in entries if e.get("tool") != tool]  # replace
                 entries.append({"tool": tool, "args": invoke_args})
                 _save(path, entries)
-                return {"ok": True, "added": {"tool": tool, "args": invoke_args}, "manifest": entries}
+                return {
+                    "ok": True,
+                    "added": {"tool": tool, "args": invoke_args},
+                    "manifest": entries,
+                }
             if action == "remove":
                 tool = args.get("tool")
                 if not tool:
@@ -245,15 +255,14 @@ def make_send_to_telegram_executor(
 
     Returns an async callable ``(args: dict) -> dict``.
     """
+
     async def executor(args: dict) -> dict:
         file_path = args.get("file_path", "")
         message = args.get("message", "")
 
         try:
             if file_path:
-                result = await _send_file(
-                    bot, chat_id, file_path, file_config, workspace
-                )
+                result = await _send_file(bot, chat_id, file_path, file_config, workspace)
                 return {"result": result}
 
             if message:
@@ -305,6 +314,7 @@ async def _send_file(
         return f"File too large: {size_mb:.1f}MB > {config.max_file_size_mb}MB limit"
 
     from aiogram.types import FSInputFile
+
     await bot.send_document(
         chat_id=chat_id,
         document=FSInputFile(path),
@@ -326,6 +336,7 @@ def make_show_image_executor(
     renders it; ``file_path`` displays a workspace image. On failure the executor
     returns an error so the agent can fall back to pasting the link as text.
     """
+
     async def executor(args: dict) -> dict:
         url = (args.get("url") or "").strip()
         file_path = (args.get("file_path") or "").strip()
@@ -336,7 +347,9 @@ def make_show_image_executor(
             caption = caption[:1021] + "…"
         logger.info(
             "show_image call: url=%r file_path=%r caption_len=%d",
-            url[:80] or None, file_path or None, len(caption) if caption else 0,
+            url[:80] or None,
+            file_path or None,
+            len(caption) if caption else 0,
         )
 
         try:
@@ -388,13 +401,14 @@ async def _show_local_image(
 
     size_mb = path.stat().st_size / (1024 * 1024)
     if size_mb > config.max_file_size_mb:
-        return {
-            "error": f"Image too large: {size_mb:.1f}MB > {config.max_file_size_mb}MB limit"
-        }
+        return {"error": f"Image too large: {size_mb:.1f}MB > {config.max_file_size_mb}MB limit"}
 
     from aiogram.types import FSInputFile
+
     await bot.send_photo(
-        chat_id=chat_id, photo=FSInputFile(path), caption=caption,
+        chat_id=chat_id,
+        photo=FSInputFile(path),
+        caption=caption,
     )
     return {"result": f"shown {path.name}"}
 
@@ -461,8 +475,13 @@ async def _show_remote_image(
         sub = "jpg"
 
     from aiogram.types import BufferedInputFile
-    logger.info("show_image remote: ctype=%s size=%d caption_len=%d",
-                ctype, len(data), len(caption) if caption else 0)
+
+    logger.info(
+        "show_image remote: ctype=%s size=%d caption_len=%d",
+        ctype,
+        len(data),
+        len(caption) if caption else 0,
+    )
     try:
         await bot.send_photo(
             chat_id=chat_id,
