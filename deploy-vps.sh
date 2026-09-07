@@ -33,7 +33,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV="$INSTALL_DIR/venv"; PYV="$VENV/bin/python"
 JAATO_DIR="$INSTALL_DIR/jaato"; BOT_DIR="$INSTALL_DIR/jaato-client-telegram"
 WORKSPACE="$BOT_DIR/runtime"
-PROFILE_DIR="$WORKSPACE/.jaato/profiles"; PROFILE_FILE="$PROFILE_DIR/telegram_chat.yaml"
+# Profiles are a base + a per-provider SET leaf (see write_profile). The bot
+# selects the leaf by QUALIFIED PATH ("<set>/telegram_chat"). SET_NAME/leaf paths
+# are derived in collect()/write_profile once the provider is known.
+PROFILE_DIR="$WORKSPACE/.jaato/profiles"
+BASE_PROFILE_FILE="$PROFILE_DIR/_base_telegram_chat.yaml"
 STATE_DIR="$HOME/.local/share/jaato-tg"
 HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.json"
 CFG_DIR="$HOME/.config/jaato-tg"
@@ -200,6 +204,27 @@ collect(){ info "Configuration"
     IFS='|' read -r VISION_PROVIDER VISION_MODEL VISION_ENVVAR VISION_KEY < <(_pick_provider "vision")
   else warn "  Vision disabled — the bot does text + tools; images/PDFs won't be understood."; fi
 
+  # Optional CODER tier — a code-specialized model the agent enters ON DEMAND
+  # (enter_tier('coder')) for real code work, leaving the cheap executor as the
+  # default. A CUSTOM tier name, so it REQUIRES a description (CODER_DESCRIPTION
+  # overrides the default prose). Non-interactive via CODER_PROVIDER / CODER_MODEL
+  # / CODER_KEY. Nothing is hardcoded: the model/provider come from env or prompt.
+  CODER_PROVIDER="${CODER_PROVIDER:-}"; CODER_MODEL="${CODER_MODEL:-}"; CODER_ENVVAR=""; CODER_KEY="${CODER_KEY:-}"
+  if [ -n "$CODER_PROVIDER" ]; then
+    CODER_MODEL="${CODER_MODEL:?CODER_MODEL required when CODER_PROVIDER is set}"
+    CODER_ENVVAR=$(_provider_keyvar "$CODER_PROVIDER")
+    info "  coder tier (env): $CODER_PROVIDER / $CODER_MODEL"
+  elif [ "$noninteractive" = "1" ]; then
+    warn "  Coder tier disabled (non-interactive run, no CODER_PROVIDER set)."
+  elif confirm "Enable an on-demand coder tier (code-specialized model)?"; then
+    IFS='|' read -r CODER_PROVIDER CODER_MODEL CODER_ENVVAR CODER_KEY < <(_pick_provider "coder")
+  else warn "  Coder tier disabled — the bot uses the main tier for code too."; fi
+  CODER_DESCRIPTION="${CODER_DESCRIPTION:-Write, edit, and reason about code to a plan. The strongest code model here; enter for real coding tasks (writing or editing files, debugging, multi-step implementation), then switch back to executor for ordinary conversation.}"
+
+  # The profile SET name (a subdir under .jaato/profiles/). Defaults to the main
+  # provider so the leaf reads as "<provider>/telegram_chat"; override with PROFILE_SET.
+  SET_NAME="${PROFILE_SET:-$EXEC_PROVIDER}"
+
   # Whitelist (username-based access control). Non-interactive via
   # WHITELIST_ADMINS / WHITELIST_USERS (comma-separated Telegram usernames).
   WL_ADMINS="${WHITELIST_ADMINS:-}"; WL_USERS="${WHITELIST_USERS:-}"
@@ -250,6 +275,9 @@ write_env(){ info "Write secrets (chmod 600)"
     [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$EXEC_KEY"
     [ -n "$VISION_ENVVAR" ] && [ "$VISION_ENVVAR" != "$EXEC_ENVVAR" ] \
         && printf '%s=%s\n' "$VISION_ENVVAR" "$VISION_KEY"
+    [ -n "$CODER_ENVVAR" ] && [ "$CODER_ENVVAR" != "$EXEC_ENVVAR" ] \
+        && [ "$CODER_ENVVAR" != "$VISION_ENVVAR" ] \
+        && printf '%s=%s\n' "$CODER_ENVVAR" "$CODER_KEY"
   } > "$SERVER_ENV"
   { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TG_TOKEN"
     printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
@@ -283,31 +311,53 @@ seed_host_tools(){ info "Seed curated host tools -> $HOST_TOOLS_DIR"
 }
 
 # ── 6. Customize the agent profile (env-resolved keys; no secret inlined) ─────
-write_profile(){ info "Customize profile -> $PROFILE_FILE"
-  mkdir -p "$PROFILE_DIR"
+# Profiles are written as a PROVIDER-AGNOSTIC base + a per-provider SET leaf.
+# The leaf `inherits: [_base_telegram_chat]` and is selected by the bot via the
+# qualified path "<set>/telegram_chat" (write_bot_config). This keeps the role
+# (plugins, venv, memory scope) in one place and lets a second provider set be
+# added as one more leaf. Tiers: executor (initial/fallback), an optional custom
+# `coder` tier entered on demand, and an optional vision tier.
+write_profile(){
+  local set_name="${SET_NAME:-$EXEC_PROVIDER}"
+  local set_dir="$PROFILE_DIR/$set_name"
+  LEAF_PROFILE_FILE="$set_dir/telegram_chat.yaml"
+  PROFILE_REF="$set_name/telegram_chat"           # qualified path for the bot config + health check
+  info "Customize profile -> $BASE_PROFILE_FILE + $LEAF_PROFILE_FILE"
+  mkdir -p "$set_dir"
+
   local apparmor=false
   have apparmor_parser && aa-enabled >/dev/null 2>&1 && apparmor=true
+
+  # Tier table. executor always; coder/vision only when their provider was chosen.
+  # A custom tier name (coder) REQUIRES a description — emitted as a folded scalar.
   local tiers="  executor:
     model: \"$EXEC_MODEL\"
     provider: \"$EXEC_PROVIDER\""
+  if [ -n "$CODER_PROVIDER" ]; then
+    tiers="$tiers
+  coder:
+    model: \"$CODER_MODEL\"
+    provider: \"$CODER_PROVIDER\"
+    description: >-
+      $CODER_DESCRIPTION"
+  fi
   if [ -n "$VISION_PROVIDER" ]; then
     tiers="$tiers
   vision:
     model: \"$VISION_MODEL\"
     provider: \"$VISION_PROVIDER\""
   fi
-  cat > "$PROFILE_FILE" <<YAML
-# Generated by deploy-vps.sh — provider/model are operator-chosen; provider keys
-# resolve from env vars (server.env), so no secret is inlined here.
-name: telegram_chat
-description: Conversational assistant for the Telegram bot client.
-provider: "$EXEC_PROVIDER"
-model: "$EXEC_MODEL"
-apparmor: $apparmor
-model_tiers:
-$tiers
-  initial: executor
-  fallback: executor
+
+  # --- base: provider-agnostic role. Static => QUOTED heredoc (no interpolation,
+  # so a literal $ in a comment is safe here, unlike the leaf below). ------------
+  cat > "$BASE_PROFILE_FILE" <<'YAML'
+# Generated by deploy-vps.sh — PROVIDER-AGNOSTIC base for the Telegram bot's
+# per-chat session. Binds no provider/model; a set leaf (e.g.
+# <provider>/telegram_chat.yaml) inherits this and does that. On inherit:
+# plugins UNION (a leaf's `plugins: []` keeps this list), plugin_configs
+# per-key dict-merge, max_turns most-restrictive-wins.
+name: _base_telegram_chat
+description: Provider-agnostic base for the Telegram bot's per-chat session.
 plugins:
   - clarification
   - web_search
@@ -337,8 +387,6 @@ plugin_configs:
   # (a bare pip install in notebook/cli/shell lands in workspace .jaato/tool-venv,
   # via the pip shim + the venv-bin ix apparmor grant, server #479), and the
   # bot prepends its site-packages so an in-process host tool imports them.
-  # NOTE: this heredoc is unquoted (it interpolates \$tiers etc.) — keep this
-  # block free of backticks and \$ so nothing is command/param-substituted.
   # Path is workspace-relative; MUST match the bot's jaato_ws.host_tools_venv.
   notebook:
     workspace_venv: ".jaato/tool-venv"
@@ -347,8 +395,30 @@ plugin_configs:
   interactive_shell:
     workspace_venv: ".jaato/tool-venv"
 YAML
-  printf '  provider=%s model=%s vision=%s apparmor=%s\n' \
-    "$EXEC_PROVIDER" "$EXEC_MODEL" "${VISION_PROVIDER:-off}" "$apparmor"
+
+  # --- set leaf: binds provider + tiers. UNQUOTED heredoc (interpolates
+  # $EXEC_*/$tiers/$apparmor) — keep it free of backticks and stray $. ----------
+  cat > "$LEAF_PROFILE_FILE" <<YAML
+# Generated by deploy-vps.sh — $set_name set. Inherits _base_telegram_chat and
+# binds the provider + per-turn model tiers. Provider keys resolve from env vars
+# (server.env), so no secret is inlined here. Selected via the bot's qualified
+# path jaato_ws.profile: "$PROFILE_REF".
+name: telegram_chat
+description: Telegram bot per-chat session — $set_name set.
+inherits: [_base_telegram_chat]
+plugins: []                 # keep the inherited base plugin surface (UNION)
+provider: "$EXEC_PROVIDER"
+model: "$EXEC_MODEL"         # ignored while model_tiers is non-empty; documents the initial model
+apparmor: $apparmor
+model_tiers:
+$tiers
+  initial: executor
+  fallback: executor
+YAML
+
+  printf '  set=%s provider=%s model=%s coder=%s vision=%s apparmor=%s\n' \
+    "$set_name" "$EXEC_PROVIDER" "$EXEC_MODEL" \
+    "${CODER_PROVIDER:+$CODER_MODEL}" "${VISION_PROVIDER:+$VISION_MODEL}" "$apparmor"
 }
 
 # ── 6b. Whitelist (username-based access control) ────────────────────────────
@@ -384,7 +454,9 @@ jaato_ws:
   tls:
     enabled: false
   secret_token: "\${JAATO_WS_TOKEN}"
-  profile: "telegram_chat"
+  # Qualified set path — resolves .jaato/profiles/$PROFILE_REF.yaml (the leaf that
+  # inherits _base_telegram_chat). No JAATO_PROFILE_SET needed.
+  profile: "$PROFILE_REF"
   agent: "telegram_chat"
   workspace: "\${JAATO_TG_WORKSPACE}"
   host_tools_dir: "\${JAATO_TG_HOST_TOOLS_DIR}"
@@ -479,16 +551,16 @@ UNIT
 _live_ping(){   # SDK facade end-to-end: connect -> session(profile) -> ask
   # shellcheck disable=SC1090
   set -a; . "$SERVER_ENV"; set +a
-  "$PYV" - "$WS_PORT" "$WS_TOKEN" "$WORKSPACE" <<'PY'
+  "$PYV" - "$WS_PORT" "$WS_TOKEN" "$WORKSPACE" "$PROFILE_REF" <<'PY'
 import asyncio,sys
-port,token,ws = sys.argv[1],sys.argv[2],sys.argv[3]
+port,token,ws,profile = sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 import jaato
 async def main():
     try:
         from jaato_sdk.events import ClientType
         async with jaato.session(mode="ws", url=f"ws://localhost:{port}", token=token,
                                   client_type=ClientType.CHAT, workspace_path=ws,
-                                  config_root=f"{ws}/.jaato", profile="telegram_chat",
+                                  config_root=f"{ws}/.jaato", profile=profile,
                                   agent="telegram_chat") as s:
             ans = await s.ask("Reply with exactly: OK")
             print("LIVE_OK:", (ans or "").strip()[:60]); return 0
@@ -502,7 +574,7 @@ start_and_check(){ info "Start server + health check"
   for _ in $(seq 1 30); do "$PYV" -m server --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
 
   info "  validate profile (jaato-scaffold validate)"
-  scaffold validate "$PROFILE_FILE" || die "profile validation failed (see above) — fix the profile and re-run"
+  scaffold validate "$LEAF_PROFILE_FILE" || die "profile validation failed (see above) — fix the profile and re-run"
 
   info "  preflight WS/auth (jaato-doctor)"
   "$PYV" -m jaato_sdk.doctor --web-socket ":$WS_PORT" --ws-token-file "$WS_TOKEN_FILE" --no-auto-start \
