@@ -1,0 +1,78 @@
+# Tier-1 base for the Telegram bot's per-chat session — PROVIDER-AGNOSTIC.
+#
+# This carries the ROLE (plugins, confinement, turn budget, venv wiring) and
+# binds NO provider / model / model_tiers. A profile SET leaf under a subdir
+# (e.g. openrouter/telegram_chat.yaml) does `inherits: [_base_telegram_chat]`
+# and binds the provider + tiers. Swap the whole provider stack by pointing the
+# bot at a different set leaf — this base never changes.
+#
+# The bot selects a leaf by QUALIFIED PATH: jaato_ws.profile = "openrouter/telegram_chat"
+# resolves profiles/openrouter/telegram_chat.yaml directly (no JAATO_PROFILE_SET
+# needed; a qualified path even wins over that env var). The persona is separate:
+# .jaato/agents/telegram_chat.md, passed as `--agent telegram_chat`.
+#
+# Merge semantics that make this split work (see `jaato-scaffold explain profile`):
+#   plugins       UNION  — a leaf's `plugins: []` keeps THIS list (can't scope down)
+#   model_tiers   child-REPLACES — lives in the leaf, not here
+#   plugin_configs per-key dict-merge — the leaf adds its provider block; these survive
+#   apparmor      UNION/OR sticky — true here stays true in every leaf
+#   max_turns     MOST-RESTRICTIVE wins — a leaf may only tighten 12
+name: _base_telegram_chat
+description: >-
+  Provider-agnostic base for the Telegram bot's per-chat session. Binds no
+  provider/model; a set leaf (e.g. openrouter/telegram_chat.yaml) does that.
+# Confine the runner to its workspace: it can read/write the workspace (incl.
+# tool_drafts/) but NOT .jaato/agents, .jaato/profiles, or .jaato/host_tools.
+# Dynamic host tools are installed into .jaato/host_tools by the UNCONFINED bot
+# process after user approval — the confined runner cannot self-install code.
+apparmor: true
+# permission / reliability / lifecycle are always-on; host tools are registered
+# client-side via tools.register_client, independent of this list.
+# NOTE: cli / interactive_shell / file_edit grant shell + file access on the
+# SERVER host — execution is gated by the permission plugin (button approval)
+# and the bot whitelist; apparmor: true above is the kernel backstop.
+plugins:
+  - clarification
+  # knowledge / web
+  - web_search
+  - web_fetch
+  - references
+  - result_grep
+  # memory + waypoint
+  - memory
+  - waypoint
+  # code / files
+  - file_edit
+  - filesystem_query
+  - ast_search
+  - lsp
+  - cli
+  - interactive_shell
+  - notebook
+  # orchestration
+  - subagent
+  - template
+  - prompt_library
+  # environment
+  - environment
+# Chat-style turns; the bot streams output and surfaces tool/permission/
+# clarification UIs over the WS protocol.
+max_turns: 12
+plugin_configs:
+  memory:
+    # Write-side scope gate (server PR #468): the bot has a SINGLE workspace
+    # shared across all of a user's chats, so "project" scope already spans every
+    # chat — restricting to it keeps memories in the workspace store (curated
+    # client-side on tool.call_end) and NEVER writes to the HOME/global tier
+    # (avoids raw-in-home). A disallowed scope is hard-rejected to the model.
+    allowed_scopes: ["project"]
+  # Dynamic-tool dependency venv: the confined runner installs deps here
+  # (pip install in notebook/cli/shell → <workspace>/.jaato/tool-venv), and the
+  # bot prepends its site-packages so an in-process host tool can import them.
+  # Path is relative to the workspace; MUST match the bot's jaato_ws.host_tools_venv.
+  notebook:
+    workspace_venv: ".jaato/tool-venv"
+  cli:
+    workspace_venv: ".jaato/tool-venv"
+  interactive_shell:
+    workspace_venv: ".jaato/tool-venv"

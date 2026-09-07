@@ -46,7 +46,12 @@ jaato_ws:
   keycloak_client_id: ""
   keycloak_client_secret: ""
   # Profile + agent for each chat session (in .jaato/profiles and .jaato/agents).
-  profile: "telegram_chat"
+  # Profile is a QUALIFIED SET PATH: "<set>/telegram_chat" resolves the leaf at
+  # .jaato/profiles/<set>/telegram_chat.yaml directly (no JAATO_PROFILE_SET needed;
+  # a qualified path wins over that env var). The leaf inherits the provider-
+  # agnostic _base_telegram_chat. Swap the whole provider stack by changing the
+  # set segment (e.g. a future "zhipuai/telegram_chat" leaf). Agent is unchanged.
+  profile: "openrouter/telegram_chat"
   agent: "telegram_chat"
   # Server-side path to this workspace (declared via set_workspace on connect) so
   # the WS server finds the profile/agent above under <workspace>/.jaato/.
