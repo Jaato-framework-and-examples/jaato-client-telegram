@@ -2,36 +2,43 @@
 #
 # deploy-vps.sh — one-shot bootstrap for the jaato Telegram bot + its server.
 #
-# Premium-free stack: clones 2 public repos (the jaato monorepo = sdk+server,
-# and this bot), installs them in a venv, asks the operator for the Telegram
-# token + provider/model/key(s), customizes the agent profile, wires two systemd
-# --user services (server + bot over ws://localhost, polling), and runs a layered
-# health check (scaffold validate -> jaato-doctor -> live provider ping).
+# Premium-free stack: installs jaato-server + jaato-sdk FROM PyPI (via uv) into a
+# uv-managed venv, clones THIS bot repo and installs it editable (the bot is the
+# deployed app, not a PyPI package), asks the operator for the Telegram token +
+# provider/model/key(s), customizes the agent profile, wires two systemd services
+# (server + bot over ws://localhost, polling), and runs a layered health check
+# (scaffold validate -> jaato-doctor -> live provider ping).
+#
+# The framework is a versioned PyPI dependency, not a git checkout — jaato-server
+# and jaato-sdk are unpinned by default (latest at deploy); pin exact versions via
+# JAATO_SERVER_VERSION / JAATO_SDK_VERSION. Uses `uv`, not `pip`.
 #
 # Provider selection AND the per-provider key env-var name are discovered from
 # `jaato-scaffold explain` — nothing about providers is hardcoded here.
 #
-# Idempotent: safe to re-run (upgrade = pull + reinstall + restart).
+# Idempotent: safe to re-run (upgrade = reinstall latest + restart).
 # Teardown:  ./deploy-vps.sh --uninstall
 #
 # Override anything via env, e.g.:
-#   JAATO_REF=<sha> BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
+#   JAATO_SERVER_VERSION=0.11.0 JAATO_SDK_VERSION=0.19.0 BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
 #
 set -euo pipefail
 
 # ── Config (override via env) ────────────────────────────────────────────────
 INSTALL_DIR="${JAATO_INSTALL_DIR:-$HOME/jaato-stack}"
-JAATO_REPO="${JAATO_REPO:-https://github.com/Jaato-framework-and-examples/jaato.git}"
 BOT_REPO="${BOT_REPO:-https://github.com/Jaato-framework-and-examples/jaato-client-telegram.git}"
-# No git tags exist upstream — pin a SHA for reproducibility (these track main/master).
-JAATO_REF="${JAATO_REF:-main}"
+# The bot is deployed from git; no tag exists upstream so this tracks master.
 BOT_REF="${BOT_REF:-master}"
+# jaato-server + jaato-sdk are installed FROM PyPI. Unpinned by default (latest at
+# deploy); set these to pin an exact version (e.g. 0.11.0 / 0.19.0).
+JAATO_SERVER_VERSION="${JAATO_SERVER_VERSION:-}"
+JAATO_SDK_VERSION="${JAATO_SDK_VERSION:-}"
 WS_PORT="${JAATO_WS_PORT:-8080}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ── Derived paths ────────────────────────────────────────────────────────────
 VENV="$INSTALL_DIR/venv"; PYV="$VENV/bin/python"
-JAATO_DIR="$INSTALL_DIR/jaato"; BOT_DIR="$INSTALL_DIR/jaato-client-telegram"
+BOT_DIR="$INSTALL_DIR/jaato-client-telegram"   # framework comes from PyPI, not a clone
 WORKSPACE="$BOT_DIR/runtime"
 # Profiles are a base + a per-provider SET leaf (see write_profile). The bot
 # selects the leaf by QUALIFIED PATH ("<set>/telegram_chat"). SET_NAME/leaf paths
@@ -82,9 +89,20 @@ install_system_deps(){
     zypper)  $SUDO zypper -q install -y git python3 python3-pip gcc gcc-c++ make curl ca-certificates ;;
   esac || warn "system-dep install returned nonzero — continuing (preflight verifies below)"
 }
+# uv is the package manager (not pip). Bootstrap it via Astral's standalone
+# installer if absent — a static binary in ~/.local/bin, no Python dependency.
+install_uv(){
+  have uv && { info "  uv present ($(uv --version))"; return; }
+  info "Install uv (Astral standalone installer)"
+  curl -LsSf https://astral.sh/uv/install.sh | sh || die "uv install failed"
+  # The installer drops uv in ~/.local/bin (or $XDG_BIN_HOME); expose it now.
+  export PATH="$HOME/.local/bin:$PATH"
+  have uv || die "uv not on PATH after install (expected ~/.local/bin/uv)"
+}
 preflight(){
   info "Preflight"
   install_system_deps
+  install_uv
   have git || die "git not found (install it or pre-provision system deps)"
   have "$PYTHON_BIN" || die "$PYTHON_BIN not found (need Python >= 3.10)"
   local v; v=$("$PYTHON_BIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')
@@ -113,25 +131,29 @@ _clone_at(){ local repo="$1" dir="$2" ref="$3"
     || git -C "$dir" reset --hard --quiet "$ref"
   printf '  %s @ %s\n' "$(basename "$dir")" "$(git -C "$dir" rev-parse --short HEAD)"
 }
-fetch(){ info "Fetch repos (pinned: jaato=$JAATO_REF bot=$BOT_REF)"
+fetch(){ info "Fetch bot repo (bot=$BOT_REF; jaato-server/sdk come from PyPI, not git)"
   mkdir -p "$INSTALL_DIR"
-  _clone_at "$JAATO_REPO" "$JAATO_DIR" "$JAATO_REF"
-  _clone_at "$BOT_REPO"  "$BOT_DIR"  "$BOT_REF"
+  _clone_at "$BOT_REPO" "$BOT_DIR" "$BOT_REF"
 }
 
-# ── 3. Install (venv + editable installs; no premium) ────────────────────────
-install(){ info "Install (venv + editable packages)"
-  [ -x "$PYV" ] || "$PYTHON_BIN" -m venv "$VENV"
-  "$PYV" -m pip install --quiet --upgrade pip wheel
-  "$PYV" -m pip install --quiet -e "$JAATO_DIR/jaato-sdk"
-  # Server WITH the plugin + provider extras our profile needs (pexpect for
-  # interactive_shell, web/ast/notebook/templates, and the common provider SDKs).
-  # NOT `[all]` — that pulls kerberos→gssapi which needs libkrb5-dev and we don't
-  # use it. Anthropic's SDK is a base dep already.
-  "$PYV" -m pip install --quiet -e \
-    "$JAATO_DIR/jaato-server[web,interactive,ast,notebook,templates,diagrams,google,github-models,nim,openrouter]"
-  "$PYV" -m pip install --quiet -e "$BOT_DIR"
-  printf '  installed: jaato-sdk, jaato-server[extras], jaato-client-telegram (no premium)\n'
+# ── 3. Install (uv venv + PyPI framework + editable bot; no premium) ──────────
+install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
+  # uv-managed venv (recreated on re-run; reinstall below repopulates it).
+  uv venv --python "$PYTHON_BIN" "$VENV"
+  # Server extras our profile needs (pexpect for interactive_shell,
+  # web/ast/notebook/templates, and the common provider SDKs). NOT `[all]` —
+  # that pulls kerberos→gssapi which needs libkrb5-dev and we don't use it.
+  local EXTRAS="web,interactive,ast,notebook,templates,diagrams,google,github-models,nim,openrouter"
+  local sdk="jaato-sdk"; [ -n "$JAATO_SDK_VERSION" ] && sdk="jaato-sdk==$JAATO_SDK_VERSION"
+  local srv="jaato-server[$EXTRAS]"; [ -n "$JAATO_SERVER_VERSION" ] && srv="jaato-server[$EXTRAS]==$JAATO_SERVER_VERSION"
+  # Framework FROM PyPI (unpinned = latest unless the version vars are set).
+  uv pip install --python "$PYV" "$sdk" "$srv"
+  # The bot is the deployed app (not on PyPI) — editable from its clone; its
+  # jaato-sdk/jaato-server deps resolve against what we just installed.
+  uv pip install --python "$PYV" -e "$BOT_DIR"
+  printf '  installed from PyPI: jaato-sdk %s, jaato-server[extras] %s; editable: jaato-client-telegram\n' \
+    "$(uv pip show --python "$PYV" jaato-sdk 2>/dev/null | sed -n 's/^Version: //p')" \
+    "$(uv pip show --python "$PYV" jaato-server 2>/dev/null | sed -n 's/^Version: //p')"
 }
 
 # The provider's key env-var name, discovered from `scaffold explain env`
