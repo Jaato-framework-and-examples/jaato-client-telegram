@@ -174,6 +174,30 @@ def record_delivery(text: str) -> None:
         recorder.append(text)
 
 
+# ---- host-tool composition (ctx.call_tool) recursion guard ----
+# How deep a host tool has re-entered OTHER host tools in the current call chain.
+# A ContextVar (not a ToolContext field) so the depth propagates through the nested
+# tool's own executor/ToolContext across ``await`` boundaries — a plain field would
+# reset to 0 for each freshly-built nested ctx. See ToolContext.call_tool.
+MAX_CALL_DEPTH = 4
+_CALL_DEPTH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "host_tool_call_depth", default=0
+)
+
+
+def _missing_required(schema: "dict | None", args: dict) -> list[str]:
+    """Required parameters a TOOL_SCHEMA declares that are absent from ``args``.
+
+    Light validation (presence only, not types) — the target tool still validates
+    its own inputs; this just gives a clear error before dispatch instead of an
+    opaque KeyError inside the callee."""
+    if not isinstance(schema, dict):
+        return []
+    params = schema.get("parameters") or {}
+    required = params.get("required") or []
+    return [k for k in required if k not in args]
+
+
 # ---- render-flush coordination (narration before an out-of-band tool prompt) ----
 # A host tool's ask_user()/ctx.ask() sends its prompt IMMEDIATELY via bot.send_message,
 # bypassing the renderer's throttled narration — so the prompt can reach Telegram before
@@ -410,6 +434,12 @@ class ToolContext:
     # ctx.bind_wake()/unbind_wake() then return outcome="disabled".
     bind_fn: "Callable[[int, str, list], Awaitable[dict]] | None" = None
     unbind_fn: "Callable[[int, str], Awaitable[dict]] | None" = None
+    # Injected by the bot: {name: {"handler": async (args)->dict, "schema": dict}}
+    # for EVERY host tool in this session (built-ins + installed), so a tool can
+    # compose the others via ctx.call_tool(). None when composition isn't wired.
+    # Reaches only HOST tools (this unconfined bot's tools), never server-side
+    # model tools like web_search — those run in the confined runner.
+    tool_registry: "dict[str, dict] | None" = None
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -493,6 +523,42 @@ class ToolContext:
             return {"outcome": "disabled", "detail": "wake binding not wired"}
         return await self.unbind_fn(self.chat_id, wake_ref)
 
+    async def call_tool(self, name: str, args: "dict | None" = None) -> dict:
+        """Invoke ANOTHER host tool by name and return its result dict — so a tool can
+        compose the others instead of reimplementing them (e.g. an image tool calling
+        ``download_file`` then ``send_to_telegram``).
+
+        Reaches only HOST tools — this bot's built-ins plus user-installed tools — NOT
+        server-side model tools (``web_search`` etc.), which run in the confined runner.
+        Never raises: returns ``{"error": ...}`` for an unknown tool, a missing required
+        argument, a failure inside the callee, or if the call chain gets too deep
+        (recursion guard, ``MAX_CALL_DEPTH``)."""
+        if self.tool_registry is None:
+            return {"error": "call_tool is not available (tool composition not wired)"}
+        entry = self.tool_registry.get(name)
+        if entry is None:
+            known = ", ".join(sorted(self.tool_registry)) or "(none)"
+            return {"error": f"unknown host tool {name!r}; available: {known}"}
+        depth = _CALL_DEPTH.get()
+        if depth >= MAX_CALL_DEPTH:
+            return {
+                "error": f"call_tool depth limit ({MAX_CALL_DEPTH}) reached at {name!r} "
+                "— possible tool recursion"
+            }
+        args = args or {}
+        missing = _missing_required(entry.get("schema"), args)
+        if missing:
+            return {"error": f"missing required argument(s) for {name!r}: {', '.join(missing)}"}
+        token = _CALL_DEPTH.set(depth + 1)
+        try:
+            result = await entry["handler"](args)
+        except Exception as e:  # noqa: BLE001 — tool boundary; surface as an error dict
+            logger.exception("ctx.call_tool(%r) failed", name)
+            return {"error": f"{name} failed: {e}"}
+        finally:
+            _CALL_DEPTH.reset(token)
+        return result if isinstance(result, dict) else {"result": result}
+
 
 def validate_name(name: str) -> None:
     """Tool names are lowercase identifiers (also used as the file stem)."""
@@ -572,6 +638,7 @@ def make_executor(
     host_tools_dir: str = "",
     bind_fn: "Callable[[int, str, list], Awaitable[dict]] | None" = None,
     unbind_fn: "Callable[[int, str], Awaitable[dict]] | None" = None,
+    tool_registry: "dict[str, dict] | None" = None,
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
     ctx = ToolContext(
@@ -582,6 +649,7 @@ def make_executor(
         host_tools_dir=host_tools_dir,
         bind_fn=bind_fn,
         unbind_fn=unbind_fn,
+        tool_registry=tool_registry,
     )
 
     async def executor(args: dict) -> dict:

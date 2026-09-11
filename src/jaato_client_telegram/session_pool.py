@@ -584,9 +584,17 @@ class SessionPool:
         executors["register_tool"] = self._make_register_tool_executor(chat_id)
         executors["service_manifest"] = make_service_manifest_executor(self._ws_config.workspace)
 
-        tools: list[dict] = [
-            {**schema, "handler": executors[schema["name"]]} for schema in TOOL_SCHEMAS
-        ]
+        # Registry every host tool can compose via ctx.call_tool (name -> {handler,
+        # schema}). A single shared dict, FULLY populated below before any tool runs,
+        # so a dynamic tool's ctx (which just captures this reference) can reach every
+        # peer tool — built-in or installed — at call time.
+        registry: dict[str, dict] = {}
+
+        tools: list[dict] = []
+        for schema in TOOL_SCHEMAS:
+            handler = executors[schema["name"]]
+            tools.append({**schema, "handler": handler})
+            registry[schema["name"]] = {"handler": handler, "schema": schema}
 
         tools_dir = self._host_tools_dir()
         if tools_dir is not None:
@@ -597,19 +605,20 @@ class SessionPool:
                 # Pass the pump's wake so the tool's ctx.wake() can raise an event
                 # turn (e.g. a reminder) that resumes an idle session, and the
                 # workspace so a tool can stage a file (e.g. install_tool writing
-                # a verified draft to tool_drafts/).
+                # a verified draft to tool_drafts/). tool_registry lets the tool
+                # compose peers via ctx.call_tool().
                 wake = self._pump.wake if self._pump is not None else None
                 htd = self._host_tools_dir()
-                tools.append({
-                    **schema,
-                    "handler": make_executor(
-                        t["execute"], tbot, chat_id,
-                        wake=wake, workspace=self._ws_config.workspace,
-                        host_tools_dir=str(htd) if htd is not None else "",
-                        bind_fn=self.bind_wake_command,
-                        unbind_fn=self.unbind_wake_command,
-                    ),
-                })
+                handler = make_executor(
+                    t["execute"], tbot, chat_id,
+                    wake=wake, workspace=self._ws_config.workspace,
+                    host_tools_dir=str(htd) if htd is not None else "",
+                    bind_fn=self.bind_wake_command,
+                    unbind_fn=self.unbind_wake_command,
+                    tool_registry=registry,
+                )
+                tools.append({**schema, "handler": handler})
+                registry[name] = {"handler": handler, "schema": schema}
         return tools
 
     # --- Telegram thread continuity -----------------------------------------
