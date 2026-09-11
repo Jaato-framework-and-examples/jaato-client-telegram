@@ -1,0 +1,63 @@
+# telegram_chat — OpenRouter set. All tiers route through OpenRouter (one
+# provider, one key). Selected by the bot via qualified path:
+#   jaato_ws.profile: "openrouter/telegram_chat"
+# Inherits the provider-agnostic role from _base_telegram_chat (plugins,
+# apparmor, max_turns, memory scope, tool-venv). This leaf adds ONLY the
+# provider binding + the per-turn model tiers.
+name: telegram_chat
+description: >-
+  Telegram bot per-chat session — OpenRouter set: cheap glm-5.3-flash default,
+  an on-demand GLM-5.3 coder tier, and a gemini vision tier.
+inherits: [_base_telegram_chat]
+# `plugins: []` keeps the inherited base surface unchanged — plugins UNION on
+# inherit, so an empty list here ADDS nothing (it cannot scope the base down).
+plugins: []
+provider: openrouter
+# model is IGNORED whenever model_tiers is non-empty (the session starts from
+# the `initial` tier). Kept as documentation of the effective initial model.
+model: z-ai/glm-5.3-flash
+# Cheap z-ai/glm-5.3-flash for text (executor / initial) + a deployment-named
+# `coder` tier on z-ai/glm-5.3 (GLM 5.3, coding- and agent-tuned) entered ON
+# DEMAND for real code work + a REAL vision tier on google/gemini-2.5-flash
+# (zhipuai glm-4.5v hallucinates, so it's not used). `coder` is a CUSTOM tier
+# name — allowed since c8f50d9a "let a deployment NAME its own tiers": any name
+# matching ^[a-z][a-z0-9_]{1,31}$ is valid PROVIDED it carries a `description`
+# (that string becomes this tier's bullet in the enter_tier tool).
+model_tiers:
+  # Each tier pins provider: openrouter explicitly. All three share the provider
+  # today, but keeping the field means a future edit pointing ONE tier elsewhere
+  # can't make enter_tier() for the others inherit that provider on switch-back.
+  executor:
+    model: z-ai/glm-5.3-flash
+    provider: openrouter
+  # Custom coder tier (custom name => `description` REQUIRED). On-demand so
+  # ordinary chat stays on the cheap flash default. Swap to z-ai/glm-5.3-flash
+  # for a cheaper coder, or keep z-ai/glm-5.3 for the strongest code model.
+  coder:
+    model: z-ai/glm-5.3
+    provider: openrouter
+    description: >-
+      Write, edit, and reason about code to a plan. THE CODER — the strongest
+      code model here (Z.AI GLM 5.3, coding- and agent-tuned). Enter for real
+      coding tasks: writing or editing files, debugging, multi-step
+      implementation. Switch back to executor for ordinary conversation.
+  vision:
+    model: google/gemini-2.5-flash
+    provider: openrouter
+  initial: executor
+  # fallback must name a DECLARED tier. Leaving it unset (default 'dispatcher',
+  # which we don't declare) makes the runner reject the whole tier config and
+  # silently drop to single-model mode — so the vision/coder tiers vanish.
+  fallback: executor
+plugin_configs:
+  # Provider-specific config lives in the leaf (the base is provider-agnostic).
+  openrouter:
+    api_params:
+      # Applies to all OpenRouter tiers (executor/coder text + gemini vision);
+      # 0.7 is a fine sampling temp for image reading too.
+      temperature: 0.7
+    # Env-var interpolation (public-checkout friendly): set JAATO_OPENROUTER_API_KEY
+    # in the workspace .env (git-ignored), forwarded to the daemon via env_file.
+    # If you have jaato-premium (installed here), pass://jaato/openrouter/api-key
+    # is preferable — the key never touches the workspace.
+    api_key: "${JAATO_OPENROUTER_API_KEY}"
