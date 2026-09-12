@@ -13,6 +13,14 @@
 # and jaato-sdk are unpinned by default (latest at deploy); pin exact versions via
 # JAATO_SERVER_VERSION / JAATO_SDK_VERSION. Uses `uv`, not `pip`.
 #
+# TESTPYPI=1 installs the framework from TestPyPI (for testing a pre-release build
+# before it is published to PyPI proper), keeping PyPI as an --extra-index-url so
+# everything else + all dependencies still resolve from PyPI. Selection is by
+# version pin: set JAATO_SDK_VERSION / JAATO_SERVER_VERSION to the version(s) you
+# are testing (pin the OTHER to its current PyPI version so it isn't accidentally
+# upgraded to a TestPyPI build). e.g.:
+#   TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh
+#
 # Provider selection AND the per-provider key env-var name are discovered from
 # `jaato-scaffold explain` — nothing about providers is hardcoded here.
 #
@@ -38,6 +46,9 @@ BOT_REF="${BOT_REF:-master}"
 # deploy); set these to pin an exact version (e.g. 0.11.0 / 0.19.0).
 JAATO_SERVER_VERSION="${JAATO_SERVER_VERSION:-}"
 JAATO_SDK_VERSION="${JAATO_SDK_VERSION:-}"
+# Non-empty => install the framework from TestPyPI (PyPI kept as --extra-index-url
+# for everything else + deps). For pre-publish testing. See the header block.
+TESTPYPI="${TESTPYPI:-}"
 WS_PORT="${JAATO_WS_PORT:-8080}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -151,12 +162,30 @@ install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
   local EXTRAS="web,interactive,ast,notebook,templates,diagrams,google,github-models,nim,openrouter"
   local sdk="jaato-sdk"; [ -n "$JAATO_SDK_VERSION" ] && sdk="jaato-sdk==$JAATO_SDK_VERSION"
   local srv="jaato-server[$EXTRAS]"; [ -n "$JAATO_SERVER_VERSION" ] && srv="jaato-server[$EXTRAS]==$JAATO_SERVER_VERSION"
-  # Framework FROM PyPI (unpinned = latest unless the version vars are set).
-  uv pip install --python "$PYV" "$sdk" "$srv"
+  # TestPyPI (opt-in) for the FRAMEWORK install only. --index-url makes TestPyPI
+  # the primary index and --extra-index-url keeps PyPI, so a jaato version that
+  # lives only on TestPyPI comes from there while everything else + all deps
+  # resolve from PyPI. --index-strategy unsafe-best-match makes uv search BOTH
+  # indexes and pick the best version per package (pip's merge behaviour) instead
+  # of uv's default first-index — which would bind a jaato package entirely to
+  # TestPyPI and fail when a pinned version lives only on PyPI (i.e. it is what
+  # lets you take ONE package from TestPyPI and the other from PyPI).
+  local idx=()
+  if [ -n "$TESTPYPI" ]; then
+    idx=( --index-url https://test.pypi.org/simple/
+          --extra-index-url https://pypi.org/simple/
+          --index-strategy unsafe-best-match )
+    info "  TestPyPI ENABLED for framework (sdk=${JAATO_SDK_VERSION:-latest} server=${JAATO_SERVER_VERSION:-latest}); other packages + deps from PyPI"
+  fi
+  # Framework FROM PyPI (unpinned = latest unless the version vars are set), or
+  # from TestPyPI when TESTPYPI is set (PyPI kept as the extra index).
+  uv pip install --python "$PYV" ${idx[@]+"${idx[@]}"} "$sdk" "$srv"
   # The bot is the deployed app (not on PyPI) — editable from its clone; its
-  # jaato-sdk/jaato-server deps resolve against what we just installed.
+  # jaato-sdk/jaato-server deps resolve against what we just installed. NO
+  # TestPyPI here: the bot's own deps (aiogram, …) must come from PyPI only.
   uv pip install --python "$PYV" -e "$BOT_DIR"
-  printf '  installed from PyPI: jaato-sdk %s, jaato-server[extras] %s; editable: jaato-client-telegram\n' \
+  printf '  installed from %s: jaato-sdk %s, jaato-server[extras] %s; editable: jaato-client-telegram (deps from PyPI)\n' \
+    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
     "$(uv pip show --python "$PYV" jaato-sdk 2>/dev/null | sed -n 's/^Version: //p')" \
     "$(uv pip show --python "$PYV" jaato-server 2>/dev/null | sed -n 's/^Version: //p')"
 }
