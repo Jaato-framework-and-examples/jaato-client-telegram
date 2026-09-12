@@ -818,15 +818,24 @@ class SessionPool:
 
     async def respond_to_clarification(
         self, session_id: str, request_id: str, answers: list[str],
+        answer_attachments: dict | None = None,
     ) -> None:
         """Answer a clarification request with one string per question, in order.
 
         WS/chat clients receive all questions at once (ClarificationBatchRequested)
         and reply in one batch; the server feeds each answer into the channel queue
         sequentially. Single/multiple-choice answers are 1-based ordinals
-        ("2", "1,3"); free-text answers are the literal text."""
+        ("2", "1,3"); free-text answers are the literal text.
+
+        ``answer_attachments`` (SDK #989) attaches media to individual answers —
+        ``{1-based question index -> [attachment, ...]}``, each attachment the same
+        ``{mime_type, data, display_name}`` shape as a user-message attachment. A
+        voice note answering a free_text question is the motivating case (its answer
+        string is then ``""`` — the utterance IS the answer)."""
         client = self._find_client(session_id)
-        await client.respond_to_clarification_batch(request_id, answers)
+        await client.respond_to_clarification_batch(
+            request_id, answers, answer_attachments=answer_attachments or None,
+        )
 
     async def events(self, session_id: str) -> AsyncIterator:
         return self._find_client(session_id).events()
