@@ -264,6 +264,7 @@ async def handle_private_audio(
     message: Message,
     pool: SessionPool,
     pump: ChatPump,
+    clarification_handler: ClarificationHandler | None = None,
 ) -> None:
     """Handle an inbound voice note or audio file.
 
@@ -317,6 +318,21 @@ async def handle_private_audio(
         return
 
     attachments = _build_audio_attachments(data, mime_type, name, seconds)
+
+    # If a clarification is awaiting this user's reply, answer THAT with the voice
+    # note instead of starting a new turn (SDK #989: audio attached to a free_text
+    # answer; the answer string is "" — the utterance IS the answer). Handled here,
+    # like the text handler's clarification branch, because it unblocks the
+    # in-flight turn rather than being a new prompt — WITHOUT this the voice note
+    # became a fresh turn while the server still waited for the answer, hanging.
+    if clarification_handler and clarification_handler.get_pending(chat_id) is not None:
+        logger.info("inbound clarification answer (audio): chat=%s mime=%s", chat_id, mime_type)
+        status, payload = clarification_handler.record_answer(chat_id, "", attachment=attachments)
+        await advance_clarification(
+            message, chat_id, status, payload, clarification_handler, pool,
+        )
+        return
+
     caption = (message.caption or "").strip() or "Listen to this voice message and respond."
     logger.info(
         "inbound thread (audio): chat=%s message_thread_id=%s mime=%s seconds=%s",

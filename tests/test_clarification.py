@@ -90,8 +90,10 @@ def test_respond_to_clarification_builds_batch_response():
     calls = []
 
     class _FakeClient:
-        async def respond_to_clarification_batch(self, request_id, answers):
-            calls.append((request_id, answers))
+        async def respond_to_clarification_batch(
+            self, request_id, answers, answer_attachments=None,
+        ):
+            calls.append((request_id, answers, answer_attachments))
 
     pool = SessionPool.__new__(SessionPool)  # bypass __init__ (needs config)
     pool._sessions = {7: SessionMetadata(
@@ -100,7 +102,30 @@ def test_respond_to_clarification_builds_batch_response():
     )}
 
     asyncio.run(pool.respond_to_clarification("sess-1", "req-1", ["1", "hello"]))
-    assert calls == [("req-1", ["1", "hello"])]
+    assert calls == [("req-1", ["1", "hello"], None)]
+
+    # #989: attachments on an answer (a voice note) are forwarded to the client.
+    att = [{"mime_type": "audio/ogg", "data": "Zm9v", "display_name": "voice.ogg"}]
+    asyncio.run(pool.respond_to_clarification(
+        "sess-1", "req-2", [""], answer_attachments={1: att},
+    ))
+    assert calls[-1] == ("req-2", [""], {1: att})
+
+
+def test_record_answer_stores_attachment_by_1based_index():
+    """A voice note answering a free_text question: empty answer, audio stored
+    under the 1-based question index (the shape the SDK's answer_attachments wants)."""
+    from jaato_client_telegram.clarification import ClarificationHandler, PendingClarification
+
+    h = ClarificationHandler()
+    h._pending[5] = PendingClarification(
+        request_id="r", chat_id=5,
+        questions=[{"text": "What's your name?", "question_type": "free_text"}],
+    )
+    att = [{"mime_type": "audio/ogg", "data": "Zm9v", "display_name": "v.ogg"}]
+    status, payload = h.record_answer(5, "", attachment=att)
+    assert status == "done" and payload == [""]
+    assert h._pending[5].answer_attachments == {1: att}
 
 
 if __name__ == "__main__":

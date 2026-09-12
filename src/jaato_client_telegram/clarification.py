@@ -42,6 +42,10 @@ class PendingClarification:
     context: str = ""                # why the agent needs this (shown once)
     answers: list[str] = field(default_factory=list)  # accumulated, one per question
     current: int = 0                 # 0-based index of the question awaiting an answer
+    # Media attached to individual answers (SDK #989): {1-based question index ->
+    # [attachment, ...]}. A voice note answering a free_text question lands here
+    # with an EMPTY answer string — the utterance IS the answer.
+    answer_attachments: dict = field(default_factory=dict)
 
 
 class ClarificationHandler:
@@ -146,8 +150,16 @@ class ClarificationHandler:
         except ValueError:
             return None
 
-    def record_answer(self, chat_id: int, answer: str) -> tuple[str, object]:
+    def record_answer(
+        self, chat_id: int, answer: str, attachment: list | None = None,
+    ) -> tuple[str, object]:
         """Record the current question's answer and advance.
+
+        ``attachment`` (SDK #989) is an optional list of media dicts for the
+        current question — e.g. a voice note answering a free_text question, in
+        which case ``answer`` is legitimately ``""`` (the utterance IS the
+        answer). Stored under the question's 1-BASED index, the shape the SDK's
+        ``answer_attachments`` expects.
 
         Returns one of:
         - ``("next", question_dict)``  — more questions remain
@@ -157,6 +169,8 @@ class ClarificationHandler:
         pending = self._pending.get(chat_id)
         if not pending:
             return ("error", "no pending clarification")
+        if attachment:
+            pending.answer_attachments[pending.current + 1] = attachment
         pending.answers.append(answer)
         pending.current += 1
         if pending.current >= len(pending.questions):
@@ -183,12 +197,21 @@ async def advance_clarification(message, chat_id, status, payload, handler, pool
     elif status == "done":
         pending = handler.get_pending(chat_id)
         request_id = pending.request_id if pending else ""
+        # Snapshot the per-answer attachments (#989) BEFORE remove_pending drops
+        # the state — e.g. a voice note answering a free_text question.
+        answer_attachments = dict(pending.answer_attachments) if pending else {}
         answers = payload
         handler.remove_pending(chat_id)
         session_id = pool.get_session_id(chat_id)
         if session_id and request_id:
-            await pool.respond_to_clarification(session_id, request_id, answers)
-            logger.info("Clarification submitted: request_id=%s answers=%s", request_id, answers)
+            await pool.respond_to_clarification(
+                session_id, request_id, answers,
+                answer_attachments=answer_attachments or None,
+            )
+            logger.info(
+                "Clarification submitted: request_id=%s answers=%s attachments=%s",
+                request_id, answers, sorted(answer_attachments) or "none",
+            )
         else:
             await message.answer("❌ No active session to submit the clarification answer.")
     elif status == "error":
