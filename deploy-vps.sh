@@ -395,6 +395,33 @@ write_profile(){
     provider: \"$VISION_PROVIDER\""
   fi
 
+  # ROUTING_ORDER (comma-separated upstream provider names, e.g. "Google AI
+  # Studio"): pin OpenRouter provider routing on the exec provider. WHY this
+  # exists: OpenRouter's DEFAULT gemini upstream ("Google"/Vertex) intermittently
+  # DROPS audio input (~25% measured — the model replies "I cannot process
+  # audio"); "Google AI Studio" handles it reliably. Emitted only when set (no
+  # hardcoded default). ROUTING_ALLOW_FALLBACKS (default true) is REQUIRED for a
+  # mixed set: a tier whose model the pinned upstream does not serve (e.g. a
+  # z-ai coder) still falls back to its own provider. For the multimodal
+  # openrouter set, pass ROUTING_ORDER="Google AI Studio".
+  local plugin_cfg=""
+  if [ -n "${ROUTING_ORDER:-}" ]; then
+    local o _ord ord_items=""
+    IFS=',' read -ra _ord <<< "$ROUTING_ORDER"
+    for o in "${_ord[@]}"; do
+      o="$(printf '%s' "$o" | sed 's/^ *//;s/ *$//')"; [ -n "$o" ] || continue
+      ord_items="${ord_items:+$ord_items, }\"$o\""
+    done
+    plugin_cfg="
+plugin_configs:
+  # Provider-routing pin (ROUTING_ORDER) — see write_profile: works around
+  # OpenRouter's default gemini upstream intermittently dropping audio input.
+  $EXEC_PROVIDER:
+    routing:
+      order: [$ord_items]
+      allow_fallbacks: ${ROUTING_ALLOW_FALLBACKS:-true}"
+  fi
+
   # --- base: provider-agnostic role. Static => QUOTED heredoc (no interpolation,
   # so a literal $ in a comment is safe here, unlike the leaf below). ------------
   cat > "$BASE_PROFILE_FILE" <<'YAML'
@@ -460,7 +487,7 @@ apparmor: $apparmor
 model_tiers:
 $tiers
   initial: executor
-  fallback: executor
+  fallback: executor$plugin_cfg
 YAML
 
   printf '  set=%s provider=%s model=%s coder=%s vision=%s apparmor=%s\n' \
