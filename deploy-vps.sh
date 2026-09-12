@@ -241,7 +241,7 @@ collect(){ info "Configuration"
   elif confirm "Enable an on-demand coder tier (code-specialized model)?"; then
     IFS='|' read -r CODER_PROVIDER CODER_MODEL CODER_ENVVAR CODER_KEY < <(_pick_provider "coder")
   else warn "  Coder tier disabled — the bot uses the main tier for code too."; fi
-  CODER_DESCRIPTION="${CODER_DESCRIPTION:-Write, edit, and reason about code to a plan. The strongest code model here; enter for real coding tasks (writing or editing files, debugging, multi-step implementation), then switch back to executor for ordinary conversation.}"
+  CODER_DESCRIPTION="${CODER_DESCRIPTION:-Write, edit, and reason about code to a plan. The strongest code model here; enter for real coding tasks (writing or editing files, debugging, multi-step implementation), then switch straight back to executor when done — a text-only coder cannot see images or hear audio, so do not linger here.}"
 
   # The profile SET name (a subdir under .jaato/profiles/). Defaults to the main
   # provider so the leaf reads as "<provider>/telegram_chat"; override with PROFILE_SET.
@@ -350,11 +350,30 @@ write_profile(){
   local apparmor=false
   have apparmor_parser && aa-enabled >/dev/null 2>&1 && apparmor=true
 
-  # Tier table. executor always; coder/vision only when their provider was chosen.
-  # A custom tier name (coder) REQUIRES a description — emitted as a folded scalar.
+  # Tier table. executor always; coder only when chosen (custom name => REQUIRES a
+  # description, emitted as a folded scalar). A standalone vision tier only when
+  # the default is NOT multimodal (see EXEC_MODALITIES).
+  #
+  # EXEC_MODALITIES (e.g. "image,audio"): declare inbound media roles on the
+  # DEFAULT tier so media (an image, a voice note) is handled in ONE turn by the
+  # always-active model — media arrives WITH the turn, so the model active when it
+  # lands must ingest it; you can't reliably switch into a media tier after the
+  # fact. When set, pick a multimodal EXEC_MODEL and the standalone vision tier is
+  # skipped (folded into the default).
+  local exec_modalities=""
+  if [ -n "${EXEC_MODALITIES:-}" ]; then
+    local m parts="" _mods
+    IFS=',' read -ra _mods <<< "$EXEC_MODALITIES"
+    for m in "${_mods[@]}"; do
+      m="$(printf '%s' "$m" | tr -d '[:space:]')"; [ -n "$m" ] || continue
+      parts="${parts:+$parts, }$m: inbound"
+    done
+    [ -n "$parts" ] && exec_modalities="
+    modalities: {$parts}"
+  fi
   local tiers="  executor:
     model: \"$EXEC_MODEL\"
-    provider: \"$EXEC_PROVIDER\""
+    provider: \"$EXEC_PROVIDER\"$exec_modalities"
   if [ -n "$CODER_PROVIDER" ]; then
     tiers="$tiers
   coder:
@@ -363,7 +382,8 @@ write_profile(){
     description: >-
       $CODER_DESCRIPTION"
   fi
-  if [ -n "$VISION_PROVIDER" ]; then
+  # Standalone vision tier only when the default isn't already multimodal.
+  if [ -n "$VISION_PROVIDER" ] && [ -z "${EXEC_MODALITIES:-}" ]; then
     tiers="$tiers
   vision:
     model: \"$VISION_MODEL\"

@@ -128,6 +128,37 @@ def _build_image_attachments(data: bytes, mime_type: str, name: str) -> list[dic
     }]
 
 
+# Audio understanding is ON: the telegram_chat profile's DEFAULT tier
+# (OpenRouter google/gemini-2.5-flash) declares `modalities: {audio: inbound}`,
+# so a user voice/audio message is heard by the always-active model in ONE turn
+# — no tier switch. Audio capability MUST live on the default tier: the audio
+# arrives with the turn, so the model active when it lands has to be able to hear
+# it (you can't reliably "switch into" an audio tier after the fact). Set False
+# if the default tier drops its inbound-audio modality.
+_AUDIO_ENABLED = True
+
+
+def _build_audio_attachments(
+    data: bytes, mime_type: str, name: str, seconds: "int | None" = None
+) -> list[dict]:
+    """Build the user-message attachment list for a voice/audio message.
+
+    Same wire contract as images ({mime_type, data(base64), display_name}); the
+    OpenRouter provider marshals an ``audio/*`` attachment into an ``input_audio``
+    block (#830) for a tier that declares inbound audio. Telegram voice is
+    OGG/Opus (``audio/ogg``, in the framework's format allow-list); audio files
+    carry their own mime. ``seconds`` (optional) gives the model duration context.
+    """
+    att: dict = {
+        "mime_type": mime_type,
+        "data": base64.b64encode(data).decode("ascii"),
+        "display_name": name,
+    }
+    if seconds is not None:
+        att["seconds"] = seconds
+    return [att]
+
+
 @router.message((F.photo | F.document), F.chat.type == "private")
 async def handle_private_media(
     message: Message,
@@ -221,6 +252,75 @@ async def handle_private_media(
     logger.info(
         "inbound thread (media): chat=%s message_thread_id=%s vision=%s",
         chat_id, message.message_thread_id, is_vision,
+    )
+    pump.submit(PumpItem(
+        chat_id=chat_id, message=message, text=caption,
+        attachments=attachments, apply_welcome=True, reply=False,
+    ))
+
+
+@router.message((F.voice | F.audio), F.chat.type == "private")
+async def handle_private_audio(
+    message: Message,
+    pool: SessionPool,
+    pump: ChatPump,
+) -> None:
+    """Handle an inbound voice note or audio file.
+
+    The audio rides to the profile's DEFAULT (audio-capable) tier as a
+    user-message attachment (#830 ``input_audio`` ferry). Telegram *voice* is
+    OGG/Opus (``audio/ogg``); an *audio* file carries its own mime. The default
+    tier (gemini-2.5-flash, ``audio: inbound``) hears it in one turn — no tier
+    switch, because audio arrives with the turn and the active model must be able
+    to ingest it.
+    """
+    chat_id = message.chat.id
+
+    # Resolve the Telegram audio object + its mime.
+    if message.voice:
+        tg_file = message.voice
+        mime_type = tg_file.mime_type or "audio/ogg"       # Telegram voice = OGG/Opus
+        name = f"voice_{tg_file.file_unique_id}.ogg"
+    else:
+        aud = message.audio
+        tg_file = aud
+        mime_type = aud.mime_type or "audio/mpeg"
+        name = aud.file_name or f"audio_{aud.file_unique_id}"
+    seconds = getattr(tg_file, "duration", None)
+
+    if not _AUDIO_ENABLED:
+        await message.answer(
+            "🎤 Got your audio — but audio understanding isn't enabled yet. "
+            "(It needs the default tier to declare inbound audio.) Send me text "
+            "in the meantime."
+        )
+        return
+
+    # Same 20 MB Telegram bot-download cap as other media (pre-checked on the
+    # size Telegram sends, for a clear reason rather than a raw getFile error).
+    size = getattr(tg_file, "file_size", None)
+    if size and size > _MAX_DOWNLOAD_BYTES:
+        await message.answer(
+            f"🎤 That audio is {size / 1024 / 1024:.0f} MB — I can only handle "
+            f"files up to 20 MB."
+        )
+        return
+
+    try:
+        await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        tg_file_info = await message.bot.get_file(tg_file.file_id)
+        buf = await message.bot.download_file(tg_file_info.file_path)
+        data = buf.read()
+    except Exception as e:  # noqa: BLE001 — download boundary
+        logger.exception("Error downloading audio from chat_id %s", chat_id)
+        await message.answer(f"❌ Sorry, I couldn't download that audio — {e}")
+        return
+
+    attachments = _build_audio_attachments(data, mime_type, name, seconds)
+    caption = (message.caption or "").strip() or "Listen to this voice message and respond."
+    logger.info(
+        "inbound thread (audio): chat=%s message_thread_id=%s mime=%s seconds=%s",
+        chat_id, message.message_thread_id, mime_type, seconds,
     )
     pump.submit(PumpItem(
         chat_id=chat_id, message=message, text=caption,
