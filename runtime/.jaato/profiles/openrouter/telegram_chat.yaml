@@ -6,8 +6,8 @@
 # provider binding + the per-turn model tiers.
 name: telegram_chat
 description: >-
-  Telegram bot per-chat session — OpenRouter set: cheap glm-5.3-flash default,
-  an on-demand GLM-5.3 coder tier, and a gemini vision tier.
+  Telegram bot per-chat session — OpenRouter set: a multimodal gemini-2.5-flash
+  default (text + image + audio) and an on-demand GLM-5.3 coder tier.
 inherits: [_base_telegram_chat]
 # `plugins: []` keeps the inherited base surface unchanged — plugins UNION on
 # inherit, so an empty list here ADDS nothing (it cannot scope the base down).
@@ -15,24 +15,26 @@ plugins: []
 provider: openrouter
 # model is IGNORED whenever model_tiers is non-empty (the session starts from
 # the `initial` tier). Kept as documentation of the effective initial model.
-model: z-ai/glm-5.3-flash
-# Cheap z-ai/glm-5.3-flash for text (executor / initial) + a deployment-named
-# `coder` tier on z-ai/glm-5.3 (GLM 5.3, coding- and agent-tuned) entered ON
-# DEMAND for real code work + a REAL vision tier on google/gemini-2.5-flash
-# (zhipuai glm-4.5v hallucinates, so it's not used). `coder` is a CUSTOM tier
-# name — allowed since c8f50d9a "let a deployment NAME its own tiers": any name
-# matching ^[a-z][a-z0-9_]{1,31}$ is valid PROVIDED it carries a `description`
-# (that string becomes this tier's bullet in the enter_tier tool).
+model: google/gemini-2.5-flash
+# The DEFAULT tier is multimodal on purpose. Media (an image, a voice note)
+# arrives WITH the turn, so the model active when it lands must be able to ingest
+# it — you can't reliably "switch into" a media tier after the fact (a non-media
+# model gets the block withheld/rejected, and a voice-only message has no text to
+# reason over). So gemini-2.5-flash is the always-active default, declaring
+# `image: inbound` + `audio: inbound`; images and voice are handled in ONE turn,
+# no tier switch. `coder` (custom tier, allowed since c8f50d9a) is the ONLY
+# on-demand tier and MUST return to executor before idle — glm can't see or hear.
 model_tiers:
-  # Each tier pins provider: openrouter explicitly. All three share the provider
-  # today, but keeping the field means a future edit pointing ONE tier elsewhere
-  # can't make enter_tier() for the others inherit that provider on switch-back.
+  # DEFAULT / initial — multimodal, always active: text chat + inbound images +
+  # inbound audio (Telegram voice = audio/ogg -> input_audio block, #830). This
+  # tier absorbs what used to be a separate `vision` tier.
   executor:
-    model: z-ai/glm-5.3-flash
+    model: google/gemini-2.5-flash
     provider: openrouter
-  # Custom coder tier (custom name => `description` REQUIRED). On-demand so
-  # ordinary chat stays on the cheap flash default. Swap to z-ai/glm-5.3-flash
-  # for a cheaper coder, or keep z-ai/glm-5.3 for the strongest code model.
+    modalities: {image: inbound, audio: inbound}
+  # Custom coder tier (custom name => `description` REQUIRED). The ONLY on-demand
+  # tier. Its description MUST tell the model to return to executor when done —
+  # glm-5.3 is text-only, so lingering here would strand a later image/voice.
   coder:
     model: z-ai/glm-5.3
     provider: openrouter
@@ -40,21 +42,19 @@ model_tiers:
       Write, edit, and reason about code to a plan. THE CODER — the strongest
       code model here (Z.AI GLM 5.3, coding- and agent-tuned). Enter for real
       coding tasks: writing or editing files, debugging, multi-step
-      implementation. Switch back to executor for ordinary conversation.
-  vision:
-    model: google/gemini-2.5-flash
-    provider: openrouter
+      implementation, then switch straight back to executor when done — glm
+      cannot see images or hear audio, so do not linger here.
   initial: executor
   # fallback must name a DECLARED tier. Leaving it unset (default 'dispatcher',
   # which we don't declare) makes the runner reject the whole tier config and
-  # silently drop to single-model mode — so the vision/coder tiers vanish.
+  # silently drop to single-model mode — so the coder tier vanishes.
   fallback: executor
 plugin_configs:
   # Provider-specific config lives in the leaf (the base is provider-agnostic).
   openrouter:
     api_params:
-      # Applies to all OpenRouter tiers (executor/coder text + gemini vision);
-      # 0.7 is a fine sampling temp for image reading too.
+      # Applies to all OpenRouter tiers (gemini multimodal default + glm coder);
+      # 0.7 is a fine sampling temp for image/audio reading too.
       temperature: 0.7
     # Env-var interpolation (public-checkout friendly): set JAATO_OPENROUTER_API_KEY
     # in the workspace .env (git-ignored), forwarded to the daemon via env_file.
