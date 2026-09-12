@@ -35,11 +35,16 @@ TOOL_SCHEMAS = [
     {
         "name": "send_to_telegram",
         "description": (
-            "Send a file or text message to the Telegram user. "
-            "Use this to proactively share files you created (CSV, JSON, "
-            "plots, etc.) or to send important notifications. "
-            "Do NOT use this for ordinary conversation — that flows "
-            "through the normal response channel."
+            "Push content to the Telegram user: a FILE via file_path, or a "
+            "text payload via message. Use `message` ONLY for a DISTINCT "
+            "deliverable that is not your ordinary reply — a document, a "
+            "formatted report, a Markdown write-up, a standalone proactive "
+            "notification. CRITICAL: your normal reply text is ALREADY sent "
+            "to the user automatically — NEVER pass your conversational "
+            "answer (the same words you are replying with) as `message`, "
+            "because that delivers the user a DUPLICATE message. If you are "
+            "simply answering the user, reply normally and do NOT call this "
+            "tool."
         ),
         "parameters": {
             "type": "object",
@@ -50,7 +55,12 @@ TOOL_SCHEMAS = [
                 },
                 "message": {
                     "type": "string",
-                    "description": "Text to send. Ignored when file_path is provided.",
+                    "description": (
+                        "A DISTINCT text deliverable (a document, report, or "
+                        "standalone notification) — NOT your conversational "
+                        "answer, which is already delivered to the user. "
+                        "Ignored when file_path is provided."
+                    ),
                 },
             },
         },
