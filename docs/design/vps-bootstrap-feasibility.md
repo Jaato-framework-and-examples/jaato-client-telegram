@@ -1,5 +1,14 @@
 # Feasibility: one-shot VPS bootstrap for the bot + its jaato stack
 
+> **Historical (superseded).** This is the pre-implementation feasibility study.
+> `deploy-vps.sh` was since built and the open questions resolved: the framework
+> is installed **from PyPI via `uv`** (`jaato-server` + `jaato-sdk`; the bot is
+> cloned + editable), not from the monorepo or TestPyPI. The "not on PyPI (404) /
+> only stale TestPyPI" notes below no longer hold. `TESTPYPI=1` remains available
+> as an opt-in for testing a pre-release build. For current, accurate deployment
+> docs see the **README → "Deploy to a VPS"** section and the header of
+> `deploy-vps.sh`.
+
 **Verdict: feasible**, and not hard — the enabling facts are all in place. The
 main reframing is that "deploy the bot + dependencies" means deploying the
 **whole stack** (server + SDK + bot), because the bot is only a client.

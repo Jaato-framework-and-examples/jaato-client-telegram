@@ -17,7 +17,7 @@ All agent logic, tool execution, plugins, and permissions live in the **jaato se
 
 ## Deploy to a VPS (one command)
 
-`deploy-vps.sh` bootstraps the **whole stack** — the jaato server *and* this bot — onto a fresh Linux VPS: it installs system deps, clones + installs the jaato monorepo (server + SDK) and this bot into a venv, asks for your provider/model/keys, generates the config + a **user whitelist**, wires two **systemd** services (server + bot), and runs a layered health check. Premium-free, no TLS or inbound ports (bot ↔ server over `ws://localhost`, Telegram polling).
+`deploy-vps.sh` bootstraps the **whole stack** — the jaato server *and* this bot — onto a fresh Linux VPS: it installs system deps, creates a **`uv`-managed venv** and installs **`jaato-server` + `jaato-sdk` from PyPI** into it, clones this bot and installs it **editable** (the bot is the deployed app, not a PyPI package), asks for your provider/model/keys, generates the config + a **user whitelist** + the agent **profile** (a provider-agnostic base plus a per-provider *set* leaf), wires two **systemd** services (server + bot), and runs a layered health check. Premium-free, no TLS or inbound ports (bot ↔ server over `ws://localhost`, Telegram polling).
 
 On a fresh **Ubuntu/Debian** VPS (as root, or a sudo user):
 
@@ -36,13 +36,27 @@ It prompts for:
 
 ```bash
 TELEGRAM_BOT_TOKEN=… \
-EXEC_PROVIDER=zhipuai EXEC_MODEL=glm-4.6 EXEC_KEY=… \
-VISION_PROVIDER=openrouter VISION_MODEL=google/gemini-2.5-flash VISION_KEY=… \
+EXEC_PROVIDER=openrouter EXEC_MODEL=google/gemini-2.5-flash EXEC_KEY=… \
+EXEC_MODALITIES=image,audio \
+CODER_PROVIDER=openrouter CODER_MODEL=z-ai/glm-5.3 \
 WHITELIST_ADMINS=yourhandle WHITELIST_USERS=friend1,friend2 \
 ./deploy-vps.sh
 ```
 
-Idempotent (re-run to upgrade); `./deploy-vps.sh --uninstall` to remove the services. Secrets go to `chmod 600` env files — never inlined in the profile. As root it installs **system** units (`systemctl status jaato-server jaato-tg`); as a non-root user, **`--user`** units with linger. Validated on a fresh Ubuntu 26.04 / Python 3.14 VPS. Design notes: [docs/design/vps-bootstrap-feasibility.md](docs/design/vps-bootstrap-feasibility.md).
+**Model tiers.** The executor is the always-active default; `EXEC_MODALITIES=image,audio` makes it **multimodal** (inbound images + voice notes handled in one turn — media arrives *with* the turn, so the active model must ingest it). An optional custom **`CODER_*`** tier (e.g. `z-ai/glm-5.3`) is switched into on demand for coding. Alternatively, `VISION_PROVIDER`/`VISION_MODEL`/`VISION_KEY` add a **separate vision tier** instead of a multimodal default. Provider/model/key(s) and each provider's key env-var are discovered from `jaato-scaffold explain` (no hardcoded provider list).
+
+**Common overrides** (all optional, via env):
+
+| Env | Effect |
+| --- | --- |
+| `JAATO_SERVER_VERSION` / `JAATO_SDK_VERSION` | Pin the framework versions (default: latest on PyPI at deploy). |
+| `TESTPYPI=1` | Install the framework from **TestPyPI** (PyPI kept as `--extra-index-url` for everything else + deps) — for testing a pre-release before it's on PyPI. Pin the version(s) under test with the vars above. |
+| `BOT_REF=<branch\|sha>` | Deploy the bot code from a branch/commit instead of `master`. |
+| `CODE_REF=<branch> ./deploy-vps.sh --code-only` | Update **only** `src/` + restart the bot — no reset, regen, reinstall, or backup. For iterating on a code change without a full redeploy. |
+| `[TESTPYPI=1 JAATO_*_VERSION=…] ./deploy-vps.sh --framework-only` | Reinstall **only** the framework (`jaato-server` + `jaato-sdk`, honoring `TESTPYPI` + version pins) into the existing venv + restart both services — no reset, regen, or backup; **config, profile, persona and bot code untouched**. For testing a pre-release build or bumping the framework in place. |
+| `PROFILE_SET=<name>` | Name of the profile *set* (default: the provider name). |
+
+Idempotent — a re-run **upgrades** (reinstall latest framework + regenerate config/profile + restart). A full run first **snapshots non-code state** (persona, profiles, config + secrets) to a dated dir under `~/.local/share/jaato-tg/deploy-backups/` before it resets the bot clone, so a hand-customized persona/profile can be restored. `./deploy-vps.sh --uninstall` removes the services. Secrets go to `chmod 600` env files — never inlined in the profile. As root it installs **system** units (`systemctl status jaato-server jaato-tg`); as a non-root user, **`--user`** units with linger. Upgrade the framework in place without a full redeploy via `uv pip install …` + `systemctl restart jaato-server jaato-tg`. Validated on a fresh Ubuntu 26.04 / Python 3.14 VPS. Design notes: [docs/design/vps-bootstrap-feasibility.md](docs/design/vps-bootstrap-feasibility.md).
 
 > Prefer to run the server and bot yourself, or connect to an existing jaato server? See **Configuration** and **Running** below.
 
