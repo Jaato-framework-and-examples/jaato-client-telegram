@@ -18,6 +18,9 @@
 #
 # Idempotent: safe to re-run (upgrade = reinstall latest + restart).
 # Teardown:  ./deploy-vps.sh --uninstall
+# Code-only: test a branch's CODE without a full redeploy — updates only src/ and
+#            restarts the bot, leaving config, profile, persona and venv untouched:
+#            CODE_REF=<branch> ./deploy-vps.sh --code-only
 #
 # Override anything via env, e.g.:
 #   JAATO_SERVER_VERSION=0.11.0 JAATO_SDK_VERSION=0.19.0 BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
@@ -636,10 +639,39 @@ uninstall(){ info "Uninstall ($SYSTEMD_MODE mode)"
   info "Services removed."
 }
 
+# ── Code-only update (branch/PR testing; preserves config, profile, persona) ──
+# Fetch the bot repo and update ONLY tracked source (src/) to a ref, then restart
+# the bot — SKIPPING the full deploy's reset/regenerate/reinstall. The bot is an
+# editable install, so a restart re-imports the new code; runtime/ (persona,
+# profile), the generated config, and the venv are left untouched. This is the
+# safe path on a hand-managed box (a full deploy's `git reset --hard` would clobber
+# a customized persona). For pure CODE changes — a branch that adds a NEW dependency
+# needs a full re-run so uv installs it. Ref: CODE_REF (else BOT_REF, else master).
+deploy_code_only(){
+  local ref="${CODE_REF:-$BOT_REF}"
+  info "Code-only update: bot src/ -> '$ref' (config, profile, persona, venv untouched)"
+  [ -d "$BOT_DIR/.git" ] || die "code-only needs an existing checkout at $BOT_DIR — run a full deploy first"
+  git -C "$BOT_DIR" fetch --quiet origin || die "git fetch failed"
+  git -C "$BOT_DIR" checkout --quiet "origin/$ref" -- src/ 2>/dev/null \
+    || git -C "$BOT_DIR" checkout --quiet "$ref" -- src/ \
+    || die "could not checkout src/ from '$ref' (does the branch exist on origin?)"
+  printf '  src/ updated to %s\n' "$(git -C "$BOT_DIR" rev-parse --short "origin/$ref" 2>/dev/null || echo "$ref")"
+  _sc restart jaato-tg.service
+  sleep 3
+  if _sc is-active --quiet jaato-tg.service; then
+    info "Bot restarted on '$ref' code. Server, config, and persona left as-is."
+    info "  Revert with: CODE_REF=master $0 --code-only"
+  else
+    local j="journalctl -u jaato-tg -e"; [ "$SYSTEMD_MODE" = user ] && j="journalctl --user -u jaato-tg -e"
+    die "bot failed to restart — check: $j"
+  fi
+}
+
 main(){
   case "${1:-}" in
     --uninstall) uninstall; exit 0 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --code-only) deploy_code_only; exit 0 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
   preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
