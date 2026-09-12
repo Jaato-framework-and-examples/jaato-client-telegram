@@ -52,6 +52,15 @@ model_tiers:
 plugin_configs:
   # Provider-specific config lives in the leaf (the base is provider-agnostic).
   openrouter:
+    # Provider-routing pin. OpenRouter's DEFAULT gemini-2.5-flash upstream
+    # ("Google"/Vertex) intermittently DROPS audio input (~25% measured: the
+    # model replies "I cannot process audio"); "Google AI Studio" handles it
+    # reliably (8/8). Prefer it. allow_fallbacks:true is REQUIRED so the coder
+    # tier (z-ai/glm-5.3, which AI Studio does not serve) still falls back to
+    # its own provider — gemini turns hit AI Studio first, so audio is reliable.
+    routing:
+      order: ["Google AI Studio"]
+      allow_fallbacks: true
     api_params:
       # Applies to all OpenRouter tiers (gemini multimodal default + glm coder);
       # 0.7 is a fine sampling temp for image/audio reading too.
