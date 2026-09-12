@@ -31,6 +31,11 @@
 # Code-only: test a branch's CODE without a full redeploy — updates only src/ and
 #            restarts the bot, leaving config, profile, persona and venv untouched:
 #            CODE_REF=<branch> ./deploy-vps.sh --code-only
+# Framework-only: reinstall ONLY jaato-server + jaato-sdk (honors TESTPYPI +
+#            version pins) into the existing venv and restart both services, leaving
+#            config, profile, persona and bot code untouched — for testing a
+#            pre-release framework build or bumping the framework in place:
+#            TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh --framework-only
 #
 # Override anything via env, e.g.:
 #   JAATO_SERVER_VERSION=0.11.0 JAATO_SDK_VERSION=0.19.0 BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
@@ -153,9 +158,11 @@ fetch(){ info "Fetch bot repo (bot=$BOT_REF; jaato-server/sdk come from PyPI, no
 }
 
 # ── 3. Install (uv venv + PyPI framework + editable bot; no premium) ──────────
-install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
-  # uv-managed venv (recreated on re-run; reinstall below repopulates it).
-  uv venv --python "$PYTHON_BIN" "$VENV"
+# Install the FRAMEWORK (jaato-server + jaato-sdk) into $VENV. Honors the version
+# pins (JAATO_SERVER_VERSION/JAATO_SDK_VERSION) and TESTPYPI. Shared by the full
+# install() and the --framework-only mode (which reuses the EXISTING venv), so the
+# resolution rules cannot drift between them.
+install_framework(){
   # Server extras our profile needs (pexpect for interactive_shell,
   # web/ast/notebook/templates, and the common provider SDKs). NOT `[all]` —
   # that pulls kerberos→gssapi which needs libkrb5-dev and we don't use it.
@@ -180,14 +187,21 @@ install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
   # Framework FROM PyPI (unpinned = latest unless the version vars are set), or
   # from TestPyPI when TESTPYPI is set (PyPI kept as the extra index).
   uv pip install --python "$PYV" ${idx[@]+"${idx[@]}"} "$sdk" "$srv"
+  printf '  framework from %s: jaato-sdk %s, jaato-server[extras] %s\n' \
+    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
+    "$(uv pip show --python "$PYV" jaato-sdk 2>/dev/null | sed -n 's/^Version: //p')" \
+    "$(uv pip show --python "$PYV" jaato-server 2>/dev/null | sed -n 's/^Version: //p')"
+}
+
+install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
+  # uv-managed venv (recreated on re-run; reinstall below repopulates it).
+  uv venv --python "$PYTHON_BIN" "$VENV"
+  install_framework
   # The bot is the deployed app (not on PyPI) — editable from its clone; its
   # jaato-sdk/jaato-server deps resolve against what we just installed. NO
   # TestPyPI here: the bot's own deps (aiogram, …) must come from PyPI only.
   uv pip install --python "$PYV" -e "$BOT_DIR"
-  printf '  installed from %s: jaato-sdk %s, jaato-server[extras] %s; editable: jaato-client-telegram (deps from PyPI)\n' \
-    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
-    "$(uv pip show --python "$PYV" jaato-sdk 2>/dev/null | sed -n 's/^Version: //p')" \
-    "$(uv pip show --python "$PYV" jaato-server 2>/dev/null | sed -n 's/^Version: //p')"
+  printf '  editable: jaato-client-telegram (its own deps from PyPI)\n'
 }
 
 # The provider's key env-var name, discovered from `scaffold explain env`
@@ -718,6 +732,33 @@ deploy_code_only(){
   fi
 }
 
+# ── Framework-only upgrade (no config/profile/persona regen) ─────────────────
+# Reinstall ONLY the framework (jaato-server + jaato-sdk) into the EXISTING venv —
+# honoring TESTPYPI + JAATO_SERVER_VERSION/JAATO_SDK_VERSION — then re-resolve the
+# editable bot and restart BOTH services. Config, profile, persona, whitelist AND
+# the bot code are left untouched (no git reset, no regen, no backup). This is the
+# supported way to test a pre-release framework build (TESTPYPI=1) or to bump the
+# framework on a hand-managed box without a full redeploy. For a bot CODE change
+# use --code-only; for a full (re)deploy run with no flag.
+#   TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh --framework-only
+deploy_framework_only(){
+  info "Framework-only upgrade -> $VENV (config, profile, persona, bot code untouched)"
+  [ -d "$VENV" ] || die "framework-only needs an existing venv at $VENV — run a full deploy first"
+  install_uv                    # ensure uv is on PATH (idempotent; no other preflight)
+  install_framework             # honors TESTPYPI + JAATO_{SDK,SERVER}_VERSION
+  # Re-resolve the editable bot against the new framework — does NOT change bot code.
+  uv pip install --python "$PYV" -e "$BOT_DIR"
+  # A framework change moves the SERVER binary AND the SDK the bot imports → both restart.
+  _sc restart jaato-server.service jaato-tg.service
+  sleep 3
+  if _sc is-active --quiet jaato-server.service && _sc is-active --quiet jaato-tg.service; then
+    info "Framework upgraded + both services restarted. Config, profile, persona left as-is."
+  else
+    local j="journalctl -u jaato-server -u jaato-tg -e"; [ "$SYSTEMD_MODE" = user ] && j="journalctl --user -u jaato-server -u jaato-tg -e"
+    die "a service failed to restart after the framework upgrade — check: $j"
+  fi
+}
+
 # ── Backup NON-CODE state before a (destructive) full deploy ─────────────────
 # A full run does `git reset --hard` (reverts tracked runtime files — a
 # customized persona/profile) AND regenerates $CFG_DIR — so snapshot everything
@@ -742,7 +783,8 @@ main(){
   case "${1:-}" in
     --uninstall) uninstall; exit 0 ;;
     --code-only) deploy_code_only; exit 0 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --framework-only) deploy_framework_only; exit 0 ;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
   backup_noncode
