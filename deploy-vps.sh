@@ -16,7 +16,9 @@
 # Provider selection AND the per-provider key env-var name are discovered from
 # `jaato-scaffold explain` — nothing about providers is hardcoded here.
 #
-# Idempotent: safe to re-run (upgrade = reinstall latest + restart).
+# Idempotent: safe to re-run (upgrade = reinstall latest + restart). A full run
+#             first snapshots non-code state (persona, profile, config) to a dated
+#             dir under ~/.local/share/jaato-tg/deploy-backups/ before it resets.
 # Teardown:  ./deploy-vps.sh --uninstall
 # Code-only: test a branch's CODE without a full redeploy — updates only src/ and
 #            restarts the bot, leaving config, profile, persona and venv untouched:
@@ -667,6 +669,26 @@ deploy_code_only(){
   fi
 }
 
+# ── Backup NON-CODE state before a (destructive) full deploy ─────────────────
+# A full run does `git reset --hard` (reverts tracked runtime files — a
+# customized persona/profile) AND regenerates $CFG_DIR — so snapshot everything
+# that isn't source first, into a dated dir OUTSIDE the clone. --code-only skips
+# this (it touches only src/). No-ops on a fresh box (nothing to back up).
+backup_noncode(){
+  { [ -d "$BOT_DIR/runtime/.jaato" ] || [ -d "$CFG_DIR" ]; } || {
+    info "No prior install to back up (fresh box)"; return; }
+  local dest="$STATE_DIR/deploy-backups/$(date +%Y%m%d-%H%M%S)"
+  info "Backup non-code state -> $dest"
+  mkdir -p "$dest"; chmod 700 "$STATE_DIR/deploy-backups" "$dest" 2>/dev/null || true
+  # Customizable workspace tree (persona .jaato/agents, profiles, scripts, session
+  # transcripts) — reset --hard reverts the tracked ones (persona/profile).
+  [ -d "$BOT_DIR/runtime/.jaato" ] && cp -a "$BOT_DIR/runtime/.jaato" "$dest/runtime-jaato"
+  # Generated config + secrets (write_env/write_bot_config/write_profile overwrite
+  # these every run). Kept mode-restricted since it holds tokens/keys.
+  [ -d "$CFG_DIR" ] && { cp -a "$CFG_DIR" "$dest/config"; chmod -R go-rwx "$dest/config" 2>/dev/null || true; }
+  printf '  backed up (restore a file with: cp %s/<path> <target>)\n' "$dest"
+}
+
 main(){
   case "${1:-}" in
     --uninstall) uninstall; exit 0 ;;
@@ -674,6 +696,7 @@ main(){
     -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
+  backup_noncode
   preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
   install_units; start_and_check
   printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
