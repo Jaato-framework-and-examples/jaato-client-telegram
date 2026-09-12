@@ -15,6 +15,7 @@ from aiogram.types import Message
 from jaato_client_telegram.chat_pump import ChatPump, PumpItem
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.voice_mode_store import VOICE_HINT, VoiceModeStore
 
 if TYPE_CHECKING:
     from jaato_client_telegram.rate_limiter import RateLimiter
@@ -27,12 +28,24 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+def _apply_voice_hint(
+    store: "VoiceModeStore | None", chat_id: int, inbound_is_audio: bool, text: str,
+) -> str:
+    """Append the voice-reply directive when this turn should be spoken — the
+    /voice toggle if set, else reply-in-kind (spoken iff the inbound was audio).
+    The directive tells the model to enter the ``voz`` tier and say its answer."""
+    if store is not None and store.wants_voice(chat_id, inbound_is_audio):
+        return text + VOICE_HINT
+    return text
+
+
 @router.message(F.text, F.chat.type == "private")
 async def handle_private_message(
     message: Message,
     pool: SessionPool,
     pump: ChatPump,
     clarification_handler: ClarificationHandler | None = None,
+    voice_mode_store: VoiceModeStore | None = None,
     rate_limiter: "RateLimiter | None" = None,
     abuse_protector: "AbuseProtector | None" = None,
     telemetry: "TelemetryCollector | None" = None,
@@ -87,7 +100,8 @@ async def handle_private_message(
 
     # Hand off to the per-chat pump: it owns session + turn + mid-turn steering.
     pump.submit(PumpItem(
-        chat_id=chat_id, message=message, text=user_text,
+        chat_id=chat_id, message=message,
+        text=_apply_voice_hint(voice_mode_store, chat_id, False, user_text),
         apply_welcome=True, reply=False,
     ))
 
@@ -164,6 +178,7 @@ async def handle_private_media(
     message: Message,
     pool: SessionPool,
     pump: ChatPump,
+    voice_mode_store: VoiceModeStore | None = None,
 ) -> None:
     """Handle an inbound photo or document.
 
@@ -254,7 +269,8 @@ async def handle_private_media(
         chat_id, message.message_thread_id, is_vision,
     )
     pump.submit(PumpItem(
-        chat_id=chat_id, message=message, text=caption,
+        chat_id=chat_id, message=message,
+        text=_apply_voice_hint(voice_mode_store, chat_id, False, caption),
         attachments=attachments, apply_welcome=True, reply=False,
     ))
 
@@ -265,6 +281,7 @@ async def handle_private_audio(
     pool: SessionPool,
     pump: ChatPump,
     clarification_handler: ClarificationHandler | None = None,
+    voice_mode_store: VoiceModeStore | None = None,
 ) -> None:
     """Handle an inbound voice note or audio file.
 
@@ -338,7 +355,9 @@ async def handle_private_audio(
         "inbound thread (audio): chat=%s message_thread_id=%s mime=%s seconds=%s",
         chat_id, message.message_thread_id, mime_type, seconds,
     )
+    # Reply-in-kind: a voice note gets a spoken reply by default (unless /voice off).
     pump.submit(PumpItem(
-        chat_id=chat_id, message=message, text=caption,
+        chat_id=chat_id, message=message,
+        text=_apply_voice_hint(voice_mode_store, chat_id, True, caption),
         attachments=attachments, apply_welcome=True, reply=False,
     ))

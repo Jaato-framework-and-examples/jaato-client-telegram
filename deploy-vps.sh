@@ -101,13 +101,14 @@ install_system_deps(){
   [ -n "$mgr" ] || { warn "no known package manager — ensure git, python3(>=3.10)+venv, pip, a C toolchain and curl are present"; return; }
   local SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
   info "Install system deps via $mgr (sudo may prompt)"
-  # python3-venv (Debian/Ubuntu split) + a C toolchain (some server deps build).
+  # python3-venv (Debian/Ubuntu split) + a C toolchain (some server deps build) +
+  # ffmpeg (voice-OUT transcodes the voz tier's PCM to Telegram's OGG/Opus).
   case "$mgr" in
     apt-get) $SUDO apt-get update -qq && $SUDO apt-get install -y -qq \
-               git python3 python3-venv python3-pip build-essential curl ca-certificates ;;
-    dnf|yum) $SUDO "$mgr" install -y -q git python3 python3-pip gcc gcc-c++ make curl ca-certificates ;;
-    pacman)  $SUDO pacman -Sy --noconfirm --needed git python python-pip base-devel curl ca-certificates ;;
-    zypper)  $SUDO zypper -q install -y git python3 python3-pip gcc gcc-c++ make curl ca-certificates ;;
+               git python3 python3-venv python3-pip build-essential curl ca-certificates ffmpeg ;;
+    dnf|yum) $SUDO "$mgr" install -y -q git python3 python3-pip gcc gcc-c++ make curl ca-certificates ffmpeg ;;
+    pacman)  $SUDO pacman -Sy --noconfirm --needed git python python-pip base-devel curl ca-certificates ffmpeg ;;
+    zypper)  $SUDO zypper -q install -y git python3 python3-pip gcc gcc-c++ make curl ca-certificates ffmpeg ;;
   esac || warn "system-dep install returned nonzero — continuing (preflight verifies below)"
 }
 # uv is the package manager (not pip). Bootstrap it via Astral's standalone
@@ -438,6 +439,39 @@ write_profile(){
     provider: \"$VISION_PROVIDER\""
   fi
 
+  # Voice-OUT tier (opt-in, VOICE_OUT=1): an on-demand tier the model ENTERS to
+  # SPEAK a reply. Only openrouter wires native audio OUTPUT (gpt-audio); the
+  # tier's `modalities: {audio: outbound}` makes the runner request + stream the
+  # audio, which the bot transcodes to a Telegram voice note. Needs the provider-
+  # scoped audio config (voice_cfg) below + ffmpeg (system dep). Model/voice
+  # overridable via VOICE_OUT_MODEL / VOICE_OUT_PROVIDER / VOICE_OUT_VOICE.
+  local voice_cfg=""
+  if [ -n "${VOICE_OUT:-}" ]; then
+    local vo_model="${VOICE_OUT_MODEL:-openai/gpt-audio}"
+    local vo_provider="${VOICE_OUT_PROVIDER:-$EXEC_PROVIDER}"
+    local vo_voice="${VOICE_OUT_VOICE:-marin}"
+    tiers="$tiers
+  voz:
+    model: \"$vo_model\"
+    provider: \"$vo_provider\"
+    modalities: {audio: outbound}
+    description: >-
+      Speak a reply aloud (voice note). Enter ONLY to voice your answer — say it
+      verbatim, naturally — then switch straight back to executor. This model
+      cannot call tools or see images, so never linger here."
+    voice_cfg="
+plugin_configs:
+  # Voice-OUT ($vo_provider): assert the provider may emit audio (else the voz
+  # tier's outbound role is refused at startup) + set the voice/wire format. Only
+  # the voz tier (modalities: {audio: outbound}) actually requests audio output.
+  $vo_provider:
+    framework_overrides:
+      output_modalities: [text, audio]
+    api_params:
+      audio: {voice: $vo_voice, format: pcm16}"
+    info "  voice-out tier (env): $vo_provider / $vo_model (voice=$vo_voice)"
+  fi
+
   # --- base: provider-agnostic role. Static => QUOTED heredoc (no interpolation,
   # so a literal $ in a comment is safe here, unlike the leaf below). ------------
   cat > "$BASE_PROFILE_FILE" <<'YAML'
@@ -503,12 +537,13 @@ apparmor: $apparmor
 model_tiers:
 $tiers
   initial: executor
-  fallback: executor
+  fallback: executor$voice_cfg
 YAML
 
-  printf '  set=%s provider=%s model=%s coder=%s vision=%s apparmor=%s\n' \
+  printf '  set=%s provider=%s model=%s coder=%s vision=%s voice=%s apparmor=%s\n' \
     "$set_name" "$EXEC_PROVIDER" "$EXEC_MODEL" \
-    "${CODER_PROVIDER:+$CODER_MODEL}" "${VISION_PROVIDER:+$VISION_MODEL}" "$apparmor"
+    "${CODER_PROVIDER:+$CODER_MODEL}" "${VISION_PROVIDER:+$VISION_MODEL}" \
+    "${VOICE_OUT:+${VOICE_OUT_MODEL:-openai/gpt-audio}}" "$apparmor"
 }
 
 # ── 6b. Whitelist (username-based access control) ────────────────────────────

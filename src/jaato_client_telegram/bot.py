@@ -6,6 +6,7 @@ and wires up dependencies (SessionPool, ResponseRenderer).
 """
 
 import logging
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -32,6 +33,7 @@ from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.wake_observer import WakeObserver
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.telemetry import TelemetryCollector
+from jaato_client_telegram.voice_mode_store import VoiceModeStore
 from jaato_client_telegram.whitelist import WhitelistManager
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,12 @@ def create_bot_and_dispatcher(
     )
     clarification_handler = ClarificationHandler()
     file_handler = FileHandler(config.file_sharing)
+    # Per-chat voice-reply mode (/voice on|off|auto). Persisted next to the session
+    # store so it survives restarts (in-memory when session_store_path is unset).
+    _store = config.session.session_store_path
+    voice_mode_store = VoiceModeStore(
+        str(Path(_store).with_name("voice_mode.json")) if _store else ""
+    )
 
     # Note: WorkspaceEventSubscriber needs an IPC backend from jaato-server
     # This will be added once we determine the source of the IPC connection
@@ -183,6 +191,7 @@ def create_bot_and_dispatcher(
     dp["whitelist"] = whitelist
     dp["permission_handler"] = permission_handler
     dp["clarification_handler"] = clarification_handler
+    dp["voice_mode_store"] = voice_mode_store
     dp["config"] = config
     dp["rate_limiter"] = rate_limiter
     dp["abuse_protector"] = abuse_protector
