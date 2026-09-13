@@ -179,7 +179,13 @@ install_framework(){
   # lets you take ONE package from TestPyPI and the other from PyPI).
   local idx=()
   if [ -n "$TESTPYPI" ]; then
-    idx=( --index-url https://test.pypi.org/simple/
+    # --refresh busts uv's cached index listing: TestPyPI is republished often, so
+    # a freshly-published version is otherwise INVISIBLE to a uv that cached the
+    # index earlier — surfacing as a MISLEADING "No solution found … no version of
+    # jaato-server[web]==<ver>" even though the version IS on the index. (Verify a
+    # real absence with `curl -s https://test.pypi.org/pypi/<pkg>/<ver>/json`.)
+    idx=( --refresh
+          --index-url https://test.pypi.org/simple/
           --extra-index-url https://pypi.org/simple/
           --index-strategy unsafe-best-match )
     info "  TestPyPI ENABLED for framework (sdk=${JAATO_SDK_VERSION:-latest} server=${JAATO_SERVER_VERSION:-latest}); other packages + deps from PyPI"
