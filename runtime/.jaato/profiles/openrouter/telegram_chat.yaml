@@ -44,6 +44,20 @@ model_tiers:
       coding tasks: writing or editing files, debugging, multi-step
       implementation, then switch straight back to executor when done — glm
       cannot see images or hear audio, so do not linger here.
+  # Voice-OUT tier (custom name => `description` REQUIRED). On-demand: the model
+  # ENTERS it to SPEAK a reply aloud, then returns to executor. gpt-audio is the
+  # only wired native audio-OUTPUT model (Gemini can't emit audio on this path);
+  # `modalities: {audio: outbound}` makes the runner request audio + stream it
+  # back as model-media (the bot turns it into a Telegram voice note). gpt-audio
+  # cannot call tools or see images, so it must never linger here.
+  voz:
+    model: openai/gpt-audio
+    provider: openrouter
+    modalities: {audio: outbound}
+    description: >-
+      Speak a reply aloud (voice note). Enter ONLY to voice your answer — say it
+      verbatim, naturally — then switch straight back to executor. gpt-audio
+      cannot call tools or see images, so never linger here.
   initial: executor
   # fallback must name a DECLARED tier. Leaving it unset (default 'dispatcher',
   # which we don't declare) makes the runner reject the whole tier config and
@@ -52,10 +66,20 @@ model_tiers:
 plugin_configs:
   # Provider-specific config lives in the leaf (the base is provider-agnostic).
   openrouter:
+    framework_overrides:
+      # ASSERT the provider may emit audio, so the `voz` tier's outbound-audio
+      # role is accepted at startup (without it, an outbound tier is REFUSED).
+      # Only the voz tier (which declares modalities: {audio: outbound}) actually
+      # requests audio output — gemini/glm stay text.
+      output_modalities: [text, audio]
     api_params:
       # Applies to all OpenRouter tiers (gemini multimodal default + glm coder);
       # 0.7 is a fine sampling temp for image/audio reading too.
       temperature: 0.7
+      # Voice + wire format for model-generated speech; consumed by the runner's
+      # audio-output stamping for the voz tier only. pcm16 is the only format
+      # OpenAI streams — the bot transcodes it to OGG/Opus for the voice note.
+      audio: {voice: marin, format: pcm16}
     # Env-var interpolation (public-checkout friendly): set JAATO_OPENROUTER_API_KEY
     # in the workspace .env (git-ignored), forwarded to the daemon via env_file.
     # If you have jaato-premium (installed here), pass://jaato/openrouter/api-key

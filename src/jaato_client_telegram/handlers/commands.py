@@ -5,11 +5,12 @@ Handles bot commands like /start, /reset, /status, and /help.
 """
 
 from aiogram import Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from jaato_client_telegram.renderer import ResponseRenderer
 from jaato_client_telegram.session_pool import SessionPool
+from jaato_client_telegram.voice_mode_store import VoiceModeStore
 from jaato_client_telegram.welcome_store import WELCOME_START
 
 
@@ -49,6 +50,42 @@ async def cmd_start(
             f"Error: {e}\n\n"
             f"Please ensure the jaato server is running."
         )
+
+
+@router.message(Command("voice"))
+async def cmd_voice(
+    message: Message,
+    voice_mode_store: VoiceModeStore,
+    command: CommandObject | None = None,
+) -> None:
+    """Control spoken replies: ``/voice on | off | auto``.
+
+    - ``on``   → speak every reply (even to text)
+    - ``off``  → text only
+    - ``auto`` (default) → reply-in-kind: speak when you send a voice note.
+    """
+    arg = (command.args or "").strip().lower() if command else ""
+    chat_id = message.chat.id
+    if arg in ("on", "yes", "1"):
+        voice_mode_store.set(chat_id, True)
+        await message.answer(
+            "🔊 Voice replies ON — I'll speak every reply. "
+            "(/voice off for text, /voice auto for reply-in-kind.)"
+        )
+    elif arg in ("off", "no", "0"):
+        voice_mode_store.set(chat_id, False)
+        await message.answer(
+            "🔇 Voice replies OFF — I'll reply in text. "
+            "(/voice on to always speak, /voice auto for reply-in-kind.)"
+        )
+    elif arg in ("", "auto", "reset"):
+        voice_mode_store.clear(chat_id)
+        await message.answer(
+            "🎙️ Voice replies AUTO — I'll speak when you send a voice note, "
+            "text otherwise. (/voice on | off to override.)"
+        )
+    else:
+        await message.answer("Usage: /voice on | off | auto")
 
 
 @router.message(Command("reset"))

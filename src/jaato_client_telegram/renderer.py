@@ -6,6 +6,7 @@ including long message splitting and edit-in-place updates.
 """
 
 import asyncio
+import base64
 import html
 import logging
 import re
@@ -22,8 +23,10 @@ from jaato_client_telegram.host_tool_loader import (
 from jaato_client_telegram.semantic_markup import render_semantic_markup
 
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message
-from jaato_sdk.events import EventType
+from aiogram.types import BufferedInputFile, Message
+from jaato_sdk.events import MODEL_MEDIA_CALL_ID, EventType
+
+from jaato_client_telegram.voice_out import parse_pcm_mime, pcm_to_ogg_opus
 
 if TYPE_CHECKING:
     from jaato_client_telegram.file_handler import FileHandler
@@ -194,6 +197,14 @@ class StreamingContext:
     # is the cumulative folded text; both reset when the fold closes / the turn ends.
     fold_target: "Message | None" = None
     fold_text: str = ""
+
+    # Voice OUT: model-generated speech (the `voz` gpt-audio tier) arrives as
+    # base64 PCM chunks on TOOL_OUTPUT model-media events, one stream per spoken
+    # utterance. Accumulate the raw bytes per stream_id and remember its mime
+    # (rate/channels) until the `final` chunk, then transcode + send as a voice
+    # note. See voice_out.py.
+    model_audio: dict[str, bytearray] = field(default_factory=dict)
+    model_audio_mime: dict[str, str] = field(default_factory=dict)
 
 
 def _has_telegram_html(text: str) -> bool:
@@ -732,6 +743,30 @@ class ResponseRenderer:
                 # gets its natural per-step segmentation. Emit the narration now.
                 await self._emit_segments(initial_message, ctx, flush=True, final=False)
 
+            elif event_type == EventType.TOOL_OUTPUT:
+                # Voice OUT: the `voz` gpt-audio tier's spoken reply arrives here as
+                # model-media (call_id == MODEL_MEDIA_CALL_ID) — base64 PCM chunks
+                # keyed by stream_id, `final` on the last. Accumulate, then on the
+                # final chunk transcode to OGG/Opus and send as a voice note (IN
+                # ADDITION to the text reply — accessibility + fallback). Ordinary
+                # (non-model) tool output is rendered via source="tool" AGENT_OUTPUT,
+                # not here, so anything that isn't model-media is ignored.
+                if getattr(event, "call_id", None) == MODEL_MEDIA_CALL_ID:
+                    data_b64 = getattr(event, "data_b64", None)
+                    sid = getattr(event, "stream_id", "") or ""
+                    if data_b64:
+                        try:
+                            ctx.model_audio.setdefault(sid, bytearray()).extend(
+                                base64.b64decode(data_b64)
+                            )
+                        except Exception:  # noqa: BLE001 — a bad chunk must not kill the turn
+                            log.warning("voice_out: undecodable model-media chunk (stream=%s)", sid)
+                        mime = getattr(event, "mime_type", None)
+                        if mime:
+                            ctx.model_audio_mime[sid] = mime
+                    if getattr(event, "final", False):
+                        await self._flush_model_audio(initial_message, ctx, sid)
+
             elif event_type == EventType.AGENT_COMPLETED:
                 # Agent completed - emit everything remaining, including the tail.
                 await self._emit_segments(initial_message, ctx, flush=True, final=True)
@@ -762,12 +797,16 @@ class ResponseRenderer:
                 # Framework abnormal-finish signal (jaato-server #544): this turn's
                 # finish_reason carries the REAL stop cause, so we branch on data
                 # instead of inferring truncation from empty output. Normal finishes
-                # are "stop" (turn done) and "tool_use" (the model is calling a tool
-                # and will continue); anything else — max_tokens / safety / error — is
-                # an abnormal or truncated finish worth surfacing, even when the model
-                # DID produce output. Cancellation is NOT inferred here: it keeps its
-                # own "[Generation cancelled]" path and its turn may report "stop".
-                if event.finish_reason not in ("stop", "tool_use"):
+                # are "stop" (turn done), "tool_use" (the model is calling a tool and
+                # will continue), and "unknown" (the provider reported no clear reason
+                # — the server treats it as normal too, FinishReason ∈ {STOP, UNKNOWN,
+                # TOOL_USE}; audio-output `voz` turns land here, so surfacing it wrongly
+                # scared the user after a perfectly good voice reply). Anything else —
+                # max_tokens / safety / error — is an abnormal or truncated finish
+                # worth surfacing, even when the model DID produce output. A missing
+                # reason (falsy) is normal. Cancellation is NOT inferred here: it keeps
+                # its own "[Generation cancelled]" path and its turn may report "stop".
+                if event.finish_reason and event.finish_reason not in ("stop", "tool_use", "unknown"):
                     await self._safe_answer(
                         initial_message,
                         self._abnormal_finish_notice(event.finish_reason),
@@ -1158,6 +1197,34 @@ class ResponseRenderer:
             getattr(m, "message_id", None), len(text), text[:50],
         )
         return m
+
+    async def _flush_model_audio(
+        self, initial_message: Message, ctx: StreamingContext, sid: str,
+    ) -> None:
+        """Transcode a completed model-speech stream to OGG/Opus and send it as a
+        Telegram voice note. Best-effort: on any failure (ffmpeg missing, empty
+        stream) the text reply the turn already produced is the fallback."""
+        pcm = bytes(ctx.model_audio.pop(sid, b""))
+        mime = ctx.model_audio_mime.pop(sid, "")
+        if not pcm:
+            return
+        rate, channels = parse_pcm_mime(mime)
+        ogg = await pcm_to_ogg_opus(pcm, rate, channels)
+        if not ogg:
+            return
+        tid = ctx.thread_id_getter() if ctx.thread_id_getter else None
+        try:
+            await initial_message.bot.send_voice(
+                chat_id=initial_message.chat.id,
+                voice=BufferedInputFile(ogg, filename="voice.ogg"),
+                message_thread_id=tid,
+            )
+            log.info(
+                "RENDER send voice bytes=%d chat=%s stream=%s",
+                len(ogg), initial_message.chat.id, sid,
+            )
+        except Exception:  # noqa: BLE001 — a failed voice send must not crash the turn
+            log.exception("voice_out: failed to send voice note (chat=%s)", initial_message.chat.id)
 
     async def _safe_edit(self, msg: Message, text: str) -> None:
         """edit_text() that falls back to plain text on HTML parse errors and
