@@ -438,11 +438,16 @@ write_profile(){
       $CODER_DESCRIPTION"
   fi
   # Standalone vision tier only when the default isn't already multimodal.
+  # exit_on: completion — a specialized excursion tier (like voz below): the
+  # model enters it for ONE turn and the framework auto-returns to executor with
+  # no cooperation. Only executor (home) and coder (a multi-turn coding MODE) stay
+  # on the default exit_on: switch, so they persist until deliberately switched.
   if [ -n "$VISION_PROVIDER" ] && [ -z "${EXEC_MODALITIES:-}" ]; then
     tiers="$tiers
   vision:
     model: \"$VISION_MODEL\"
-    provider: \"$VISION_PROVIDER\""
+    provider: \"$VISION_PROVIDER\"
+    exit_on: completion"
   fi
 
   # Voice-OUT tier (opt-in, VOICE_OUT=1): an on-demand tier the model ENTERS to
@@ -460,11 +465,13 @@ write_profile(){
   voz:
     model: \"$vo_model\"
     provider: \"$vo_provider\"
+    exit_on: completion
     modalities: {audio: outbound}
     description: >-
       Speak a reply aloud (voice note). Enter ONLY to voice your answer — say it
-      verbatim, naturally — then switch straight back to executor. This model
-      cannot call tools or see images, so never linger here."
+      verbatim, naturally. This model cannot call tools or see images; the
+      framework returns to executor automatically after you speak, so say your
+      whole answer in one turn."
     voice_cfg="
 plugin_configs:
   # Voice-OUT ($vo_provider): assert the provider may emit audio (else the voz
