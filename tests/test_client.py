@@ -200,8 +200,10 @@ class TestEventStreaming:
 
     @pytest.mark.asyncio
     async def test_normal_finish_reason_stays_silent(self):
-        """The normal finishes — "stop" (turn done) and "tool_use" (model is
-        calling a tool) — must NOT surface any abnormal-finish notice."""
+        """The normal finishes must NOT surface any abnormal-finish notice:
+        "stop" (turn done), "tool_use" (model is calling a tool), "unknown"
+        (provider reported no clear reason — the server treats it as normal too;
+        audio-output `voz` turns land here), and a missing/None reason."""
         from unittest.mock import AsyncMock, MagicMock
 
         from jaato_client_telegram.renderer import ResponseRenderer
@@ -215,6 +217,9 @@ class TestEventStreaming:
         events = [
             MockEvent(type="agent.output", source="model", mode="write", text="mid"),
             MockEvent(type="turn.completed", finish_reason="tool_use"),
+            MockEvent(type="agent.output", source="model", mode="append", text=" more"),
+            MockEvent(type="turn.completed", finish_reason="unknown"),   # e.g. a voz audio turn
+            MockEvent(type="turn.completed", finish_reason=None),         # provider gave none
             MockEvent(type="agent.output", source="model", mode="append", text=" and final"),
             MockEvent(type="turn.completed", finish_reason="stop"),
             MockEvent(type="agent.completed"),

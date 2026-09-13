@@ -797,12 +797,16 @@ class ResponseRenderer:
                 # Framework abnormal-finish signal (jaato-server #544): this turn's
                 # finish_reason carries the REAL stop cause, so we branch on data
                 # instead of inferring truncation from empty output. Normal finishes
-                # are "stop" (turn done) and "tool_use" (the model is calling a tool
-                # and will continue); anything else — max_tokens / safety / error — is
-                # an abnormal or truncated finish worth surfacing, even when the model
-                # DID produce output. Cancellation is NOT inferred here: it keeps its
-                # own "[Generation cancelled]" path and its turn may report "stop".
-                if event.finish_reason not in ("stop", "tool_use"):
+                # are "stop" (turn done), "tool_use" (the model is calling a tool and
+                # will continue), and "unknown" (the provider reported no clear reason
+                # — the server treats it as normal too, FinishReason ∈ {STOP, UNKNOWN,
+                # TOOL_USE}; audio-output `voz` turns land here, so surfacing it wrongly
+                # scared the user after a perfectly good voice reply). Anything else —
+                # max_tokens / safety / error — is an abnormal or truncated finish
+                # worth surfacing, even when the model DID produce output. A missing
+                # reason (falsy) is normal. Cancellation is NOT inferred here: it keeps
+                # its own "[Generation cancelled]" path and its turn may report "stop".
+                if event.finish_reason and event.finish_reason not in ("stop", "tool_use", "unknown"):
                     await self._safe_answer(
                         initial_message,
                         self._abnormal_finish_notice(event.finish_reason),
