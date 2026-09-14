@@ -185,10 +185,16 @@ install_framework(){
     # index earlier — surfacing as a MISLEADING "No solution found … no version of
     # jaato-server[web]==<ver>" even though the version IS on the index. (Verify a
     # real absence with `curl -s https://test.pypi.org/pypi/<pkg>/<ver>/json`.)
+    # --prerelease allow: TestPyPI is where we test PRE-RELEASE framework builds
+    # (rc/a/b — see the header). uv will NOT select a pre-release for a pin like
+    # ==0.14.0rc1 under its default policy, failing with the SAME misleading
+    # "no version of jaato-server[web]==0.14.0rc1" as a stale cache — even though
+    # the version IS on the index (verify: curl -s https://test.pypi.org/pypi/<pkg>/<ver>/json).
     idx=( --refresh
           --index-url https://test.pypi.org/simple/
           --extra-index-url https://pypi.org/simple/
-          --index-strategy unsafe-best-match )
+          --index-strategy unsafe-best-match
+          --prerelease allow )
     info "  TestPyPI ENABLED for framework (sdk=${JAATO_SDK_VERSION:-latest} server=${JAATO_SERVER_VERSION:-latest}); other packages + deps from PyPI"
   fi
   # Framework FROM PyPI (unpinned = latest unless the version vars are set), or
