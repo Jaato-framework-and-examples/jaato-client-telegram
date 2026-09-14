@@ -29,6 +29,7 @@ from jaato_sdk.events import ClientType, EventType
 from jaato_sdk.plugins.model_provider.types import UNTRUSTED_OPEN
 
 from jaato_client_telegram.chat_session_store import ChatSessionStore
+from jaato_client_telegram.enrichment import Observer
 from jaato_client_telegram.host_tool_loader import (
     USER_INSTALLED_TAG,
     load_all_tools,
@@ -88,6 +89,10 @@ class SessionMetadata:
     created_at: datetime
     last_activity: datetime
     client: WSRecoveryClient
+    # The reference-enrichment Observer for this chat (searches behind stored
+    # memories). None when the workspace is unset (enrichment needs a place to
+    # write the catalogue). Drained on teardown so in-flight searches finish.
+    observer: "Observer | None" = None
 
 
 def create_telegram_presentation_context() -> dict:
@@ -299,6 +304,26 @@ class SessionPool:
             presentation=create_telegram_presentation_context(),
         )
 
+    def _enrichment_conn(self) -> dict:
+        """Dial params for the enrichment judge's throwaway sub-session — the
+        SAME daemon/workspace as the chat client, but ``client_type=API``.
+
+        The judge uses ``signal_completion`` (it has a completion schema), and
+        the server STRIPS ``signal_completion`` from root sessions of a
+        CHAT/WEB/TERMINAL client. A judge dialled as CHAT (like the chat client)
+        could never return its verdict, so it must declare API — a headless,
+        programmatic identity. Passed to ``WSRecoveryClient.session(**conn,
+        profile=..., agent=..., ...)`` in enrichment._judge."""
+        workspace = self._ws_config.workspace
+        return dict(
+            url=self._ws_config.url,
+            token=self._ws_config.secret_token or None,
+            client_type=ClientType.API,
+            ssl=self._build_ssl_context(),
+            workspace_path=workspace or None,
+            config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
+        )
+
     async def _list_session_ids(self, client: WSRecoveryClient) -> list[str]:
         """Session ids the daemon currently knows (in-memory AND on disk). The
         client's list_sessions() is fire-and-forget (reply via SESSION_LIST on the
@@ -377,6 +402,12 @@ class SessionPool:
                 )
                 self._sessions.pop(chat_id, None)
                 await self._stop_wake_watcher(chat_id)
+                if meta.observer is not None:
+                    try:
+                        await meta.observer.drain()
+                    except Exception:
+                        logger.debug("enrichment drain failed for dead client",
+                                     exc_info=True)
                 try:
                     await meta.client.disconnect()
                 except Exception:
@@ -396,6 +427,20 @@ class SessionPool:
                 # Registered on the recovery client's registry, so it survives
                 # reconnects.
                 client.subscribe(EventType.TOOL_CALL_END, self._on_tool_call_end)
+
+                # Reference enrichment: the SAME memory-write signal also kicks off
+                # a background search (tags -> DuckDuckGo -> judge -> references
+                # catalogue), so a topic the user stores today is offered back by
+                # the model when the conversation brushes it again. Its START/END
+                # subscriptions ride the same registry (survive reconnects); its
+                # in-flight tasks are drained on teardown. Gated on the workspace,
+                # like curation — enrichment needs a place to write the catalogue.
+                observer: Observer | None = None
+                if self._ws_config.workspace:
+                    observer = Observer(
+                        self._enrichment_conn(), Path(self._ws_config.workspace)
+                    )
+                    observer.attach(client)
 
                 # No manual set_workspace: the client's _handshake already sends a
                 # set_workspace CommandRequest (from workspace_path) AND the
@@ -461,6 +506,7 @@ class SessionPool:
                     created_at=datetime.now(),
                     last_activity=datetime.now(),
                     client=client,
+                    observer=observer,
                 )
                 return session_id
             except Exception as e:
@@ -858,6 +904,15 @@ class SessionPool:
             session = self._sessions.pop(chat_id, None)
             await self._stop_wake_watcher(chat_id)
             if session:
+                # Let in-flight enrichment searches finish and catalogue what they
+                # found BEFORE the client goes away (the catalogue reload needs the
+                # live client). Best-effort; never blocks teardown.
+                if session.observer is not None:
+                    try:
+                        await session.observer.drain()
+                    except Exception:
+                        logger.debug("enrichment drain failed for chat_id %d",
+                                     chat_id, exc_info=True)
                 try:
                     await session.client.disconnect()
                 except Exception:

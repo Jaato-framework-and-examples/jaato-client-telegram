@@ -1,0 +1,58 @@
+# Tier-1 base for 'judge' — PROVIDER-AGNOSTIC.
+# The enrichment judge (src/jaato_client_telegram/enrichment.py): decides
+# whether some search results are about the topic of a just-stored memory.
+# One turn, one verdict, and it is done. Ported from jaato-escriba's
+# _base_juez.yaml.
+name: _base_judge
+description: >
+  Decides whether some search results are about the topic. One turn, one
+  verdict, and it is done.
+plugins:
+  # ONE tool, eagerly. The judge used to decide from the title and the
+  # snippet alone, having opened nothing — so a dead link or a page that is
+  # not what its snippet claims got catalogued and then offered to a person
+  # mid-conversation. Fetching what it is about to accept both verifies the
+  # page exists and lets it say what is actually in it.
+  #
+  # `tools:[web_fetch]` drops the plugin's other surface; the judge has no
+  # business doing anything else.
+  - "web_fetch(mode:preload, tools:[web_fetch])"
+# One turn by design: fetch a handful of URLs, accept or discard. The
+# ceiling is deliberately tight — anything more means it is re-judging.
+budget_control:
+  limits:
+    usd: 0.30
+    turns: 25
+    tool_calls: 60
+    seconds: 240
+  degrade:
+    - at: 80
+      action: finalize
+    - at: 100
+      action: abort
+
+suppress_base_instructions: true
+# It DOES declare a schema, unlike the conversational profiles, and that is
+# correct: this session is single-turn and terminating is exactly its job.
+completion_payload_schema: completion_schemas/judge.json
+plugin_configs:
+  permission:
+    policy:
+      defaultPolicy: deny
+      whitelist: {tools: [web_fetch]}
+  web_fetch:
+    # A summary needs the top of the page, not the whole of it: the judge
+    # reads several of these in one turn and the context is not free.
+    max_length: 6000
+    timeout: 15
+
+completion_processors:
+  # Reconciles the verdict against the candidates it was handed: every URL
+  # in one list and only one. Without this, returning two accepted and
+  # saying nothing about the rest validates just the same and looks like
+  # finished work.
+  - script: scripts/processors/all_judged.py
+    name: all_judged
+    on_error: fail_completion
+    max_refusals: 3
+    on_exhausted: allow
