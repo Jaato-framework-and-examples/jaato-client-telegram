@@ -335,14 +335,24 @@ class SessionPool:
 
     def _enrichment_conn(self) -> dict:
         """Dial params for the enrichment judge's throwaway sub-session — the
-        SAME daemon/workspace as the chat client, but ``client_type=API``.
+        SAME daemon/workspace as the chat client, but ``client_type=API`` and a
+        SEPARATE ``config_root``.
 
         The judge uses ``signal_completion`` (it has a completion schema), and
         the server STRIPS ``signal_completion`` from root sessions of a
         CHAT/WEB/TERMINAL client. A judge dialled as CHAT (like the chat client)
         could never return its verdict, so it must declare API — a headless,
-        programmatic identity. Passed to ``WSRecoveryClient.session(**conn,
-        profile=..., agent=..., ...)`` in enrichment._judge."""
+        programmatic identity.
+
+        ``config_root`` points at ``<workspace>/.jaato-judge`` — a self-contained
+        tree (profiles/, completion_schemas/, scripts/processors/, agents/) that
+        lives OUTSIDE the bot's ``.jaato/``. That isolation is deliberate: the
+        chat session's ``subagent`` plugin auto-discovers spawnable profiles from
+        the bot's config_root (``.jaato/profiles/``), so keeping the judge here
+        (not there) stops the model being offered ``judge`` as a subagent it can
+        spawn. The judge session still resolves its own profile from this root.
+        Passed to ``WSRecoveryClient.session(**conn, profile=..., agent=..., ...)``
+        in enrichment._judge."""
         workspace = self._ws_config.workspace
         return dict(
             url=self._ws_config.url,
@@ -350,7 +360,7 @@ class SessionPool:
             client_type=ClientType.API,
             ssl=self._build_ssl_context(),
             workspace_path=workspace or None,
-            config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
+            config_root=(workspace.rstrip("/") + "/.jaato-judge") if workspace else None,
         )
 
     async def _list_session_ids(self, client: WSRecoveryClient) -> list[str]:

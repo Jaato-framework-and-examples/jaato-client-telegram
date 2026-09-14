@@ -170,6 +170,12 @@ runtime/.jaato/scripts/**/__pycache__/
 # completion_payload_schema) — they must travel with the profile that names them.
 !runtime/.jaato/completion_schemas/
 !runtime/.jaato/completion_schemas/**
+# The enrichment JUDGE lives in its OWN config_root, deliberately OUTSIDE the bot's
+# .jaato/ so the bot's subagent plugin (which auto-discovers .jaato/profiles/) can't
+# offer `judge` as a spawnable subagent. The whole tree is versioned config.
+!runtime/.jaato-judge/
+!runtime/.jaato-judge/**
+runtime/.jaato-judge/**/__pycache__/
 
 # User data and workspaces
 workspaces/
