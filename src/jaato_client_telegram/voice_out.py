@@ -83,27 +83,34 @@ async def pcm_to_ogg_opus(
     return out
 
 
-async def audio_to_wav(data: bytes) -> bytes | None:
-    """Transcode an inbound audio note (Telegram voice = OGG/Opus) → WAV via ffmpeg.
+async def audio_to_mp3(data: bytes) -> bytes | None:
+    """Transcode an inbound audio note (Telegram voice = OGG/Opus) → MP3 via ffmpeg.
 
     An audio-INPUT tier backed by OpenAI ``gpt-audio`` rejects ``input_audio.format:
     'ogg'`` (it accepts only ``wav``/``mp3``), and Telegram voice notes are always
-    OGG. Down-mix to mono 16 kHz PCM16 WAV — plenty for speech recognition and keeps
-    the base64 payload small. Returns WAV bytes, or ``None`` if ffmpeg is missing or
-    fails (the caller then sends the original bytes, which 400s — no worse than now)."""
+    OGG. We transcode to **MP3, not WAV, deliberately**: WAV is uncompressed PCM
+    (~32 KB/s at 16 kHz mono → a 41 s note is ~1.3 MB), and the server echoes the
+    user turn back to the client as a ``source="user"`` event — so a large audio
+    turn produces a >1 MiB frame that blows the client's default WebSocket
+    ``max_size`` (1 MiB) and drops the connection mid-turn. MP3 at 64 kbps mono is
+    ~10× smaller (a 41 s note is ~0.3 MB), keeping the echo well under the cap while
+    staying plenty for speech. Down-mix to mono 16 kHz. Returns MP3 bytes, or
+    ``None`` if ffmpeg is missing or fails (the caller then sends the original
+    bytes, which 400s — no worse than doing nothing)."""
     if not data:
         return None
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", "pipe:0",
-            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+            "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+            "-f", "mp3", "pipe:1",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError:
-        log.warning("voice_in: ffmpeg not found — cannot transcode the voice note to WAV")
+        log.warning("voice_in: ffmpeg not found — cannot transcode the voice note to MP3")
         return None
     try:
         out, err = await proc.communicate(data)

@@ -38,6 +38,20 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# Memory-write tools whose successful call gets a visible "memory stored" hint in
+# the chat (sibling to the tier-switch indicator). Kept in step with the pool's
+# store set (session_pool._MEMORY_STORE_TOOLS) and the enrichment Observer's — the
+# same successful-store signal drives curation + reference enrichment behind the
+# scenes, so the hint appears exactly when that work kicks off. `update_memory` is
+# left out: the hint reads "stored", and an edit to an existing memory is not that.
+_MEMORY_STORE_TOOLS = frozenset({"store_memory", "memory"})
+
+# The references-plugin tool the model calls to pull catalogue entries into its
+# context (what the enrichment Observer fills). A successful call gets a visible
+# "reference loaded" hint — the read-side sibling of the "memory stored" hint.
+_REFERENCE_SELECT_TOOL = "selectReferences"
+
+
 # ANSI escape code pattern - matches terminal color codes like [1;38;5;253;48;5;235m
 ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*m|\[\d+(?:;\d+)*m')
 
@@ -110,6 +124,14 @@ _AWAIT_USER_TIMEOUT_SECS = 1800.0  # 30 min
 # not started producing output yet, use this far more generous cap.
 _INIT_TIMEOUT_SECS = 420.0  # 7 min — covers a slow runner re-spawn + plugin bootstrap
 
+# When the WS dropped MID-TURN (a reconnect happened after we sent the turn), the
+# server discards the in-flight turn on reattach, so the answer will NEVER come —
+# waiting out the 7-min revive cap is pure dead time. This is the short grace we
+# give the reattached session to resume before declaring the turn lost so the pump
+# can re-send it. Distinct from the cold-start revive above (no reconnect there —
+# the turn WILL come once the bootstrap finishes), which keeps the long cap.
+_RECONNECT_GRACE_SECS = 60.0
+
 
 # --- Markdown -> Telegram HTML --------------------------------------------------
 # The model is told the client supports markdown (presentation context), so it
@@ -177,6 +199,8 @@ class StreamingContext:
     content_sent: bool = False  # Track if content was already sent (prevents final duplicate)
     last_final_text: str = ""   # Last text sent via send_final_response (dedups repeat TURN_COMPLETED)
     stalled: bool = False  # Did the stream go silent (no events) past the stall timeout?
+    turn_lost: bool = False  # Stalled specifically because a mid-turn reconnect discarded
+    # the in-flight turn (turn never started after the reattach) — the pump re-sends once.
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
@@ -564,12 +588,27 @@ class ResponseRenderer:
                 and self._clarification_handler.get_pending(chat_id) is not None)
         )
 
+    async def _send_chat_hint(self, initial_message: Message, ctx, text: str) -> None:
+        """Send a small inline status line to the chat (the tier / memory / reference
+        indicators). Best-effort in its own message so it never disturbs the streamed
+        answer; an indicator must NEVER break the turn."""
+        try:
+            await initial_message.bot.send_message(
+                chat_id=initial_message.chat.id,
+                text=text,
+                parse_mode="HTML",
+                message_thread_id=(ctx.thread_id_getter() if ctx.thread_id_getter else None),
+            )
+        except Exception:  # noqa: BLE001 — an indicator must never break the turn
+            log.warning("chat-hint send failed (%r)", text, exc_info=True)
+
     async def stream_response(
         self,
         initial_message: Message,
         event_stream,  # AsyncIterator[Event] from SDK
         thread_id_getter: "Callable[[], int | None] | None" = None,
         status_message: "Message | None" = None,
+        reconnect_getter: "Callable[[], int] | None" = None,
     ) -> StreamingContext:
         """
         Stream events progressively, editing the message in place.
@@ -625,7 +664,11 @@ class ResponseRenderer:
         # response is generated. Only honor done/idle once the turn has actually
         # started ("active" status, or model output).
         turn_started = False
-        
+        # Baseline WS-drop count for this chat. If it rises while the turn is in
+        # flight (before any output), the connection dropped mid-turn — the server
+        # discards the in-flight turn on reattach, so the answer will never come.
+        reconnect_baseline = reconnect_getter() if reconnect_getter else 0
+
         event_iter = event_stream.__aiter__()
         chat_id = initial_message.chat.id
         while True:
@@ -637,7 +680,18 @@ class ResponseRenderer:
             # be legitimately silent for >120s while plugins bootstrap — use the
             # generous revive cap there so we don't falsely stall the reviving turn.
             reviving = init_progress_count > 0 and not turn_started
-            if awaiting_user:
+            # A mid-turn reconnect (WS dropped after we sent the turn, before any
+            # output): the reattach discards the turn, so the answer will NOT come —
+            # give the reattached session a short grace, then declare the turn lost
+            # so the pump re-sends it, rather than burning the 7-min revive cap.
+            reconnected_mid_turn = (
+                reconnect_getter is not None
+                and reconnect_getter() > reconnect_baseline
+                and not turn_started
+            )
+            if reconnected_mid_turn:
+                timeout = _RECONNECT_GRACE_SECS
+            elif awaiting_user:
                 timeout = _AWAIT_USER_TIMEOUT_SECS
             elif reviving:
                 timeout = _INIT_TIMEOUT_SECS
@@ -649,10 +703,12 @@ class ResponseRenderer:
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "stream_response: no event for %.0fs (awaiting_user=%s reviving=%s) — treating session as stalled",
-                    timeout, awaiting_user, reviving,
+                    "stream_response: no event for %.0fs (awaiting_user=%s reviving=%s "
+                    "reconnected_mid_turn=%s) — treating session as stalled",
+                    timeout, awaiting_user, reviving, reconnected_mid_turn,
                 )
                 ctx.stalled = True
+                ctx.turn_lost = reconnected_mid_turn
                 break
             except StopAsyncIteration:
                 break
@@ -766,6 +822,22 @@ class ResponseRenderer:
                         )
                     except Exception:  # noqa: BLE001 — an indicator must never break the turn
                         log.warning("tier-indicator send failed", exc_info=True)
+
+            elif event_type == EventType.TOOL_CALL_END:
+                # Tool-result visibility hints (siblings of the tier-switch indicator),
+                # fired on END so they reflect what actually happened, not an attempt.
+                # `is_error_result` is a success=True call that returned an error body.
+                _tool = getattr(event, "tool_name", "")
+                _ok = getattr(event, "success", False) and not getattr(
+                    event, "is_error_result", False
+                )
+                if _ok and _tool in _MEMORY_STORE_TOOLS:
+                    # The agent committed something to memory.
+                    await self._send_chat_hint(initial_message, ctx, "🧠 <i>memory stored</i>")
+                elif _ok and _tool == _REFERENCE_SELECT_TOOL:
+                    # The agent pulled reference material (an enrichment catalogue
+                    # entry, or any reference) into its context for this turn.
+                    await self._send_chat_hint(initial_message, ctx, "📎 <i>reference loaded</i>")
 
             elif event_type == EventType.TOOL_OUTPUT:
                 # Voice OUT: the `voz` gpt-audio tier's spoken reply arrives here as

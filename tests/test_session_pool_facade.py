@@ -81,7 +81,7 @@ def _make_pool(client, *, store=None, workspace="/ws", profile="p", agent="a"):
         url="wss://x", secret_token="", tls=None, workspace=workspace,
         profile=profile, agent=agent, host_tools_dir="", keycloak_client_id="",
     )
-    pool._make_client = lambda: client
+    pool._make_client = lambda chat_id=None: client
     return pool
 
 

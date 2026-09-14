@@ -1,0 +1,14 @@
+# judge — openrouter set: text only, one turn.
+# Selected by enrichment.py as the qualified path "openrouter/judge".
+name: judge
+description: >
+  Decides whether some search results are about the topic. One turn, one
+  verdict, and it is done.
+inherits: [_base_judge]
+plugins: []
+model: openai/gpt-4o-mini
+provider: openrouter
+plugin_configs:
+  openrouter:
+    api_params:
+      temperature: 0.0   # the same verdict for the same candidates

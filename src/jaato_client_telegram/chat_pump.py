@@ -303,6 +303,7 @@ class ChatPump:
             event_stream=await self._pool.events(session_id),
             thread_id_getter=lambda cid=item.chat_id: self._pool.current_thread(cid),
             status_message=status_message,
+            reconnect_getter=lambda cid=item.chat_id: self._pool.reconnect_count(cid),
         )
 
     async def _keep_typing(self, item: PumpItem) -> None:
@@ -327,6 +328,32 @@ class ChatPump:
             pass
 
     async def _post_turn(self, item: PumpItem, ctx) -> None:
+        # A mid-turn WS reconnect discarded the in-flight turn (the answer will never
+        # come). The server re-bootstraps a fresh runner on reattach, so re-sending
+        # the SAME message is safe (no double-processing) — do it once, silently, so
+        # the user just sees a brief pause then their answer, not a 7-min hang.
+        if ctx is not None and getattr(ctx, "turn_lost", False):
+            logger.info(
+                "pump: turn for chat %s lost to a mid-turn reconnect — re-sending once",
+                item.chat_id,
+            )
+            ctx2 = None
+            try:
+                session_id = await self._pool.get_or_create_session(item.chat_id)
+                await self._pool.send_message(session_id, item.text, attachments=item.attachments)
+                ctx2 = await self._render(item, session_id, None)
+            except Exception:  # noqa: BLE001 — retry boundary
+                logger.exception("pump: re-send after reconnect failed for chat %s", item.chat_id)
+            # Only give up (reset + ask the user) if the retry ALSO failed.
+            if ctx2 is None or getattr(ctx2, "stalled", False):
+                notify = item.message.reply if item.reply else item.message.answer
+                await notify(
+                    "⚠️ The session stopped responding — I've reset it. "
+                    "Please resend your message.",
+                    parse_mode=None,
+                )
+                await self._pool.forget_session(item.chat_id)
+            return
         if ctx is not None and getattr(ctx, "stalled", False):
             notify = item.message.reply if item.reply else item.message.answer
             await notify(

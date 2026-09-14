@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "aceptadas",
+    "descartadas"
+  ],
+  "properties": {
+    "aceptadas": {
+      "type": "array",
+      "description": "Los candidatos que de verdad tratan del tema. Vacío es una respuesta correcta y frecuente: una búsqueda que no encontró nada bueno no rinde nada.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "nombre",
+          "descripcion",
+          "resumen"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 8,
+            "description": "La URL del candidato, copiada TAL CUAL de la lista. No la inventes ni la retoques."
+          },
+          "nombre": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "description": "Nombre corto y humano de la fuente, como se diría al mencionarla en voz alta."
+          },
+          "descripcion": {
+            "type": "string",
+            "minLength": 1,
+            "description": "UNA frase de qué aporta sobre el tema. Con esta frase se vuelve a encontrar la referencia más adelante por parecido semántico, así que nombra los conceptos. El detalle va en `resumen`."
+          },
+          "resumen": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 600,
+            "description": "Dos o tres frases de lo que DICE la página, sacadas de haberla abierto — no del fragmento del buscador. Es lo que se leerá para decidir si vale la pena ofrecerla, así que di de qué trata y qué aporta, no si está bien escrita."
+          }
+        }
+      }
+    },
+    "descartadas": {
+      "type": "array",
+      "description": "Los candidatos que NO valen, con el motivo. No es papeleo: esta lista es lo que impide que la misma URL se vuelva a juzgar en cada búsqueda futura, y es donde se ve si estás descartando bien.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "motivo"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 8,
+            "description": "La URL del candidato, copiada TAL CUAL de la lista."
+          },
+          "motivo": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Por qué no vale, en pocas palabras y concreto: 'es una tienda', 'coincide por la palabra suelta pero habla de arneses de escalada', 'no se pudo abrir', 'la página no trata de lo que prometía el fragmento'."
+          }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Avisos que no bloquean nada."
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Marcadores de fallo duro: no pudiste juzgar."
+    }
+  },
+  "description": "El campo `agent` NO está aquí a propósito. Era un `const` que el modelo tenía que repetir, y repetir una constante que el framework ya conoce es papeleo: se olvidaba, `signal_completion` se rechazaba con \"'agent' is a required property\", y cada olvido gastaba un intento Y un nudge del presupuesto de la sesión."
+}

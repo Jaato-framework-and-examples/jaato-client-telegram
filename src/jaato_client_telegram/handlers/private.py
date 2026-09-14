@@ -16,7 +16,7 @@ from jaato_client_telegram.chat_pump import ChatPump, PumpItem
 from jaato_client_telegram.clarification import ClarificationHandler, advance_clarification
 from jaato_client_telegram.session_pool import SessionPool
 from jaato_client_telegram.voice_mode_store import VOICE_HINT, VoiceModeStore
-from jaato_client_telegram.voice_out import audio_to_wav
+from jaato_client_telegram.voice_out import audio_to_mp3
 
 if TYPE_CHECKING:
     from jaato_client_telegram.rate_limiter import RateLimiter
@@ -337,14 +337,17 @@ async def handle_private_audio(
 
     # The voz ingest tier (OpenAI gpt-audio) rejects `input_audio.format: 'ogg'`
     # (accepts only wav/mp3), and Telegram voice notes are always OGG. Transcode
-    # → WAV so the audio tier can hear them. Best-effort: if ffmpeg fails we send
-    # the original OGG (which 400s — no worse than doing nothing).
+    # → MP3 (not WAV): WAV is uncompressed PCM, so a long note becomes >1 MiB and
+    # the server's echo of the user turn overflows the client's WS max_size (1 MiB)
+    # and drops the connection mid-turn; MP3 is ~10x smaller and stays under it.
+    # Best-effort: if ffmpeg fails we send the original OGG (which 400s — no worse
+    # than doing nothing).
     if mime_type == "audio/ogg":
-        _wav = await audio_to_wav(data)
-        if _wav:
-            logger.info("inbound audio transcoded OGG->WAV (%d -> %d bytes)", len(data), len(_wav))
-            data, mime_type = _wav, "audio/wav"
-            name = (name.rsplit(".", 1)[0] if "." in name else name) + ".wav"
+        _mp3 = await audio_to_mp3(data)
+        if _mp3:
+            logger.info("inbound audio transcoded OGG->MP3 (%d -> %d bytes)", len(data), len(_mp3))
+            data, mime_type = _mp3, "audio/mpeg"
+            name = (name.rsplit(".", 1)[0] if "." in name else name) + ".mp3"
 
     attachments = _build_audio_attachments(data, mime_type, name, seconds)
 
