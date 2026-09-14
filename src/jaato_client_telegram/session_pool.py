@@ -294,16 +294,24 @@ class SessionPool:
             ctx.load_cert_chain(tls.cert_path, tls.key_path)
         return ctx
 
-    def _make_client(self, chat_id: int) -> WSRecoveryClient:
+    def _make_client(self, chat_id: "int | None" = None) -> WSRecoveryClient:
         workspace = self._ws_config.workspace
 
-        def _on_status(status: object, cid: int = chat_id) -> None:
-            # A CONNECTED -> RECONNECTING transition means the WS dropped. Count it
-            # so the renderer knows a turn in flight on this chat may have been lost
-            # (server discards the in-flight turn on reattach) and can re-send it,
-            # instead of waiting out the full cold-revive cap. Best-effort.
-            if getattr(status, "state", None) == ConnectionState.RECONNECTING:
-                self._reconnects[cid] = self._reconnects.get(cid, 0) + 1
+        # Only per-chat clients track reconnects (for mid-turn re-send). The
+        # bot-wide WakeObserver also builds a client via this method with no
+        # chat_id — it has no turn to re-send, so no callback.
+        on_status = None
+        if chat_id is not None:
+
+            def _on_status(status: object, cid: int = chat_id) -> None:
+                # A CONNECTED -> RECONNECTING transition means the WS dropped. Count
+                # it so the renderer knows a turn in flight on this chat may have
+                # been lost (server discards the in-flight turn on reattach) and can
+                # re-send it, instead of waiting out the cold-revive cap. Best-effort.
+                if getattr(status, "state", None) == ConnectionState.RECONNECTING:
+                    self._reconnects[cid] = self._reconnects.get(cid, 0) + 1
+
+            on_status = _on_status
 
         # config_root wires the daemon's framework-config search (profiles, agents,
         # file_edit backup dir); working_dir/workspace_path gates the runner-tier
@@ -316,7 +324,7 @@ class SessionPool:
             workspace_path=workspace or None,
             config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
             presentation=create_telegram_presentation_context(),
-            on_status_change=_on_status,
+            on_status_change=on_status,
         )
 
     def reconnect_count(self, chat_id: int) -> int:
