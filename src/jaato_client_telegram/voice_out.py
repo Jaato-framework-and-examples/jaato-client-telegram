@@ -81,3 +81,39 @@ async def pcm_to_ogg_opus(
         )
         return None
     return out
+
+
+async def audio_to_wav(data: bytes) -> bytes | None:
+    """Transcode an inbound audio note (Telegram voice = OGG/Opus) → WAV via ffmpeg.
+
+    An audio-INPUT tier backed by OpenAI ``gpt-audio`` rejects ``input_audio.format:
+    'ogg'`` (it accepts only ``wav``/``mp3``), and Telegram voice notes are always
+    OGG. Down-mix to mono 16 kHz PCM16 WAV — plenty for speech recognition and keeps
+    the base64 payload small. Returns WAV bytes, or ``None`` if ffmpeg is missing or
+    fails (the caller then sends the original bytes, which 400s — no worse than now)."""
+    if not data:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0",
+            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.warning("voice_in: ffmpeg not found — cannot transcode the voice note to WAV")
+        return None
+    try:
+        out, err = await proc.communicate(data)
+    except Exception:  # noqa: BLE001 — transcode boundary
+        log.exception("voice_in: ffmpeg transcode failed")
+        return None
+    if proc.returncode != 0 or not out:
+        log.warning(
+            "voice_in: ffmpeg returned %s, %d bytes out (%s)",
+            proc.returncode, len(out or b""), (err or b"")[:200].decode("utf-8", "ignore"),
+        )
+        return None
+    return out

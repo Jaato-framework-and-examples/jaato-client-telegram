@@ -742,6 +742,30 @@ class ResponseRenderer:
                 # source="tool" agent output), so this is where a multi-step turn
                 # gets its natural per-step segmentation. Emit the narration now.
                 await self._emit_segments(initial_message, ctx, flush=True, final=False)
+                # Tier visibility: surface a model-initiated tier switch
+                # (enter_tier) as a small chat line so the user can see when the
+                # agent moves to voz / coder / vision. NOTE: the framework's
+                # automatic exit_on:completion return to executor is NOT a tool
+                # call, so it does not appear here (jaato #675 — no seam emits it).
+                if getattr(event, "tool_name", "") == "enter_tier":
+                    _args = getattr(event, "tool_args", {}) or {}
+                    _tier = (
+                        _args.get("tier") or _args.get("requested_tier")
+                        or _args.get("name")
+                        or next((str(v) for v in _args.values() if isinstance(v, str)), "?")
+                    )
+                    log.info("tier switch: model entered '%s'", _tier)
+                    try:
+                        await initial_message.bot.send_message(
+                            chat_id=initial_message.chat.id,
+                            text=f"🔀 <i>→ <code>{_tier}</code> tier</i>",
+                            parse_mode="HTML",
+                            message_thread_id=(
+                                ctx.thread_id_getter() if ctx.thread_id_getter else None
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — an indicator must never break the turn
+                        log.warning("tier-indicator send failed", exc_info=True)
 
             elif event_type == EventType.TOOL_OUTPUT:
                 # Voice OUT: the `voz` gpt-audio tier's spoken reply arrives here as

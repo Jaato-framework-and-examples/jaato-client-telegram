@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 # voice-out works even before the Langfuse persona names the tier; the persona
 # reinforces it. Short spoken replies keep gpt-audio cost + note length down.
 VOICE_HINT = (
-    "\n\n[SYSTEM — voice reply requested: after composing your answer, switch to "
-    "the `voz` tier and speak your answer aloud, verbatim and naturally, then "
-    "return to executor. Keep the spoken reply concise.]"
+    "\n\n[SYSTEM — the user sent a voice note. You are already in the voz tier, which "
+    "HEARS them and SPEAKS: just answer by SPEAKING your reply aloud, naturally and "
+    "concise. Only if you need a tool or to see an attached image, enter the executor "
+    "tier for that, then you return to voz automatically and speak your answer.]"
 )
 
 
