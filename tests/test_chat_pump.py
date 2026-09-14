@@ -12,8 +12,9 @@ from jaato_client_telegram.host_tool_loader import ToolContext
 # ---- fakes -----------------------------------------------------------------
 
 class _Ctx:
-    def __init__(self, stalled=False):
+    def __init__(self, stalled=False, turn_lost=False):
         self.stalled = stalled
+        self.turn_lost = turn_lost
 
 
 class FakePool:
@@ -58,6 +59,9 @@ class FakePool:
     def current_thread(self, chat_id):
         return self.threads.get(chat_id)
 
+    def reconnect_count(self, chat_id):
+        return 0
+
     async def forget_session(self, chat_id):
         self.forgotten.append(chat_id)
 
@@ -77,7 +81,7 @@ class FakeRenderer:
         return self.release.setdefault(idx, asyncio.Event())
 
     async def stream_response(self, initial_message, event_stream, thread_id_getter=None,
-                              status_message=None):
+                              status_message=None, reconnect_getter=None):
         idx = len(self.started)
         self.started.append(idx)
         await self._ev(idx).wait()          # block the turn until the test releases it
@@ -207,6 +211,48 @@ def test_stall_forgets_session():
         pump.submit(item)
         await _until(lambda: rend.started == [0])
         rend._ev(0).set()
+        await _until(lambda: pool.forgotten == [1])
+        assert any("stopped responding" in a for a in item.message.answers)
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_turn_lost_to_reconnect_resends_once():
+    """A turn lost to a mid-turn reconnect (ctx.turn_lost) is re-sent ONCE and
+    re-rendered — the session is NOT forgotten and the user is NOT asked to resend."""
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        rend.ctx[0] = _Ctx(stalled=True, turn_lost=True)   # first render: turn lost
+        rend.ctx[1] = _Ctx(stalled=False)                  # re-send: succeeds
+        pump = ChatPump(pool, rend)
+        item = _item(1, "A", apply_welcome=False)
+        pump.submit(item)
+        await _until(lambda: rend.started == [0])
+        rend._ev(0).set()                                  # release the lost turn
+        # The pump re-sends the same message and renders again.
+        await _until(lambda: rend.started == [0, 1] and len(pool.sent) == 2)
+        rend._ev(1).set()                                  # release the retry
+        await _until(lambda: rend.completed == [0, 1])
+        assert pool.sent[0][1] == pool.sent[1][1] == "A"   # same message, re-sent
+        assert pool.forgotten == []                        # session kept
+        assert not any("stopped responding" in a for a in item.message.answers)
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_turn_lost_retry_also_fails_then_forgets():
+    """If the re-send after a reconnect ALSO stalls, give up: reset + ask the user."""
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        rend.ctx[0] = _Ctx(stalled=True, turn_lost=True)   # lost to reconnect
+        rend.ctx[1] = _Ctx(stalled=True)                   # retry also stalls
+        pump = ChatPump(pool, rend)
+        item = _item(1, "A", apply_welcome=False)
+        pump.submit(item)
+        await _until(lambda: rend.started == [0])
+        rend._ev(0).set()
+        await _until(lambda: rend.started == [0, 1])
+        rend._ev(1).set()
         await _until(lambda: pool.forgotten == [1])
         assert any("stopped responding" in a for a in item.message.answers)
         await pump.shutdown()

@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from jaato_sdk import WSRecoveryClient
+from jaato_sdk import ConnectionState, WSRecoveryClient
 from jaato_sdk.events import ClientType, EventType
 from jaato_sdk.plugins.model_provider.types import UNTRUSTED_OPEN
 
@@ -131,6 +131,11 @@ class SessionPool:
         self._max_concurrent = max_concurrent
         self._sessions: dict[int, SessionMetadata] = {}
         self._lock = asyncio.Lock()
+        # Per-chat count of WS connection losses (CONNECTED -> RECONNECTING). The
+        # renderer reads this to tell a mid-turn reconnect (turn lost — re-send)
+        # apart from a cold-start revive (legit slow bootstrap — wait it out).
+        # Monotonic; the renderer compares against a per-turn baseline.
+        self._reconnects: dict[int, int] = {}
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
@@ -289,8 +294,17 @@ class SessionPool:
             ctx.load_cert_chain(tls.cert_path, tls.key_path)
         return ctx
 
-    def _make_client(self) -> WSRecoveryClient:
+    def _make_client(self, chat_id: int) -> WSRecoveryClient:
         workspace = self._ws_config.workspace
+
+        def _on_status(status: object, cid: int = chat_id) -> None:
+            # A CONNECTED -> RECONNECTING transition means the WS dropped. Count it
+            # so the renderer knows a turn in flight on this chat may have been lost
+            # (server discards the in-flight turn on reattach) and can re-send it,
+            # instead of waiting out the full cold-revive cap. Best-effort.
+            if getattr(status, "state", None) == ConnectionState.RECONNECTING:
+                self._reconnects[cid] = self._reconnects.get(cid, 0) + 1
+
         # config_root wires the daemon's framework-config search (profiles, agents,
         # file_edit backup dir); working_dir/workspace_path gates the runner-tier
         # sandbox root. Both ride the client's connect-time ClientConfigRequest.
@@ -302,7 +316,14 @@ class SessionPool:
             workspace_path=workspace or None,
             config_root=(workspace.rstrip("/") + "/.jaato") if workspace else None,
             presentation=create_telegram_presentation_context(),
+            on_status_change=_on_status,
         )
+
+    def reconnect_count(self, chat_id: int) -> int:
+        """How many times this chat's WS has dropped (CONNECTED -> RECONNECTING).
+        Monotonic per process. The renderer captures it at turn start and compares,
+        to detect a mid-turn reconnect (see stream_response)."""
+        return self._reconnects.get(chat_id, 0)
 
     def _enrichment_conn(self) -> dict:
         """Dial params for the enrichment judge's throwaway sub-session — the
@@ -417,7 +438,7 @@ class SessionPool:
                 await self._evict_oldest()
 
             try:
-                client = self._make_client()
+                client = self._make_client(chat_id)
                 if not await client.connect():
                     raise RuntimeError("WSRecoveryClient.connect() returned False")
                 logger.info("Connected facade WS client for chat_id %d", chat_id)
