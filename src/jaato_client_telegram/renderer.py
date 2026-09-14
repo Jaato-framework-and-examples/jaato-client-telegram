@@ -38,6 +38,15 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# Memory-write tools whose successful call gets a visible "memory stored" hint in
+# the chat (sibling to the tier-switch indicator). Kept in step with the pool's
+# store set (session_pool._MEMORY_STORE_TOOLS) and the enrichment Observer's — the
+# same successful-store signal drives curation + reference enrichment behind the
+# scenes, so the hint appears exactly when that work kicks off. `update_memory` is
+# left out: the hint reads "stored", and an edit to an existing memory is not that.
+_MEMORY_STORE_TOOLS = frozenset({"store_memory", "memory"})
+
+
 # ANSI escape code pattern - matches terminal color codes like [1;38;5;253;48;5;235m
 ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*m|\[\d+(?:;\d+)*m')
 
@@ -742,6 +751,31 @@ class ResponseRenderer:
                 # source="tool" agent output), so this is where a multi-step turn
                 # gets its natural per-step segmentation. Emit the narration now.
                 await self._emit_segments(initial_message, ctx, flush=True, final=False)
+
+            elif event_type == EventType.TOOL_CALL_END:
+                # Memory visibility: surface a SUCCESSFUL memory store as a small
+                # chat line, so the user can see when the agent has committed
+                # something to memory (sibling to the tier-switch indicator). Fired
+                # on END, not START: the hint says "stored", so it must reflect a
+                # store that actually happened — not one the model merely attempted.
+                # `is_error_result` is a success=True call that returned an error
+                # body, which is not a store either.
+                if (
+                    getattr(event, "tool_name", "") in _MEMORY_STORE_TOOLS
+                    and getattr(event, "success", False)
+                    and not getattr(event, "is_error_result", False)
+                ):
+                    try:
+                        await initial_message.bot.send_message(
+                            chat_id=initial_message.chat.id,
+                            text="🧠 <i>memory stored</i>",
+                            parse_mode="HTML",
+                            message_thread_id=(
+                                ctx.thread_id_getter() if ctx.thread_id_getter else None
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — an indicator must never break the turn
+                        log.warning("memory-indicator send failed", exc_info=True)
 
             elif event_type == EventType.TOOL_OUTPUT:
                 # Voice OUT: the `voz` gpt-audio tier's spoken reply arrives here as
