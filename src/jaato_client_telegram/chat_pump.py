@@ -328,6 +328,15 @@ class ChatPump:
             pass
 
     async def _post_turn(self, item: PumpItem, ctx) -> None:
+        # Budget ceiling hit: the session refuses all further turns, so forget it —
+        # the next message starts a fresh session (fresh budget + context). The 💸
+        # hint was already sent by the renderer, so no extra notice here.
+        if ctx is not None and getattr(ctx, "budget_exhausted", False):
+            logger.info(
+                "pump: chat %s hit its budget ceiling — forgetting the session", item.chat_id
+            )
+            await self._pool.forget_session(item.chat_id)
+            return
         # A mid-turn WS reconnect discarded the in-flight turn (the answer will never
         # come). The server re-bootstraps a fresh runner on reattach, so re-sending
         # the SAME message is safe (no double-processing) — do it once, silently, so

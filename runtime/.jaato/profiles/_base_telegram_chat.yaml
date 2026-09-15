@@ -58,6 +58,25 @@ plugins:
 # Chat-style turns; the bot streams output and surfaces tool/permission/
 # clarification UIs over the WS protocol.
 max_turns: 12
+
+# Agent-economics ceiling for the whole chat SESSION (cumulative usd/tool_calls,
+# persists across reload). Generous — a normal conversation never trips it; only a
+# pathological runaway does. NOT a per-turn loop-cap (usage is cumulative), and NO
+# brownout rung (the only pricey tier is audio, with no cheaper drop-in). finalize@90
+# injects "wrap up and answer"; abort@100 is the backstop and surfaces as
+# SessionTerminatedEvent(reason=budget_exhausted) → the "💸 budget" chat hint.
+# (Gentler hints — brownout/finalize/threshold checkpoints — await framework #1069,
+# which adds a rung-fired event + a notify-only rung.)
+budget_control:
+  limits:
+    usd: 15
+    tool_calls: 1500
+  degrade:
+    - at: 90
+      action: finalize
+    - at: 100
+      action: abort
+
 plugin_configs:
   memory:
     # Write-side scope gate (server PR #468): the bot has a SINGLE workspace

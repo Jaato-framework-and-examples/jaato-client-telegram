@@ -12,9 +12,10 @@ from jaato_client_telegram.host_tool_loader import ToolContext
 # ---- fakes -----------------------------------------------------------------
 
 class _Ctx:
-    def __init__(self, stalled=False, turn_lost=False):
+    def __init__(self, stalled=False, turn_lost=False, budget_exhausted=False):
         self.stalled = stalled
         self.turn_lost = turn_lost
+        self.budget_exhausted = budget_exhausted
 
 
 class FakePool:
@@ -255,6 +256,24 @@ def test_turn_lost_retry_also_fails_then_forgets():
         rend._ev(1).set()
         await _until(lambda: pool.forgotten == [1])
         assert any("stopped responding" in a for a in item.message.answers)
+        await pump.shutdown()
+    asyncio.run(run())
+
+
+def test_budget_exhausted_forgets_session():
+    """A budget_control ceiling (ctx.budget_exhausted) forgets the session so the
+    next message starts fresh — and no generic stall notice (the 💸 hint came from
+    the renderer)."""
+    async def run():
+        pool, rend = FakePool(), FakeRenderer()
+        rend.ctx[0] = _Ctx(budget_exhausted=True)
+        pump = ChatPump(pool, rend)
+        item = _item(1, "A", apply_welcome=False)
+        pump.submit(item)
+        await _until(lambda: rend.started == [0])
+        rend._ev(0).set()
+        await _until(lambda: pool.forgotten == [1])
+        assert not any("stopped responding" in a for a in item.message.answers)
         await pump.shutdown()
     asyncio.run(run())
 
