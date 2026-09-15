@@ -29,6 +29,7 @@ from jaato_sdk.events import ClientType, EventType
 from jaato_sdk.plugins.model_provider.types import UNTRUSTED_OPEN
 
 from jaato_client_telegram.chat_session_store import ChatSessionStore
+from jaato_client_telegram.curator import raw_memory_count, run_curator
 from jaato_client_telegram.enrichment import Observer
 from jaato_client_telegram.host_tool_loader import (
     USER_INSTALLED_TAG,
@@ -76,11 +77,6 @@ def _is_wake_echo(ev: object) -> bool:
         and isinstance(text, str)
         and text.startswith(_WAKE_ECHO_PREFIX)
     )
-
-# Memory-write tools whose successful completion should trigger a raw->curated
-# drain (so the NEXT session's enrichment surfaces the memory). The model calls
-# these via the server's memory plugin.
-_MEMORY_STORE_TOOLS = frozenset({"store_memory", "memory", "update_memory"})
 
 
 @dataclass
@@ -136,6 +132,9 @@ class SessionPool:
         # apart from a cold-start revive (legit slow bootstrap — wait it out).
         # Monotonic; the renderer compares against a per-turn baseline.
         self._reconnects: dict[int, int] = {}
+        # The single in-flight memory-curator drain, if any (curate_memories_bg).
+        # One at a time; the idle sweep skips while it runs.
+        self._curator_task: "asyncio.Task | None" = None
         # Persistent chat_id -> session_id map for re-attachment across restarts.
         # None when unconfigured (re-attachment disabled — sessions are per-process).
         self._session_store = ChatSessionStore(session_store_path) if session_store_path else None
@@ -333,26 +332,26 @@ class SessionPool:
         to detect a mid-turn reconnect (see stream_response)."""
         return self._reconnects.get(chat_id, 0)
 
-    def _enrichment_conn(self) -> dict:
-        """Dial params for the enrichment judge's throwaway sub-session — the
-        SAME daemon/workspace as the chat client, but ``client_type=API`` and a
-        SEPARATE ``config_root``.
+    def _internal_conn(self) -> dict:
+        """Dial params for the bot's headless INTERNAL sub-sessions — the
+        enrichment judge and the memory curator. Same daemon/workspace as the chat
+        client, but ``client_type=API`` and a SEPARATE ``config_root``.
 
-        The judge uses ``signal_completion`` (it has a completion schema), and
-        the server STRIPS ``signal_completion`` from root sessions of a
-        CHAT/WEB/TERMINAL client. A judge dialled as CHAT (like the chat client)
-        could never return its verdict, so it must declare API — a headless,
-        programmatic identity.
+        ``client_type=API`` (not CHAT): the server STRIPS ``signal_completion``
+        from root sessions of a CHAT/WEB/TERMINAL client, so the judge (which has a
+        completion schema) must be API — a headless, programmatic identity. The
+        curator has no schema but shares the same dial for the same isolation.
 
         ``config_root`` points at ``<workspace>/.jaato-judge`` — a self-contained
-        tree (profiles/, completion_schemas/, scripts/processors/, agents/) that
-        lives OUTSIDE the bot's ``.jaato/``. That isolation is deliberate: the
-        chat session's ``subagent`` plugin auto-discovers spawnable profiles from
-        the bot's config_root (``.jaato/profiles/``), so keeping the judge here
-        (not there) stops the model being offered ``judge`` as a subagent it can
-        spawn. The judge session still resolves its own profile from this root.
+        tree (profiles/, completion_schemas/, scripts/processors/, agents/) OUTSIDE
+        the bot's ``.jaato/``. Deliberate: the chat session's ``subagent`` plugin
+        auto-discovers spawnable profiles from the bot's config_root
+        (``.jaato/profiles/``), so keeping ``judge`` + ``curator`` here (not there)
+        stops the model being offered them as subagents. Each internal session
+        still resolves its own profile from this root, while ``workspace_path`` (the
+        bot's workspace) gives its memory plugin the bot's own ``.jaato/memories``.
         Passed to ``WSRecoveryClient.session(**conn, profile=..., agent=..., ...)``
-        in enrichment._judge."""
+        in enrichment._judge and curator.run_curator."""
         workspace = self._ws_config.workspace
         return dict(
             url=self._ws_config.url,
@@ -461,13 +460,13 @@ class SessionPool:
                     raise RuntimeError("WSRecoveryClient.connect() returned False")
                 logger.info("Connected facade WS client for chat_id %d", chat_id)
 
-                # Auto-curate memories client-side: a successful memory-write tool
-                # call promotes raw->curated (replaces the premium reactor engine).
-                # Registered on the recovery client's registry, so it survives
-                # reconnects.
-                client.subscribe(EventType.TOOL_CALL_END, self._on_tool_call_end)
+                # Memory curation is NOT wired here anymore. It used to promote
+                # every raw memory to validated on each store_memory (a blunt
+                # promote-all); it is replaced by the LLM curator that judges the
+                # raw queue on idle-detach (curate_memories_bg / curator.py) —
+                # validate/dismiss/fix, not promote-all.
 
-                # Reference enrichment: the SAME memory-write signal also kicks off
+                # Reference enrichment: a successful memory-write signal kicks off
                 # a background search (tags -> DuckDuckGo -> judge -> references
                 # catalogue), so a topic the user stores today is offered back by
                 # the model when the conversation brushes it again. Its START/END
@@ -477,7 +476,7 @@ class SessionPool:
                 observer: Observer | None = None
                 if self._ws_config.workspace:
                     observer = Observer(
-                        self._enrichment_conn(), Path(self._ws_config.workspace)
+                        self._internal_conn(), Path(self._ws_config.workspace)
                     )
                     observer.attach(client)
 
@@ -737,47 +736,34 @@ class SessionPool:
         (dest_dir / safe).write_bytes(data)
         return f"uploads/{safe}"
 
-    # --- Client-side memory curation (replaces the premium reactor) ----------
-    def _curate_memories(self) -> int:
-        """Promote this workspace's raw memories to curated — the same
-        deterministic raw->validated drain the premium reactor did, now
-        client-side. Returns the count promoted. No-op (returns 0) if the
-        workspace or the server's memory package is unavailable, so the bot
-        degrades gracefully without curation rather than failing."""
+    # --- Memory curation: the LLM curator, on idle-detach --------------------
+    async def curate_memories_bg(self) -> None:
+        """Run the memory curator in the background when there is a raw queue to
+        judge. Called from the idle-cleanup sweep — a chat just went idle, i.e. a
+        conversation ended, which is the escriba curator's "on close" boundary.
+
+        Guards against overlap (one curator at a time) and skips when the raw
+        queue is empty (no point waking an LLM). The curator (curator.py) is a
+        SEPARATE headless session that validates / dismisses / fixes raw memories
+        in the bot's own store; it needs no live chat client. Fire-and-forget with
+        error logging — a failed curation must never disturb the chats."""
         workspace = self._ws_config.workspace
         if not workspace:
-            return 0
+            return
+        if self._curator_task is not None and not self._curator_task.done():
+            logger.debug("curator: a drain is already running — skipping this sweep")
+            return
+        raw = await asyncio.to_thread(raw_memory_count, Path(workspace))
+        if raw <= 0:
+            return
+        logger.info("curator: %d raw memory(ies) to judge — starting a drain", raw)
+        self._curator_task = asyncio.create_task(self._run_curator())
+
+    async def _run_curator(self) -> None:
         try:
-            import dataclasses
-
-            from shared.plugins.memory.models import MATURITY_VALIDATED
-            from shared.plugins.memory.storage import MemoryStore
-        except Exception:
-            logger.debug(
-                "memory curation skipped: shared.plugins.memory unavailable", exc_info=True
-            )
-            return 0
-        store = MemoryStore(f"{workspace.rstrip('/')}/.jaato/memories")
-        raw = store.list_raw()
-        if not raw:
-            return 0
-        for memory in raw:
-            store.update(dataclasses.replace(memory, maturity=MATURITY_VALIDATED))
-        return len(raw)
-
-    async def _on_tool_call_end(self, event) -> None:
-        """Auto-curate after the model stores a memory: when a memory-write tool
-        completes successfully, drain raw->curated so the next session's
-        enrichment surfaces it. Event-driven, client-side — replaces the premium
-        reactor engine. Subscribed per client (survives reconnects via the
-        recovery client's subscription registry)."""
-        if getattr(event, "tool_name", "") not in _MEMORY_STORE_TOOLS:
-            return
-        if not getattr(event, "success", False):
-            return
-        promoted = await asyncio.to_thread(self._curate_memories)
-        if promoted:
-            logger.info("memory curation: promoted %d raw -> curated", promoted)
+            await run_curator(self._internal_conn())
+        except Exception:  # noqa: BLE001 — curation boundary; never disturb chats
+            logger.exception("curator: drain failed")
 
     def _make_register_tool_executor(self, chat_id: int):
         async def executor(args: dict) -> dict:
