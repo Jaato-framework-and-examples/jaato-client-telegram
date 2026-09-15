@@ -1,0 +1,76 @@
+# Tier-1 base for 'curator' — PROVIDER-AGNOSTIC.
+# The memory curator (src/jaato_client_telegram/curator.py): after a chat goes
+# idle, it judges the RAW memory queue — validate / dismiss / fix-in-place — so
+# the next session wakes up knowing what was said. Ported from jaato-escriba's
+# _base_curator.yaml. Lives in the isolated .jaato-judge config_root (NOT the
+# bot's .jaato/) so the chat's `subagent` plugin can't offer it as a spawnable
+# profile. It reaches the bot's OWN memory store via workspace_path (the default
+# `.jaato/memories` is workspace-relative), so it needs NO storage_path override.
+name: _base_curator
+description: >
+  Judges what the assistant wrote down raw: validates it or lets it go.
+  It is what makes "remembering" true — without it the raw queue is
+  reachable by no tag search, and the next session wakes up with nothing.
+
+# It declares no completion_payload_schema, unlike the judge, and for a
+# reason: it is a FACULTY, not a service that gets called. It cannot decide
+# it is finished. Withholding the schema removes `signal_completion` entirely
+# — it works the raw queue until the queue is empty or the budget caps.
+#
+# It neither speaks nor hears: no tiers or modalities. The thing that judges
+# the memories is not the thing that writes them.
+
+plugins:
+  # THREE tools, and nothing else EXISTS in this session.
+  #
+  # `mode:preload` because `update_memory` is DEFERRED behind discovery — a
+  # curator that has to call `list_tools` before it can validate anything spends
+  # its first turn looking for its own hands.
+  #
+  # `tools:[...]` is the part that matters: it leaves `store_memory` and
+  # `delete_memory` out of the whole registry, not just out of the permission
+  # policy. Necessary because the whitelist does NOT reach `store_memory`: the
+  # plugin marks it auto-approved along with `retrieve_memories`/`list_memory_tags`,
+  # and an auto-approved tool bypasses the policy.
+  #
+  # jaato-escriba measured (2026-09-09): with `store_memory` in reach the curator
+  # discarded a good memory and stored it again raw with content/description
+  # swapped — every drain re-created it, so it never validated. The curator JUDGES
+  # what is already written; it does not write.
+  - "memory(mode:preload, tools:[retrieve_memories, update_memory, list_memory_tags])"
+
+# Judges raw memories eight at a time and stops. Past 40 turns it is not
+# curating, it is looping.
+budget_control:
+  limits:
+    usd: 0.40
+    turns: 40
+    tool_calls: 120
+  degrade:
+    - at: 80
+      action: finalize
+    - at: 100
+      action: abort
+
+gc:
+  type: hybrid
+  threshold_percent: 75.0
+  preserve_recent_turns: 4
+
+plugin_configs:
+  memory:
+    # SAME store as the bot: no storage_path here, so it defaults to the
+    # workspace's `.jaato/memories` (wired by set_workspace_path from
+    # workspace_path). scope=project matches the bot (single shared workspace).
+    allowed_scopes: ["project"]
+  permission:
+    policy:
+      defaultPolicy: deny
+      whitelist:
+        # WITHOUT `delete_memory` — a guarantee, not a preference. jaato-escriba
+        # (2026-09-09): on its first run a curator with delete deleted three real
+        # user memories (two personal, 22 and 18 uses). The persona said "prefer
+        # discarding to deleting"; prose is a suggestion, the whitelist is the
+        # contract. Discarding does everything curation needs and is reversible
+        # (a `maturity` change, not a loss); deleting is not recoverable.
+        tools: [retrieve_memories, update_memory, list_memory_tags]

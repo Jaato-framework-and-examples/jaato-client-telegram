@@ -1,0 +1,14 @@
+# curator — openrouter set: text only, good at calling tools.
+# Selected by curator.py as the qualified path "openrouter/curator".
+name: curator
+description: >
+  Judges what the assistant wrote down raw: validates it or lets it go.
+  It is what makes "remembering" true.
+inherits: [_base_curator]
+plugins: []  # empty keeps the surface inherited from _base_curator
+model: openai/gpt-4o-mini
+provider: openrouter
+plugin_configs:
+  openrouter:
+    api_params:
+      temperature: 0.0   # the same verdict for the same memory

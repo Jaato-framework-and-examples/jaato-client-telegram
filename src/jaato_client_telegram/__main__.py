@@ -152,6 +152,10 @@ async def _idle_session_cleanup_task(
                 logging.info(f"Cleaned up {len(dropped)} idle sessions")
                 if notice_text and not _in_quiet_hours(quiet_hours):
                     await _notify_idle_dropped(bot, dropped, notice_text)
+                # A conversation just ended — consolidate the raw memory queue
+                # (validate/dismiss/fix) so the next session wakes up knowing it.
+                # Self-gates on the raw count + one-drain-at-a-time; fire-and-forget.
+                await pool.curate_memories_bg()
         except asyncio.CancelledError:
             break
         except Exception as e:

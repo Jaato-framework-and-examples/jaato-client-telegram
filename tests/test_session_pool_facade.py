@@ -182,34 +182,71 @@ def test_stage_upload_none_without_workspace():
     assert pool.stage_upload("x.txt", b"x") is None
 
 
-# ── client-side memory curation (replaces the premium reactor) ───────────────
+# ── memory curation: the LLM curator on idle-detach ──────────────────────────
 
-def test_on_tool_call_end_curates_on_memory_store_success():
-    pool = _pool_with_workspace("/ws")
-    calls = []
-    pool._curate_memories = lambda: (calls.append(1), 1)[1]
-    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="store_memory", success=True)))
-    assert calls == [1]
-
-
-def test_on_tool_call_end_ignores_non_memory_and_failures():
-    pool = _pool_with_workspace("/ws")
-    calls = []
-    pool._curate_memories = lambda: (calls.append(1), 1)[1]
-    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="web_search", success=True)))
-    asyncio.run(pool._on_tool_call_end(SimpleNamespace(tool_name="store_memory", success=False)))
-    assert calls == []
+def _curator_pool(ws):
+    pool = _pool_with_workspace(ws)
+    pool._curator_task = None
+    pool._internal_conn = lambda: {"url": "ws://x"}   # avoid touching _ws_config
+    return pool
 
 
-def test_curate_memories_noop_without_workspace():
-    assert _pool_with_workspace("")._curate_memories() == 0
+def test_curate_memories_bg_noop_without_workspace():
+    pool = _curator_pool("")
+    asyncio.run(pool.curate_memories_bg())
+    assert pool._curator_task is None
 
 
-def test_curate_memories_promotes_raw_to_curated(tmp_path):
+def test_curate_memories_bg_skips_empty_raw_queue(monkeypatch):
+    import jaato_client_telegram.session_pool as sp
+    monkeypatch.setattr(sp, "raw_memory_count", lambda ws: 0)
+    pool = _curator_pool("/ws")
+    asyncio.run(pool.curate_memories_bg())
+    assert pool._curator_task is None   # empty queue → no LLM woken
+
+
+def test_curate_memories_bg_runs_when_raw_exists(monkeypatch):
+    import jaato_client_telegram.session_pool as sp
+    monkeypatch.setattr(sp, "raw_memory_count", lambda ws: 3)
+    ran = []
+
+    async def fake_run_curator(conn):
+        ran.append(conn)
+
+    monkeypatch.setattr(sp, "run_curator", fake_run_curator)
+    pool = _curator_pool("/ws")
+
+    async def go():
+        await pool.curate_memories_bg()
+        assert pool._curator_task is not None
+        await pool._curator_task   # let the background drain finish
+
+    asyncio.run(go())
+    assert ran == [{"url": "ws://x"}]
+
+
+def test_curate_memories_bg_skips_when_already_running(monkeypatch):
+    import jaato_client_telegram.session_pool as sp
+    checked = []
+    monkeypatch.setattr(sp, "raw_memory_count", lambda ws: checked.append(1) or 5)
+    pool = _curator_pool("/ws")
+
+    async def go():
+        pool._curator_task = asyncio.create_task(asyncio.sleep(1))
+        await pool.curate_memories_bg()   # a drain is in flight → skip
+        pool._curator_task.cancel()
+
+    asyncio.run(go())
+    assert checked == []   # returned before even reading the raw count
+
+
+def test_raw_memory_count_reads_store(tmp_path):
     import pytest
     pytest.importorskip("shared.plugins.memory")  # needs jaato-server installed
     from shared.plugins.memory.models import MATURITY_RAW, Memory
     from shared.plugins.memory.storage import MemoryStore
+
+    from jaato_client_telegram.curator import raw_memory_count
 
     store = MemoryStore(str(tmp_path / ".jaato" / "memories"))
     store.save(Memory(
@@ -217,13 +254,7 @@ def test_curate_memories_promotes_raw_to_curated(tmp_path):
         tags=["pref"], timestamp="2026-06-30T00:00:00", maturity=MATURITY_RAW,
         source_agent="telegram_chat",
     ))
-    assert len(store.list_raw()) == 1
-
-    promoted = _pool_with_workspace(tmp_path)._curate_memories()
-    assert promoted == 1
-    assert store.list_raw() == []
-    curated = store.load_curated()
-    assert len(curated) == 1 and curated[0].maturity == "validated"
+    assert raw_memory_count(tmp_path) == 1
 
 
 if __name__ == "__main__":
