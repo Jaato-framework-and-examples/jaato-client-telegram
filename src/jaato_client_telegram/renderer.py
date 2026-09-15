@@ -201,6 +201,9 @@ class StreamingContext:
     stalled: bool = False  # Did the stream go silent (no events) past the stall timeout?
     turn_lost: bool = False  # Stalled specifically because a mid-turn reconnect discarded
     # the in-flight turn (turn never started after the reattach) — the pump re-sends once.
+    budget_exhausted: bool = False  # The session hit its budget_control ceiling
+    # (SessionTerminatedEvent reason=budget_exhausted) — it refuses further turns, so
+    # the pump forgets it (next message starts fresh). The 💸 hint is already sent.
 
     # Buffer for text chunks in arrival order
     text_buffer: list[str] = field(default_factory=list)
@@ -862,6 +865,24 @@ class ResponseRenderer:
                             ctx.model_audio_mime[sid] = mime
                     if getattr(event, "final", False):
                         await self._flush_model_audio(initial_message, ctx, sid)
+
+            elif event_type == EventType.SESSION_TERMINATED:
+                # A budget_control ceiling was hit: the server refuses this and all
+                # further turns and emits SessionTerminatedEvent(reason=
+                # budget_exhausted). Surface it as a chat hint and flag it so the
+                # pump forgets the session (the next message starts fresh — the
+                # ceiling is per-session). Other terminate reasons (natural /
+                # client_request / error) are handled elsewhere; only budget gets
+                # this hint. (Gentler budget hints await framework #1069.)
+                if getattr(event, "reason", "") == "budget_exhausted":
+                    await self._emit_segments(initial_message, ctx, flush=True, final=True)
+                    await self._send_chat_hint(
+                        initial_message, ctx,
+                        "💸 <i>budget ceiling reached — send a new message to start fresh</i>",
+                    )
+                    ctx.budget_exhausted = True
+                    ctx.content_sent = True
+                    break
 
             elif event_type == EventType.AGENT_COMPLETED:
                 # Agent completed - emit everything remaining, including the tail.
