@@ -354,11 +354,19 @@ write_env(){ info "Write secrets (chmod 600)"
   [ -z "$store_tok" ] && [ -f "$BOT_ENV" ] && \
     store_tok=$(sed -n 's/^JAATO_TOOLSTORE_GH_TOKEN=//p' "$BOT_ENV" | head -1)
   printf '%s' "$WS_TOKEN" > "$WS_TOKEN_FILE"
-  # server.env holds ONLY the daemon-global WS bearer token. Provider keys are
-  # PER-CLIENT (written to the bot's workspace .env below), so the shared daemon
-  # carries no provider secret and a second WS client (e.g. web-coder) on the
-  # same daemon never inherits the bot's keys.
-  printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN" > "$SERVER_ENV"
+  # server.env holds daemon-global config only: the WS bearer token, plus any
+  # daemon-scoped TELEMETRY config (enablement toggles, backend, LANGFUSE_HOST,
+  # OTEL_* endpoints) carried forward from a prior deploy. Provider keys and the
+  # per-client Langfuse KEYS are NOT here — they go to the bot's workspace .env
+  # below, so the shared daemon carries no per-client secret and a second WS
+  # client (e.g. web-coder) never inherits the bot's keys. Telemetry config is
+  # operator-managed (never generated); we preserve it rather than drop it.
+  { printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
+    if [ -f "$SERVER_ENV" ]; then
+      grep -E '^(JAATO_TELEMETRY_|LANGFUSE_HOST|OTEL_)' "$SERVER_ENV" || true
+    fi
+  } > "$SERVER_ENV.tmp"
+  mv "$SERVER_ENV.tmp" "$SERVER_ENV"
 
   # Provider keys -> <workspace>/.env: the SDK sends env_file=<workspace>/.env and
   # the daemon overlays it per-SESSION over its own env (a key present here wins;
@@ -523,9 +531,9 @@ plugins:
   - clarification
   - web_search
   - web_fetch
-  - references
+  - "references(mode:preload, tools:[listReferences, selectReferences])"
   - result_grep
-  - memory
+  - "memory(mode:preload, tools:[store_memory, retrieve_memories])"
   - waypoint
   - file_edit
   - filesystem_query
