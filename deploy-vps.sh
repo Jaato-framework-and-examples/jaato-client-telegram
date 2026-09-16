@@ -354,14 +354,32 @@ write_env(){ info "Write secrets (chmod 600)"
   [ -z "$store_tok" ] && [ -f "$BOT_ENV" ] && \
     store_tok=$(sed -n 's/^JAATO_TOOLSTORE_GH_TOKEN=//p' "$BOT_ENV" | head -1)
   printf '%s' "$WS_TOKEN" > "$WS_TOKEN_FILE"
-  { printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
+  # server.env holds ONLY the daemon-global WS bearer token. Provider keys are
+  # PER-CLIENT (written to the bot's workspace .env below), so the shared daemon
+  # carries no provider secret and a second WS client (e.g. web-coder) on the
+  # same daemon never inherits the bot's keys.
+  printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN" > "$SERVER_ENV"
+
+  # Provider keys -> <workspace>/.env: the SDK sends env_file=<workspace>/.env and
+  # the daemon overlays it per-SESSION over its own env (a key present here wins;
+  # an absent key falls through to the daemon env). MERGE — preserve lines we do
+  # not manage (e.g. hand-added LANGFUSE_* telemetry keys) instead of truncating.
+  local ws_env="$WORKSPACE/.env"; mkdir -p "$WORKSPACE"
+  local drop="^(JAATO_WS_TOKEN"
+  [ -n "$EXEC_ENVVAR" ]   && drop="$drop|$EXEC_ENVVAR"
+  [ -n "$VISION_ENVVAR" ] && drop="$drop|$VISION_ENVVAR"
+  [ -n "$CODER_ENVVAR" ]  && drop="$drop|$CODER_ENVVAR"
+  drop="$drop)="
+  { if [ -f "$ws_env" ]; then grep -vE "$drop" "$ws_env" || true; fi
     [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$EXEC_KEY"
     [ -n "$VISION_ENVVAR" ] && [ "$VISION_ENVVAR" != "$EXEC_ENVVAR" ] \
         && printf '%s=%s\n' "$VISION_ENVVAR" "$VISION_KEY"
     [ -n "$CODER_ENVVAR" ] && [ "$CODER_ENVVAR" != "$EXEC_ENVVAR" ] \
         && [ "$CODER_ENVVAR" != "$VISION_ENVVAR" ] \
         && printf '%s=%s\n' "$CODER_ENVVAR" "$CODER_KEY"
-  } > "$SERVER_ENV"
+    true
+  } > "$ws_env.tmp"
+  mv "$ws_env.tmp" "$ws_env"
   { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TG_TOKEN"
     printf 'JAATO_WS_TOKEN=%s\n' "$WS_TOKEN"
     printf 'JAATO_TG_WORKSPACE=%s\n' "$WORKSPACE"
@@ -369,7 +387,7 @@ write_env(){ info "Write secrets (chmod 600)"
     printf 'JAATO_TG_SESSION_STORE=%s\n' "$SESSION_STORE"
     [ -n "$store_tok" ] && printf 'JAATO_TOOLSTORE_GH_TOKEN=%s\n' "$store_tok"
   } > "$BOT_ENV"
-  chmod 600 "$WS_TOKEN_FILE" "$SERVER_ENV" "$BOT_ENV"
+  chmod 600 "$WS_TOKEN_FILE" "$SERVER_ENV" "$BOT_ENV" "$ws_env"
 }
 
 # ── 5b. Seed curated host tools (repo is the source of truth) ─────────────────
