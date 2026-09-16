@@ -197,7 +197,12 @@ def _wake_prompt(text: str) -> str:
         f"This is a fresh firing for TODAY ({day}); any identical reminders "
         f"earlier in the conversation were on previous days, not this one. "
         f"Reminder: \"{text}\". Let the user know now and take any action it "
-        f"implies, treating the date above as \"today\"."
+        f"implies, treating the date above as \"today\". "
+        f"CRITICAL - run this reminder EXACTLY ONCE per firing. Call each "
+        f"tool it needs AT MOST ONCE, deliver your single reply, then STOP "
+        f"and end the turn with NO further tool calls. Do NOT re-fetch, "
+        f"re-run any tool, or repeat the reminder: once you have answered "
+        f"this firing, it is DONE."
     )
 
 

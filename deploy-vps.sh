@@ -521,6 +521,24 @@ plugins:
   - prompt_library
   - environment
 max_turns: 12
+
+# Agent-economics ceiling for the whole chat SESSION (cumulative usd/tool_calls,
+# persists across reload). LOW by design: a normal conversation never trips it; a
+# runaway does — e.g. a wake reminder that loops on the pricey audio tier (the
+# 2026-09-16 incident, which $15 was too high to catch: it exceeded the account
+# balance so the model drained credits first). finalize@90 injects "wrap up and
+# answer"; abort@100 is the backstop, surfacing as
+# SessionTerminatedEvent(reason=budget_exhausted) → the "💸 budget" chat hint.
+budget_control:
+  limits:
+    usd: 3
+    tool_calls: 1500
+  degrade:
+    - at: 90
+      action: finalize
+    - at: 100
+      action: abort
+
 plugin_configs:
   memory:
     # Single shared workspace => "project" scope already spans all of a user's
