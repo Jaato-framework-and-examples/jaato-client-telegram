@@ -86,6 +86,16 @@ else C_G=; C_Y=; C_R=; C_B=; C_0=; fi
 info(){ printf '%s\n' "${C_G}${C_B}▶${C_0} $*"; }
 warn(){ printf '%s\n' "${C_Y}⚠ $*${C_0}" >&2; }
 die(){  printf '%s\n' "${C_R}✗ $*${C_0}" >&2; exit 1; }
+# Echo the secret URI already configured for a managed key in <env-file>, else
+# the collected value.  A value like ``pass://…`` / ``vault://…`` is deliberate
+# operator configuration that the DAEMON resolves at session time; a redeploy
+# must never silently downgrade a secrets-manager setup back to a literal key
+# on disk.  Plain values keep being refreshed from collect() as before.
+secret_uri_or(){ # <env-file> <VAR> <collected-value>
+  local cur=""
+  [ -f "$1" ] && cur=$(sed -n "s|^$2=\(.*://.*\)$|\1|p" "$1" | head -1)
+  printf '%s' "${cur:-$3}"
+}
 have(){ command -v "$1" >/dev/null 2>&1; }
 ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "  $p [$d]: " a; printf '%s' "${a:-$d}"
        else read -rp "  $p: " a; printf '%s' "$a"; fi; }
@@ -207,6 +217,14 @@ install_framework(){
 }
 
 install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
+  # A full run RECREATES the venv, wiping anything installed outside this
+  # script — notably the private jaato-premium wheel, which supplies the
+  # pass:// / vault:// secret RESOLVERS.  This script stays premium-free by
+  # design, but losing the resolver is SILENT: every secret URI is then handed
+  # to the provider literally and the next turn 401s.  Record it here, report
+  # it at the end so the operator knows to reinstall.
+  PREMIUM_WAS=""
+  [ -x "$PYV" ] && PREMIUM_WAS=$("$PYV" -c 'import importlib.metadata as m; print(m.version("jaato-premium"))' 2>/dev/null || true)
   # uv-managed venv (recreated on re-run; reinstall below repopulates it).
   uv venv --python "$PYTHON_BIN" "$VENV"
   install_framework
@@ -371,12 +389,12 @@ write_env(){ info "Write secrets (chmod 600)"
   [ -n "$CODER_ENVVAR" ]  && drop="$drop|$CODER_ENVVAR"
   drop="$drop)="
   { if [ -f "$ws_env" ]; then grep -vE "$drop" "$ws_env" || true; fi
-    [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$EXEC_KEY"
+    [ -n "$EXEC_ENVVAR" ]   && printf '%s=%s\n' "$EXEC_ENVVAR" "$(secret_uri_or "$ws_env" "$EXEC_ENVVAR" "$EXEC_KEY")"
     [ -n "$VISION_ENVVAR" ] && [ "$VISION_ENVVAR" != "$EXEC_ENVVAR" ] \
-        && printf '%s=%s\n' "$VISION_ENVVAR" "$VISION_KEY"
+        && printf '%s=%s\n' "$VISION_ENVVAR" "$(secret_uri_or "$ws_env" "$VISION_ENVVAR" "$VISION_KEY")"
     [ -n "$CODER_ENVVAR" ] && [ "$CODER_ENVVAR" != "$EXEC_ENVVAR" ] \
         && [ "$CODER_ENVVAR" != "$VISION_ENVVAR" ] \
-        && printf '%s=%s\n' "$CODER_ENVVAR" "$CODER_KEY"
+        && printf '%s=%s\n' "$CODER_ENVVAR" "$(secret_uri_or "$ws_env" "$CODER_ENVVAR" "$CODER_KEY")"
     true
   } > "$ws_env.tmp"
   mv "$ws_env.tmp" "$ws_env"
@@ -692,6 +710,16 @@ JSON
 # ── 8. systemd units (server + bot) — system-wide as root, else --user ───────
 install_units(){ info "Install systemd units ($SYSTEMD_MODE mode)"
   mkdir -p "$UNIT_DIR"
+  # jaato-server 1.0 folded the top-level ``server`` module into ``jaato_server``
+  # and ships a ``jaato-server`` console script as the supported entry point, so
+  # a unit hardcoding ``-m server`` silently stops starting on an upgrade.  Ask
+  # the framework we just installed which entry point it actually provides, and
+  # fail loudly if neither is there rather than writing a unit that dies at boot.
+  local srv_exec
+  if [ -x "$VENV/bin/jaato-server" ]; then srv_exec="$VENV/bin/jaato-server"
+  elif "$PYV" -c 'import server' >/dev/null 2>&1; then srv_exec="$PYV -m server"
+  else die "no jaato-server entry point in $VENV (neither bin/jaato-server nor a top-level 'server' module) — did install_framework run?"
+  fi
   cat > "$UNIT_DIR/jaato-server.service" <<UNIT
 [Unit]
 Description=jaato server (WebSocket daemon for the Telegram bot)
@@ -700,7 +728,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=$SERVER_ENV
-ExecStart=$PYV -m server --web-socket :$WS_PORT --ws-token-file $WS_TOKEN_FILE
+ExecStart=$srv_exec --web-socket :$WS_PORT --ws-token-file $WS_TOKEN_FILE
 Restart=on-failure
 RestartSec=5
 [Install]
@@ -881,5 +909,12 @@ main(){
   preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
   install_units; start_and_check
   printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
+  if [ -n "${PREMIUM_WAS:-}" ]; then
+    warn "jaato-premium $PREMIUM_WAS was installed in the previous venv and this rebuild REMOVED it.
+  It provides the pass:// / vault:// secret resolvers; without it those URIs reach the provider
+  literally and every turn 401s.  Reinstall the wheel, then restart the daemon:
+    uv pip install --python $PYV --no-deps /path/to/jaato_premium-<version>-py3-none-any.whl
+    systemctl restart jaato-server"
+  fi
 }
 main "$@"
