@@ -94,7 +94,16 @@ async def audio_to_mp3(data: bytes) -> bytes | None:
     turn produces a >1 MiB frame that blows the client's default WebSocket
     ``max_size`` (1 MiB) and drops the connection mid-turn. MP3 at 64 kbps mono is
     ~10× smaller (a 41 s note is ~0.3 MB), keeping the echo well under the cap while
-    staying plenty for speech. Down-mix to mono 16 kHz. Returns MP3 bytes, or
+    staying plenty for speech.
+
+    STILL LOAD-BEARING — do not drop this transcode because the server limit was
+    raised. The daemon gained ``--ws-max-message-size`` (this deployment runs
+    16 MiB), but the ceiling that actually breaks is the CLIENT's: the SDK passes
+    no ``max_size`` to ``websockets.connect``, so receives are still capped at the
+    1 MiB default and a larger echo closes the socket with 1009 exactly as before.
+    The two ends cannot currently be set consistently — tracked as jaato#1279.
+
+    Down-mix to mono 16 kHz. Returns MP3 bytes, or
     ``None`` if ffmpeg is missing or fails (the caller then sends the original
     bytes, which 400s — no worse than doing nothing)."""
     if not data:
