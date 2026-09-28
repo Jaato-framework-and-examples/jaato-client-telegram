@@ -28,7 +28,9 @@ confined runner cannot write there) and are loaded at startup without re-prompt.
 
 import asyncio
 import contextvars
+import hashlib
 import importlib
+import inspect
 import logging
 import re
 import sys
@@ -717,8 +719,56 @@ def mark_user_installed(schema: dict) -> dict:
     return marked
 
 
+# path -> (source digest, {schema, execute}).  Keyed on the file's CONTENT, not
+# its mtime: the register_tool path overwrites a tool and reloads it within the
+# same second, and that is exactly what a coarse mtime cannot see (the defect
+# test_host_tool_reload.py exists for, one layer down).  A digest answers the
+# question the cache is really asking — has the code changed — and a host tool
+# is a few KB, so re-reading it per session costs nothing measurable.
+_TOOL_CACHE: dict[Path, tuple[bytes, dict]] = {}
+
+
+def _release_tool(path: Path, entry: dict) -> None:
+    """Let a tool module release background work before we drop our last
+    reference to it.  ``execute.__globals__`` IS the module namespace, so an
+    optional module-level ``on_unload()`` is reachable there.
+
+    This is load-bearing rather than tidy: a tool's ``asyncio`` task is owned by
+    the EVENT LOOP, not by the module that created it, so a module replaced
+    without this keeps its timers running forever with nothing left that can
+    see — let alone cancel — them.  That is how one daily reminder became six
+    (each reload armed another copy while the previous one stayed live).
+    """
+    hook = entry.get("execute").__globals__.get("on_unload")
+    if hook is None:
+        return
+    try:
+        result = hook()
+        if inspect.isawaitable(result):
+            # Tolerated, not encouraged: cancelling a task is synchronous.
+            try:
+                asyncio.get_running_loop().create_task(result)
+            except RuntimeError:
+                result.close()
+    except Exception:  # noqa: BLE001 — a bad unload must not block the reload
+        logger.exception("host tool %s on_unload failed", path.name)
+
+
 def load_all_tools(host_tools_dir: Path) -> dict[str, dict]:
     """Load every ``*.py`` in ``host_tools_dir`` → ``{name: {schema, execute}}``.
+
+    A file whose CONTENT is unchanged since the last call returns the SAME
+    module object rather than a freshly compiled one.  That is not an
+    optimisation: this function is called on every session creation and on every
+    re-registration, and a fresh module gets fresh module-level state, so any
+    tool holding background work (a timer, a task, a connection) had one live
+    copy per call with no way to reach the previous ones.
+
+    A changed file still reloads immediately — the digest sees a same-second
+    overwrite that an mtime cannot — and the outgoing module is given
+    ``on_unload()`` first.  A file that FAILS to load is not cached, so a tool
+    whose dependency is pip-installed a moment later is retried on the next call
+    instead of staying broken until the bot restarts.
 
     Invalid files are skipped with a warning so one bad tool never blocks the
     bot. Returns an empty dict if the directory does not exist.
@@ -726,19 +776,41 @@ def load_all_tools(host_tools_dir: Path) -> dict[str, dict]:
     tools: dict[str, dict] = {}
     if not host_tools_dir.is_dir():
         return tools
-    # A tool's deps may have just been pip-installed into the tools venv (on
-    # sys.path) by the confined runner. Drop importlib's finder caches so a tool
-    # importing that fresh package resolves on this (re)load instead of failing
-    # until the next bot restart.
-    importlib.invalidate_caches()
+    seen: set[Path] = set()
+    invalidated = False
     for path in sorted(host_tools_dir.glob("*.py")):
         if path.name.startswith("_"):
             continue
+        try:
+            digest = hashlib.sha256(path.read_bytes()).digest()
+        except OSError as e:  # noqa: BLE001 — unreadable file, skip like a bad one
+            logger.warning("Skipping unreadable host tool %s: %s", path.name, e)
+            continue
+        seen.add(path)
+        cached = _TOOL_CACHE.get(path)
+        if cached is not None and cached[0] == digest:
+            tools[cached[1]["schema"]["name"]] = cached[1]
+            continue
+        if not invalidated:
+            # A tool's deps may have just been pip-installed into the tools venv
+            # (on sys.path) by the confined runner. Drop importlib's finder
+            # caches so a tool importing that fresh package resolves on this
+            # (re)load instead of failing until the next bot restart.
+            importlib.invalidate_caches()
+            invalidated = True
+        if cached is not None:
+            _release_tool(path, cached[1])
+            _TOOL_CACHE.pop(path, None)
         try:
             schema, execute = load_tool_file(path)
         except Exception as e:  # noqa: BLE001 — skip bad files
             logger.warning("Skipping invalid host tool %s: %s", path.name, e)
             continue
-        tools[schema["name"]] = {"schema": schema, "execute": execute}
+        entry = {"schema": schema, "execute": execute}
+        _TOOL_CACHE[path] = (digest, entry)
+        tools[schema["name"]] = entry
         logger.info("Loaded dynamic host tool %r from %s", schema["name"], path.name)
+    for gone in set(_TOOL_CACHE) - seen:
+        _release_tool(gone, _TOOL_CACHE[gone][1])
+        _TOOL_CACHE.pop(gone, None)
     return tools
