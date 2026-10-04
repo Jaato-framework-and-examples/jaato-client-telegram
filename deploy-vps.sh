@@ -152,7 +152,29 @@ ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "  $p [$d]: " a;
        else read -rp "  $p: " a; printf '%s' "$a"; fi; }
 ask_secret(){ local p="$1" a; read -rsp "  $p: " a; printf '\n' >&2; printf '%s' "$a"; }
 confirm(){ local a; read -rp "  $1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]; }
-scaffold(){ "$PYV" -m shared.scaffold "$@"; }   # available after install()
+# The framework's own module paths, for the layout the INSTALLED framework has.
+# 1.0 moved the top-level `shared`/`server` packages under `jaato_server`, and
+# pinning an older framework is documented above (JAATO_SERVER_VERSION=0.11.0) --
+# install_units already asks the same question for the server's entry point.
+# Resolved ONCE, after install(), into globals that the pipelines below inherit.
+#
+# Neither layout is said here, by name, because every later symptom lies: the
+# scaffold call sites discard stderr, so a missing module used to surface as
+# "scaffold explain returned no providers" or "profile validation failed -- fix
+# the profile", and the readiness probe never succeeded and just moved on.
+resolve_fw_layout(){
+  if "$PYV" -c 'import jaato_server' >/dev/null 2>&1; then
+    FW_SCAFFOLD_MOD=jaato_server.shared.scaffold; FW_SERVER_MOD=jaato_server
+  elif "$PYV" -c 'import server' >/dev/null 2>&1; then
+    FW_SCAFFOLD_MOD=shared.scaffold; FW_SERVER_MOD=server
+  else
+    die "no jaato framework importable from $PYV -- neither the 1.x 'jaato_server' package nor the pre-1.0 top-level 'server' (did install_framework run?)"
+  fi
+}
+scaffold(){
+  [ -n "${FW_SCAFFOLD_MOD:-}" ] || die "internal: framework layout not resolved before scaffold()"
+  "$PYV" -m "$FW_SCAFFOLD_MOD" "$@"
+}
 
 # ── 1. Preflight ─────────────────────────────────────────────────────────────
 _pkg_mgr(){ local m; for m in apt-get dnf yum pacman zypper; do have "$m" && { printf '%s' "$m"; return; }; done; }
@@ -286,6 +308,7 @@ install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
   # TestPyPI here: the bot's own deps (aiogram, …) must come from PyPI only.
   uv pip install --python "$PYV" -e "$BOT_DIR"
   printf '  editable: jaato-client-telegram (its own deps from PyPI)\n'
+  resolve_fw_layout
 }
 
 # The provider's key env-var name, discovered from `scaffold explain env`
@@ -832,7 +855,7 @@ PY
 }
 start_and_check(){ info "Start server + health check"
   _sc restart jaato-server.service
-  for _ in $(seq 1 30); do "$PYV" -m server --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
+  for _ in $(seq 1 30); do "$PYV" -m "$FW_SERVER_MOD" --web-socket ":$WS_PORT" --status >/dev/null 2>&1 && break; sleep 1; done
 
   info "  validate profile (jaato-scaffold validate)"
   scaffold validate "$LEAF_PROFILE_FILE" || die "profile validation failed (see above) — fix the profile and re-run"
