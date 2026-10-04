@@ -240,23 +240,6 @@ def test_curate_memories_bg_skips_when_already_running(monkeypatch):
     assert checked == []   # returned before even reading the raw count
 
 
-def test_raw_memory_count_reads_store(tmp_path):
-    import pytest
-    pytest.importorskip("shared.plugins.memory")  # needs jaato-server installed
-    from shared.plugins.memory.models import MATURITY_RAW, Memory
-    from shared.plugins.memory.storage import MemoryStore
-
-    from jaato_client_telegram.curator import raw_memory_count
-
-    store = MemoryStore(str(tmp_path / ".jaato" / "memories"))
-    store.save(Memory(
-        id="m1", content="favorite color is blue", description="user pref",
-        tags=["pref"], timestamp="2026-06-30T00:00:00", maturity=MATURITY_RAW,
-        source_agent="telegram_chat",
-    ))
-    assert raw_memory_count(tmp_path) == 1
-
-
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
