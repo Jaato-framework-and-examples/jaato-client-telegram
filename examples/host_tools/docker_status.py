@@ -24,7 +24,7 @@ async def execute(args: dict, ctx) -> dict:
     all_containers = args.get("all", False)
     filter_name = args.get("filter_name", "")
 
-    cmd = ["docker", "ps", "-a" if all_containers else "ps",
+    cmd = ["docker", "ps", *(["-a"] if all_containers else []),
            "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}"]
 
     try:
