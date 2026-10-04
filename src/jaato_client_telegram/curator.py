@@ -38,22 +38,39 @@ CURATOR_TIMEOUT = 240.0
 
 
 def raw_memory_count(workspace: Path) -> int:
-    """How many RAW (un-judged) memories the bot's store holds — the gate for
+    """How many RAW (un-judged) memories the bot's store holds -- the gate for
     running the curator at all (no point waking an LLM for an empty queue).
 
-    Reads the same workspace store the memory plugin uses (`.jaato/memories`).
-    Returns 0 if the server's memory package isn't importable in the bot env, so
-    the bot simply skips curation rather than failing."""
+    Counts ``<workspace>/.jaato/memories/raw/*.json`` the way the framework's own
+    raw store enumerates it (``list_all``): one file per raw memory, ``.json``
+    only -- the atomic writer's ``.tmp`` files are not memories. An ABSENT
+    directory is an empty queue, not an error: the store creates ``raw/`` lazily
+    on its first write, so a workspace that never stored a raw memory has none.
+
+    It reads the files instead of importing the framework's store because the bot
+    runs from its own venv with only ``jaato-sdk``. That import used to be here,
+    as ``shared.plugins.memory.storage`` -- a jaato-server INTERNAL, under its
+    pre-1.0 name, so it had been dead since 1.0 behind ``except Exception:
+    return 0`` at DEBUG: a broken gate read exactly like an empty queue.
+    ``test_curator_raw_count.py`` now holds this count equal to ``list_raw()``
+    wherever the framework is installed, so a change to the store's layout fails
+    a test instead of silently reading as "nothing to curate".
+
+    A directory that exists but cannot be read is NOT an empty queue: it is
+    logged at WARNING and skipped for this sweep -- visible (after moving the
+    bot to its own account, a wrong owner shows up exactly here) without
+    disturbing the chats. It over-counts a corrupt ``.json`` that ``list_raw``
+    would skip; for a gate that is the safe direction -- the curator wakes and
+    finds nothing, rather than never waking.
+    """
+    raw_dir = Path(workspace) / ".jaato" / "memories" / "raw"
     try:
-        from shared.plugins.memory.storage import MemoryStore
-    except Exception:
-        log.debug("curator: shared.plugins.memory unavailable — skipping", exc_info=True)
+        return sum(1 for entry in raw_dir.iterdir() if entry.suffix == ".json")
+    except FileNotFoundError:
         return 0
-    try:
-        store = MemoryStore(f"{str(workspace).rstrip('/')}/.jaato/memories")
-        return len(store.list_raw())
-    except Exception:  # noqa: BLE001 — store read boundary
-        log.debug("curator: could not read the raw queue", exc_info=True)
+    except OSError:
+        log.warning("curator: cannot read the raw memory queue at %s -- "
+                    "skipping curation this sweep", raw_dir, exc_info=True)
         return 0
 
 
