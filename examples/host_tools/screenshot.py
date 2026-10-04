@@ -6,6 +6,10 @@ import tempfile
 import time
 from datetime import datetime
 
+# PyPI packages this tool imports. deploy-vps.sh installs them into the
+# workspace tool-venv; the tool store publishes them as the entry's `deps`.
+TOOL_DEPS = ['pillow']
+
 TOOL_SCHEMA = {
     "name": "screenshot",
     "description": "Render a Telegram-style chat screenshot from provided messages. "

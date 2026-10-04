@@ -2,6 +2,10 @@
 import json, io
 from PIL import Image, ImageDraw, ImageFont
 
+# PyPI packages this tool imports. deploy-vps.sh installs them into the
+# workspace tool-venv; the tool store publishes them as the entry's `deps`.
+TOOL_DEPS = ['pillow']
+
 TOOL_SCHEMA = {
     "name": "ttt",
     "description": "Tic-tac-toe game. Actions: 'new' (start game), 'move' (place X/O at position 1-9). Sends board image with inline keyboard to Telegram.",

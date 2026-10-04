@@ -105,6 +105,10 @@ resolve_bot_paths(){
   fi
   BOT_PYV="$BOT_VENV/bin/python"
   WORKSPACE="$BOT_DIR/runtime"
+  # The venv host tools import their PyPI deps from. MUST match the profile's
+  # plugin_configs.<notebook|cli|interactive_shell>.workspace_venv and the bot
+  # config's jaato_ws.host_tools_venv (write_profile / write_bot_config).
+  TOOLS_VENV="$WORKSPACE/.jaato/tool-venv"
   # Profiles are a base + a per-provider SET leaf (see write_profile). The bot
   # selects the leaf by QUALIFIED PATH ("<set>/telegram_chat"). SET_NAME/leaf
   # paths are derived in collect()/write_profile once the provider is known.
@@ -616,6 +620,45 @@ seed_host_tools(){ info "Seed curated host tools -> $HOST_TOOLS_DIR"
   printf '  seeded/refreshed %d curated tool(s); foreign tools left untouched\n' "$n"
 }
 
+# ── 5c. Host tools' PyPI deps -> the workspace tool-venv ─────────────────────
+# A host tool runs inside the BOT process, which imports third-party packages
+# from the workspace tool-venv (jaato_ws.host_tools_venv, prepended to sys.path)
+# -- never from the bot's own venv, which a full deploy recreates.  Each tool
+# declares what it imports as a module-level TOOL_DEPS = [...] (PyPI names), the
+# same field the tool store publishes as `deps`.  Read from EVERY tool in
+# $HOST_TOOLS_DIR, curated and runtime-installed alike, and read statically: a
+# tool whose deps are missing is exactly the one that cannot be imported yet.
+# Until the bot had its own venv these tools borrowed the framework venv's
+# packages, so a missing declaration went unnoticed.
+# A missing tool-venv is created the way the framework creates it (stdlib venv,
+# no pip, system site-packages), so the runner finds it and reuses it.
+install_tool_deps(){
+  local deps
+  deps=$("$PYTHON_BIN" - "$HOST_TOOLS_DIR" <<'PY'
+import ast, pathlib, sys
+seen = []
+for f in sorted(pathlib.Path(sys.argv[1]).glob("*.py")):
+    try:
+        body = ast.parse(f.read_text()).body
+    except SyntaxError as e:
+        sys.exit(f"{f}: cannot parse ({e}) -- fix or remove the tool")
+    for node in body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "TOOL_DEPS" for t in node.targets):
+            for dep in ast.literal_eval(node.value):
+                if dep not in seen:
+                    seen.append(dep)
+print("\n".join(seen))
+PY
+) || die "could not read TOOL_DEPS from the host tools in $HOST_TOOLS_DIR"
+  [ -n "$deps" ] || { info "Host tools declare no PyPI deps"; return 0; }
+  info "Host tools' PyPI deps -> $TOOLS_VENV: $(printf '%s ' $deps)"
+  [ -x "$TOOLS_VENV/bin/python" ] \
+    || "$PYTHON_BIN" -m venv --without-pip --system-site-packages "$TOOLS_VENV"
+  # shellcheck disable=SC2086  # one PyPI name per word, by construction
+  uv pip install --python "$TOOLS_VENV/bin/python" $deps
+}
+
 # ── 6. Customize the agent profile (env-resolved keys; no secret inlined) ─────
 # Profiles are written as a PROVIDER-AGNOSTIC base + a per-provider SET leaf.
 # The leaf `inherits: [_base_telegram_chat]` and is selected by the bot via the
@@ -1112,7 +1155,7 @@ main(){
   check_bot_location
   backup_noncode
   preflight; ensure_bot_user; own_bot_home
-  fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
+  fetch; install; collect; write_env; seed_host_tools; install_tool_deps; write_profile; write_whitelist; write_bot_config; write_wake_json
   own_bot_home
   install_units; start_and_check
   local logs="journalctl -u jaato-tg -f"; [ "$SYSTEMD_MODE" = user ] && logs="journalctl --user -u jaato-tg -f"
