@@ -9,6 +9,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from zoneinfo import ZoneInfo
 
+# PyPI packages this tool imports. deploy-vps.sh installs them into the
+# workspace tool-venv; the tool store publishes them as the entry's `deps`.
+TOOL_DEPS = ['numpy', 'pillow', 'skyfield']
+
 TOOL_SCHEMA = {
     "name": "moon_phase",
     "description": "Show today's moon phase with a realistic PIL-rendered image and illumination percentage. Sends the result as a photo to Telegram.",

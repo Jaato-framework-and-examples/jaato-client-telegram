@@ -1,6 +1,10 @@
 """YouTube search tool — returns top results as a formatted list."""
 import json
 
+# PyPI packages this tool imports. deploy-vps.sh installs them into the
+# workspace tool-venv; the tool store publishes them as the entry's `deps`.
+TOOL_DEPS = ['youtube-search']
+
 TOOL_SCHEMA = {
     "name": "youtube_search",
     "description": "Search YouTube and return the top matching videos with titles, URLs, durations, channels, and view counts.",
