@@ -40,6 +40,11 @@
 # Override anything via env, e.g.:
 #   JAATO_SERVER_VERSION=0.11.0 JAATO_SDK_VERSION=0.19.0 BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
 #
+# The FRAMEWORK venv lives OUTSIDE the install dir when run as root:
+# /opt/jaato-stack/venv by default (JAATO_VENV_DIR overrides). The bot's checkout
+# and workspace stay under JAATO_INSTALL_DIR ($HOME/jaato-stack). Why, and what to
+# do with a venv still at the old path: see resolve_venv_paths below.
+#
 set -euo pipefail
 
 # ── Config (override via env) ────────────────────────────────────────────────
@@ -58,7 +63,6 @@ WS_PORT="${JAATO_WS_PORT:-8080}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ── Derived paths ────────────────────────────────────────────────────────────
-VENV="$INSTALL_DIR/venv"; PYV="$VENV/bin/python"
 BOT_DIR="$INSTALL_DIR/jaato-client-telegram"   # framework comes from PyPI, not a clone
 WORKSPACE="$BOT_DIR/runtime"
 # Profiles are a base + a per-provider SET leaf (see write_profile). The bot
@@ -79,6 +83,53 @@ else
   SYSTEMD_MODE=user; UNIT_DIR="$HOME/.config/systemd/user"; WANTED_BY="default.target"
 fi
 _sc(){ if [ "$SYSTEMD_MODE" = system ]; then systemctl "$@"; else systemctl --user "$@"; fi; }
+# ── The framework venv ───────────────────────────────────────────────────────
+# Decoupled from $INSTALL_DIR in system mode, and the reason is a framework
+# check, not tidiness.  A root daemon run with `--runner-uid-policy peer` drops
+# each session's runner to the OS user that opened the IPC socket, and REFUSES
+# the session if that user cannot read the interpreter's packages (`jaato-scaffold
+# explain runner-user` lists exactly what it reads).  /root is 0700, so a venv
+# under it is unreachable by any other user whatever the venv's own mode; /opt is
+# traversable.
+#
+# ONLY the venv moves.  The bot's checkout and workspace stay under
+# $INSTALL_DIR: the bot connects as root, so its sessions stay root under `peer`
+# and nothing needs another user to read them -- and its workspace holds the
+# chat history and memories, which /root's 0700 is all that protects (almost
+# every file in it is mode 644).
+#
+# User mode keeps the venv under $INSTALL_DIR: /opt is not writable without
+# root, and a --user deploy has no other OS user to serve.
+resolve_venv_paths(){
+  local default
+  if [ "$SYSTEMD_MODE" = system ]; then default="/opt/jaato-stack/venv"
+  else default="$INSTALL_DIR/venv"; fi
+  VENV="${JAATO_VENV_DIR:-$default}"; PYV="$VENV/bin/python"
+  LEGACY_VENV="$INSTALL_DIR/venv"
+}
+resolve_venv_paths
+
+# A venv still at the pre-decoupling path, while $VENV points elsewhere, must
+# be MOVED -- never rebuilt.  A full run recreates the venv at $VENV, so without
+# this it would build a SECOND copy beside the first (torch alone is several GB)
+# and can fill the disk mid-install; and --framework-only's "run a full deploy
+# first" advice would send the operator straight into that.  It refuses rather
+# than falling back to the legacy copy: a script that quietly kept using the old
+# path would leave the daemon on a venv the peer runners cannot read, with
+# nothing saying so.
+check_venv_location(){
+  [ "$VENV" = "$LEGACY_VENV" ] && return 0     # not decoupled (user mode, or pinned there)
+  [ -e "$VENV" ] && return 0                   # already where it belongs
+  [ -L "$LEGACY_VENV" ] && return 0            # the old path is the post-move symlink
+  [ -d "$LEGACY_VENV" ] || return 0            # fresh box: nothing to collide with
+  die "the framework venv is still at the legacy path $LEGACY_VENV,
+  but this script now installs it at $VENV.  It must be MOVED, not rebuilt
+  (rebuilding beside it needs several GB the disk may not have).
+  Either move it (same filesystem: instant) -- the procedure, including the
+  console-script shebangs that still name the old path, is in the jaato-vps
+  skill under 'Framework venv location' -- or keep it where it is for this run:
+    JAATO_VENV_DIR=$LEGACY_VENV $0 ${*:-}"
+}
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 if [ -t 1 ]; then C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_B=$'\e[1m'; C_0=$'\e[0m'
@@ -145,7 +196,7 @@ preflight(){
   else
     warn "AppArmor not available — the server will run the runner UNCONFINED (fine for a single-tenant VPS)."
   fi
-  printf '  Python %s, git OK. Install dir: %s\n' "$v" "$INSTALL_DIR"
+  printf '  Python %s, git OK. Install dir: %s   Framework venv: %s\n' "$v" "$INSTALL_DIR" "$VENV"
 }
 
 # ── 2. Fetch (clone/update at pinned refs) ───────────────────────────────────
@@ -223,6 +274,8 @@ install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
   # design, but losing the resolver is SILENT: every secret URI is then handed
   # to the provider literally and the next turn 401s.  Record it here, report
   # it at the end so the operator knows to reinstall.
+  check_venv_location
+  mkdir -p "$(dirname "$VENV")"
   PREMIUM_WAS=""
   [ -x "$PYV" ] && PREMIUM_WAS=$("$PYV" -c 'import importlib.metadata as m; print(m.version("jaato-premium"))' 2>/dev/null || true)
   # uv-managed venv (recreated on re-run; reinstall below repopulates it).
@@ -818,7 +871,9 @@ uninstall(){ info "Uninstall ($SYSTEMD_MODE mode)"
   _sc disable --now jaato-tg.service jaato-server.service 2>/dev/null || true
   rm -f "$UNIT_DIR/jaato-tg.service" "$UNIT_DIR/jaato-server.service"
   _sc daemon-reload 2>/dev/null || true
-  warn "Left in place (delete manually if wanted): $INSTALL_DIR, $CFG_DIR, $STATE_DIR"
+  local left="$INSTALL_DIR"
+  case "$VENV/" in "$INSTALL_DIR"/*) ;; *) left="$left, $VENV" ;; esac
+  warn "Left in place (delete manually if wanted): $left, $CFG_DIR, $STATE_DIR"
   info "Services removed."
 }
 
@@ -861,6 +916,7 @@ deploy_code_only(){
 #   TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh --framework-only
 deploy_framework_only(){
   info "Framework-only upgrade -> $VENV (config, profile, persona, bot code untouched)"
+  check_venv_location --framework-only
   [ -d "$VENV" ] || die "framework-only needs an existing venv at $VENV — run a full deploy first"
   install_uv                    # ensure uv is on PATH (idempotent; no other preflight)
   install_framework             # honors TESTPYPI + JAATO_{SDK,SERVER}_VERSION
@@ -917,4 +973,6 @@ main(){
     systemctl restart jaato-server"
   fi
 }
-main "$@"
+# Run only when executed, not when sourced (the tests source it to exercise
+# the path resolution without deploying anything).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
