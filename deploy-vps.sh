@@ -41,9 +41,12 @@
 #   JAATO_SERVER_VERSION=0.11.0 JAATO_SDK_VERSION=0.19.0 BOT_REF=<sha> JAATO_WS_PORT=8090 ./deploy-vps.sh
 #
 # The FRAMEWORK venv lives OUTSIDE the install dir when run as root:
-# /opt/jaato-stack/venv by default (JAATO_VENV_DIR overrides). The bot's checkout
-# and workspace stay under JAATO_INSTALL_DIR ($HOME/jaato-stack). Why, and what to
+# /opt/jaato-stack/venv by default (JAATO_VENV_DIR overrides). Why, and what to
 # do with a venv still at the old path: see resolve_venv_paths below.
+# When this script runs as root the BOT still does not: it gets its own account
+# (JAATO_TG_USER, default jaato-tg) with everything of its own -- checkout,
+# workspace, state, config and its own jaato-sdk venv -- in /home/<account>.
+# See resolve_bot_paths below.
 #
 set -euo pipefail
 
@@ -63,19 +66,6 @@ WS_PORT="${JAATO_WS_PORT:-8080}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ── Derived paths ────────────────────────────────────────────────────────────
-BOT_DIR="$INSTALL_DIR/jaato-client-telegram"   # framework comes from PyPI, not a clone
-WORKSPACE="$BOT_DIR/runtime"
-# Profiles are a base + a per-provider SET leaf (see write_profile). The bot
-# selects the leaf by QUALIFIED PATH ("<set>/telegram_chat"). SET_NAME/leaf paths
-# are derived in collect()/write_profile once the provider is known.
-PROFILE_DIR="$WORKSPACE/.jaato/profiles"
-BASE_PROFILE_FILE="$PROFILE_DIR/_base_telegram_chat.yaml"
-STATE_DIR="$HOME/.local/share/jaato-tg"
-HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.json"
-CFG_DIR="$HOME/.config/jaato-tg"
-SERVER_ENV="$CFG_DIR/server.env"; BOT_ENV="$CFG_DIR/bot.env"
-WS_TOKEN_FILE="$CFG_DIR/ws.token"; BOT_CONFIG="$CFG_DIR/jaato-client-telegram.yaml"
-WHITELIST_FILE="$CFG_DIR/whitelist.json"
 # systemd: system-wide units when root (VPS-native), --user units otherwise.
 if [ "$(id -u)" -eq 0 ]; then
   SYSTEMD_MODE=system; UNIT_DIR="/etc/systemd/system"; WANTED_BY="multi-user.target"
@@ -83,6 +73,94 @@ else
   SYSTEMD_MODE=user; UNIT_DIR="$HOME/.config/systemd/user"; WANTED_BY="default.target"
 fi
 _sc(){ if [ "$SYSTEMD_MODE" = system ]; then systemctl "$@"; else systemctl --user "$@"; fi; }
+
+# The DEPLOYER's files (root's in system mode): the daemon's server.env + ws.token,
+# and bot.env -- the Telegram + WS tokens, read by systemd (EnvironmentFile=)
+# BEFORE it drops the bot to its account, so that account never needs to read it.
+# Deploy backups live here too, never in the bot's home: they hold copies of all
+# of the above.
+CFG_DIR="$HOME/.config/jaato-tg"
+SERVER_ENV="$CFG_DIR/server.env"; BOT_ENV="$CFG_DIR/bot.env"
+WS_TOKEN_FILE="$CFG_DIR/ws.token"
+BACKUP_DIR="$HOME/.local/share/jaato-tg/deploy-backups"
+
+# ── The bot's own account ────────────────────────────────────────────────────
+# In system mode the bot never runs as root: it runs as its own account,
+# $BOT_USER, whose home under /home holds everything the bot reads or writes --
+# the checkout and its workspace (chat history, memories), state, host tools, the
+# bot config + whitelist, and the bot's OWN venv: jaato-sdk and the bot's deps,
+# nothing of the server's.  The home is 0750, which is what protects the
+# workspace (almost every file in it is mode 644).
+#
+# User mode has no second account: the deploying user IS the bot's account, and
+# the layout stays under $INSTALL_DIR as before -- except the venv, which is the
+# bot's own there too.
+resolve_bot_paths(){
+  if [ "$SYSTEMD_MODE" = system ]; then
+    BOT_USER="${JAATO_TG_USER:-jaato-tg}"; BOT_HOME="/home/$BOT_USER"
+    BOT_DIR="$BOT_HOME/jaato-client-telegram"; BOT_VENV="$BOT_HOME/venv"
+  else
+    BOT_USER="$(id -un)"; BOT_HOME="$HOME"
+    BOT_DIR="$INSTALL_DIR/jaato-client-telegram"; BOT_VENV="$INSTALL_DIR/bot-venv"
+  fi
+  BOT_PYV="$BOT_VENV/bin/python"
+  WORKSPACE="$BOT_DIR/runtime"
+  # Profiles are a base + a per-provider SET leaf (see write_profile). The bot
+  # selects the leaf by QUALIFIED PATH ("<set>/telegram_chat"). SET_NAME/leaf
+  # paths are derived in collect()/write_profile once the provider is known.
+  PROFILE_DIR="$WORKSPACE/.jaato/profiles"
+  BASE_PROFILE_FILE="$PROFILE_DIR/_base_telegram_chat.yaml"
+  STATE_DIR="$BOT_HOME/.local/share/jaato-tg"
+  HOST_TOOLS_DIR="$STATE_DIR/host_tools"; SESSION_STORE="$STATE_DIR/chat_sessions.json"
+  BOT_CFG_DIR="$BOT_HOME/.config/jaato-tg"
+  BOT_CONFIG="$BOT_CFG_DIR/jaato-client-telegram.yaml"
+  WHITELIST_FILE="$BOT_CFG_DIR/whitelist.json"
+  # Where a root-run bot kept its checkout before it had an account.
+  LEGACY_BOT_DIR="$INSTALL_DIR/jaato-client-telegram"
+}
+resolve_bot_paths
+
+# Run a command AS the bot's account (system mode), with that account's HOME --
+# runuser keeps the caller's environment, and git refuses to start when it cannot
+# read the $HOME/.gitconfig it was pointed at (/root is 0700).  From / for the
+# same reason: the caller's cwd is usually /root.
+as_bot(){
+  if [ "$SYSTEMD_MODE" = system ]; then
+    (cd / && runuser -u "$BOT_USER" -- env HOME="$BOT_HOME" USER="$BOT_USER" LOGNAME="$BOT_USER" "$@")
+  else "$@"; fi
+}
+# The account's home belongs to the account, all of it.  Root writes into it
+# (generated config, the venv uv builds), so every run hands it back -- before
+# git touches the checkout, and after the last write.
+own_bot_home(){
+  [ "$SYSTEMD_MODE" = system ] || return 0
+  chown -R "$BOT_USER:$BOT_USER" "$BOT_HOME"
+}
+ensure_bot_user(){
+  [ "$SYSTEMD_MODE" = system ] || return 0
+  if ! getent passwd "$BOT_USER" >/dev/null; then
+    info "Create the bot's account $BOT_USER (home $BOT_HOME, no login shell)"
+    useradd --system --user-group --create-home --home-dir "$BOT_HOME" \
+            --shell /usr/sbin/nologin "$BOT_USER"
+  fi
+  local home; home=$(getent passwd "$BOT_USER" | cut -d: -f6)
+  [ "$home" = "$BOT_HOME" ] || die "the account $BOT_USER exists with home $home, not $BOT_HOME --
+  every bot path is derived from $BOT_HOME; fix the account (usermod -d) or pick another JAATO_TG_USER"
+  chmod 750 "$BOT_HOME"
+}
+# A bot checkout still under the deployer's install dir must be MOVED into the
+# account, never re-cloned beside it: the workspace holds the chat history, the
+# memories and the hand-tuned persona, and a fresh clone would start the bot
+# with none of them -- while the old copy kept looking like the live one.
+check_bot_location(){
+  [ "$BOT_DIR" = "$LEGACY_BOT_DIR" ] && return 0   # user mode: nothing moved
+  [ -e "$BOT_DIR" ] && return 0                     # already in the account
+  [ -d "$LEGACY_BOT_DIR" ] || return 0              # fresh box
+  die "the bot still lives at $LEGACY_BOT_DIR, run as root,
+  but this script now runs it as $BOT_USER from $BOT_DIR.  Its workspace
+  (chat history, memories, persona) must be MOVED there, not re-cloned:
+  see the jaato-vps skill under 'Bot account'."
+}
 # ── The framework venv ───────────────────────────────────────────────────────
 # Decoupled from $INSTALL_DIR in system mode, and the reason is a framework
 # check, not tidiness.  A root daemon run with `--runner-uid-policy peer` drops
@@ -92,11 +170,8 @@ _sc(){ if [ "$SYSTEMD_MODE" = system ]; then systemctl "$@"; else systemctl --us
 # under it is unreachable by any other user whatever the venv's own mode; /opt is
 # traversable.
 #
-# ONLY the venv moves.  The bot's checkout and workspace stay under
-# $INSTALL_DIR: the bot connects as root, so its sessions stay root under `peer`
-# and nothing needs another user to read them -- and its workspace holds the
-# chat history and memories, which /root's 0700 is all that protects (almost
-# every file in it is mode 644).
+# It holds the FRAMEWORK only (jaato-server + jaato-sdk): the bot has its own
+# venv in its own account (resolve_bot_paths).
 #
 # User mode keeps the venv under $INSTALL_DIR: /opt is not writable without
 # root, and a --user deploy has no other OS user to serve.
@@ -218,26 +293,27 @@ preflight(){
   else
     warn "AppArmor not available — the server will run the runner UNCONFINED (fine for a single-tenant VPS)."
   fi
-  printf '  Python %s, git OK. Install dir: %s   Framework venv: %s\n' "$v" "$INSTALL_DIR" "$VENV"
+  printf '  Python %s, git OK. Framework venv: %s\n' "$v" "$VENV"
+  printf '  Bot: account %s, checkout %s, venv %s\n' "$BOT_USER" "$BOT_DIR" "$BOT_VENV"
 }
 
 # ── 2. Fetch (clone/update at pinned refs) ───────────────────────────────────
 _clone_at(){ local repo="$1" dir="$2" ref="$3"
-  if [ -d "$dir/.git" ]; then git -C "$dir" fetch --quiet origin
-  else git clone --quiet "$repo" "$dir"; fi
+  if [ -d "$dir/.git" ]; then as_bot git -C "$dir" fetch --quiet origin
+  else as_bot git clone --quiet "$repo" "$dir"; fi
   # Hard-reset to the target ref. write_profile/write_bot_config regenerate
   # git-tracked files every run, leaving the tree permanently dirty — so a plain
   # `pull --ff-only` is always blocked (and the old `|| true` swallowed it,
   # pinning the bot repo to its first-cloned commit). Those generated files are
   # disposable (rewritten seconds later), so discard local changes and advance
   # to the fetched tip. Handles a branch ref (origin/<branch>) or a pinned SHA.
-  git -C "$dir" checkout --quiet --force "$ref"
-  git -C "$dir" reset --hard --quiet "origin/$ref" 2>/dev/null \
-    || git -C "$dir" reset --hard --quiet "$ref"
-  printf '  %s @ %s\n' "$(basename "$dir")" "$(git -C "$dir" rev-parse --short HEAD)"
+  as_bot git -C "$dir" checkout --quiet --force "$ref"
+  as_bot git -C "$dir" reset --hard --quiet "origin/$ref" 2>/dev/null \
+    || as_bot git -C "$dir" reset --hard --quiet "$ref"
+  printf '  %s @ %s\n' "$(basename "$dir")" "$(as_bot git -C "$dir" rev-parse --short HEAD)"
 }
 fetch(){ info "Fetch bot repo (bot=$BOT_REF; jaato-server/sdk come from PyPI, not git)"
-  mkdir -p "$INSTALL_DIR"
+  as_bot mkdir -p "$(dirname "$BOT_DIR")"
   _clone_at "$BOT_REPO" "$BOT_DIR" "$BOT_REF"
 }
 
@@ -261,7 +337,21 @@ install_framework(){
   # of uv's default first-index — which would bind a jaato package entirely to
   # TestPyPI and fail when a pinned version lives only on PyPI (i.e. it is what
   # lets you take ONE package from TestPyPI and the other from PyPI).
-  local idx=()
+  fw_index_args
+  # Framework FROM PyPI (unpinned = latest unless the version vars are set), or
+  # from TestPyPI when TESTPYPI is set (PyPI kept as the extra index).
+  uv pip install --python "$PYV" ${FW_IDX[@]+"${FW_IDX[@]}"} "$sdk" "$srv"
+  printf '  framework from %s: jaato-sdk %s, jaato-server[extras] %s\n' \
+    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
+    "$(_dist_version "$PYV" jaato-sdk)" "$(_dist_version "$PYV" jaato-server)"
+}
+# The installed version of a distribution in a venv (empty if absent).
+_dist_version(){ uv pip show --python "$1" "$2" 2>/dev/null | sed -n 's/^Version: //p'; }
+# The index arguments for a FRAMEWORK package, into FW_IDX: empty (PyPI), or
+# TestPyPI-first when TESTPYPI is set.  Shared by the framework install and the
+# bot's jaato-sdk pin, which must resolve the same version from the same index.
+fw_index_args(){
+  FW_IDX=()
   if [ -n "$TESTPYPI" ]; then
     # --refresh busts uv's cached index listing: TestPyPI is republished often, so
     # a freshly-published version is otherwise INVISIBLE to a uv that cached the
@@ -273,23 +363,16 @@ install_framework(){
     # ==0.14.0rc1 under its default policy, failing with the SAME misleading
     # "no version of jaato-server[web]==0.14.0rc1" as a stale cache — even though
     # the version IS on the index (verify: curl -s https://test.pypi.org/pypi/<pkg>/<ver>/json).
-    idx=( --refresh
+    FW_IDX=( --refresh
           --index-url https://test.pypi.org/simple/
           --extra-index-url https://pypi.org/simple/
           --index-strategy unsafe-best-match
           --prerelease allow )
     info "  TestPyPI ENABLED for framework (sdk=${JAATO_SDK_VERSION:-latest} server=${JAATO_SERVER_VERSION:-latest}); other packages + deps from PyPI"
   fi
-  # Framework FROM PyPI (unpinned = latest unless the version vars are set), or
-  # from TestPyPI when TESTPYPI is set (PyPI kept as the extra index).
-  uv pip install --python "$PYV" ${idx[@]+"${idx[@]}"} "$sdk" "$srv"
-  printf '  framework from %s: jaato-sdk %s, jaato-server[extras] %s\n' \
-    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
-    "$(uv pip show --python "$PYV" jaato-sdk 2>/dev/null | sed -n 's/^Version: //p')" \
-    "$(uv pip show --python "$PYV" jaato-server 2>/dev/null | sed -n 's/^Version: //p')"
 }
 
-install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
+install(){ info "Install (framework venv: PyPI jaato-server/jaato-sdk; bot venv: jaato-sdk + editable bot)"
   # A full run RECREATES the venv, wiping anything installed outside this
   # script — notably the private jaato-premium wheel, which supplies the
   # pass:// / vault:// secret RESOLVERS.  This script stays premium-free by
@@ -301,14 +384,42 @@ install(){ info "Install (uv venv + PyPI jaato-server/jaato-sdk + editable bot)"
   PREMIUM_WAS=""
   [ -x "$PYV" ] && PREMIUM_WAS=$("$PYV" -c 'import importlib.metadata as m; print(m.version("jaato-premium"))' 2>/dev/null || true)
   # uv-managed venv (recreated on re-run; reinstall below repopulates it).
-  uv venv --python "$PYTHON_BIN" "$VENV"
+  # --clear: since uv 0.8 `uv venv` REFUSES a non-empty path without it, so a
+  # re-run died here instead of recreating the venv as this comment says.
+  uv venv --clear --python "$PYTHON_BIN" "$VENV"
   install_framework
-  # The bot is the deployed app (not on PyPI) — editable from its clone; its
-  # jaato-sdk/jaato-server deps resolve against what we just installed. NO
-  # TestPyPI here: the bot's own deps (aiogram, …) must come from PyPI only.
-  uv pip install --python "$PYV" -e "$BOT_DIR"
-  printf '  editable: jaato-client-telegram (its own deps from PyPI)\n'
   resolve_fw_layout
+  install_bot
+}
+
+# ── 3b. The bot's own venv (jaato-sdk + the bot's deps, nothing of the server) ─
+# Built by root -- uv lives under /root, which the account cannot traverse -- AT
+# ITS FINAL PATH, so the console-script shebangs name that path, then handed to
+# the account.  --no-managed-python: a uv-managed CPython would live under /root
+# too, and the account could not exec its own interpreter.
+# The bot is the deployed app (not on PyPI) — editable from its clone. NO
+# TestPyPI for it: the bot's own deps (aiogram, …) must come from PyPI only.
+install_bot(){ info "Bot venv -> $BOT_VENV (jaato-sdk + editable bot, owned by $BOT_USER)"
+  uv venv --clear --no-managed-python --python "$PYTHON_BIN" "$BOT_VENV"
+  uv pip install --python "$BOT_PYV" -e "$BOT_DIR"
+  sync_bot_sdk
+}
+# Pin the bot's jaato-sdk to the version the FRAMEWORK venv holds: the wire
+# schema is the SDK's, and the daemon speaks the one installed beside it.  After
+# the editable install, so the pin -- from TestPyPI when the framework came from
+# there -- replaces whatever the bot's `jaato-sdk>=` resolved to on PyPI.
+# Proven by importing the bot AS its account: that read is the one that matters.
+sync_bot_sdk(){
+  local want got
+  want=$(_dist_version "$PYV" jaato-sdk)
+  [ -n "$want" ] || die "no jaato-sdk in the framework venv $VENV -- install the framework first"
+  fw_index_args
+  uv pip install --python "$BOT_PYV" ${FW_IDX[@]+"${FW_IDX[@]}"} "jaato-sdk==$want"
+  own_bot_home
+  got=$(as_bot "$BOT_PYV" -c 'import importlib.metadata as m, jaato, jaato_client_telegram; print(m.version("jaato-sdk"))') \
+    || die "the bot venv does not import as $BOT_USER (see the traceback above)"
+  [ "$got" = "$want" ] || die "bot venv has jaato-sdk $got, the framework has $want"
+  printf '  bot venv: jaato-sdk %s (= framework), imports as %s\n' "$got" "$BOT_USER"
 }
 
 # The provider's key env-var name, discovered from `scaffold explain env`
@@ -439,7 +550,7 @@ collect(){ info "Configuration"
 
 # ── 5. Write env files + token (chmod 600) ───────────────────────────────────
 write_env(){ info "Write secrets (chmod 600)"
-  mkdir -p "$CFG_DIR" "$STATE_DIR" "$HOST_TOOLS_DIR"
+  mkdir -p "$CFG_DIR" "$BOT_CFG_DIR" "$STATE_DIR" "$HOST_TOOLS_DIR"
   umask 077
   # The tool-store contribution token (enables share_tool): what collect()
   # gathered (prompt / env), else preserve an existing one from bot.env so a
@@ -810,6 +921,12 @@ RestartSec=5
 [Install]
 WantedBy=$WANTED_BY
 UNIT
+  # The bot drops to its own account (system mode).  EnvironmentFile= is read by
+  # systemd before the drop, so bot.env stays root's 0600.
+  local bot_identity=""
+  [ "$SYSTEMD_MODE" = system ] && bot_identity="User=$BOT_USER
+Group=$BOT_USER
+WorkingDirectory=$BOT_HOME"
   cat > "$UNIT_DIR/jaato-tg.service" <<UNIT
 [Unit]
 Description=jaato Telegram bot client
@@ -817,8 +934,9 @@ After=jaato-server.service
 Requires=jaato-server.service
 [Service]
 Type=simple
+$bot_identity
 EnvironmentFile=$BOT_ENV
-ExecStart=$VENV/bin/jaato-tg --config $BOT_CONFIG --whitelist $WHITELIST_FILE
+ExecStart=$BOT_VENV/bin/jaato-tg --config $BOT_CONFIG --whitelist $WHITELIST_FILE
 Restart=on-failure
 RestartSec=10
 [Install]
@@ -896,6 +1014,7 @@ uninstall(){ info "Uninstall ($SYSTEMD_MODE mode)"
   _sc daemon-reload 2>/dev/null || true
   local left="$INSTALL_DIR"
   case "$VENV/" in "$INSTALL_DIR"/*) ;; *) left="$left, $VENV" ;; esac
+  [ "$SYSTEMD_MODE" = system ] && left="$left, $BOT_HOME (account $BOT_USER: userdel -r $BOT_USER)"
   warn "Left in place (delete manually if wanted): $left, $CFG_DIR, $STATE_DIR"
   info "Services removed."
 }
@@ -911,12 +1030,13 @@ uninstall(){ info "Uninstall ($SYSTEMD_MODE mode)"
 deploy_code_only(){
   local ref="${CODE_REF:-$BOT_REF}"
   info "Code-only update: bot src/ -> '$ref' (config, profile, persona, venv untouched)"
+  check_bot_location
   [ -d "$BOT_DIR/.git" ] || die "code-only needs an existing checkout at $BOT_DIR — run a full deploy first"
-  git -C "$BOT_DIR" fetch --quiet origin || die "git fetch failed"
-  git -C "$BOT_DIR" checkout --quiet "origin/$ref" -- src/ 2>/dev/null \
-    || git -C "$BOT_DIR" checkout --quiet "$ref" -- src/ \
+  as_bot git -C "$BOT_DIR" fetch --quiet origin || die "git fetch failed"
+  as_bot git -C "$BOT_DIR" checkout --quiet "origin/$ref" -- src/ 2>/dev/null \
+    || as_bot git -C "$BOT_DIR" checkout --quiet "$ref" -- src/ \
     || die "could not checkout src/ from '$ref' (does the branch exist on origin?)"
-  printf '  src/ updated to %s\n' "$(git -C "$BOT_DIR" rev-parse --short "origin/$ref" 2>/dev/null || echo "$ref")"
+  printf '  src/ updated to %s\n' "$(as_bot git -C "$BOT_DIR" rev-parse --short "origin/$ref" 2>/dev/null || echo "$ref")"
   _sc restart jaato-tg.service
   sleep 3
   if _sc is-active --quiet jaato-tg.service; then
@@ -931,7 +1051,7 @@ deploy_code_only(){
 # ── Framework-only upgrade (no config/profile/persona regen) ─────────────────
 # Reinstall ONLY the framework (jaato-server + jaato-sdk) into the EXISTING venv —
 # honoring TESTPYPI + JAATO_SERVER_VERSION/JAATO_SDK_VERSION — then re-resolve the
-# editable bot and restart BOTH services. Config, profile, persona, whitelist AND
+# bot's jaato-sdk to match and restart BOTH services. Config, profile, persona, whitelist AND
 # the bot code are left untouched (no git reset, no regen, no backup). This is the
 # supported way to test a pre-release framework build (TESTPYPI=1) or to bump the
 # framework on a hand-managed box without a full redeploy. For a bot CODE change
@@ -940,11 +1060,13 @@ deploy_code_only(){
 deploy_framework_only(){
   info "Framework-only upgrade -> $VENV (config, profile, persona, bot code untouched)"
   check_venv_location --framework-only
+  check_bot_location
   [ -d "$VENV" ] || die "framework-only needs an existing venv at $VENV — run a full deploy first"
+  [ -x "$BOT_PYV" ] || die "framework-only needs the bot's own venv at $BOT_VENV — run a full deploy first"
   install_uv                    # ensure uv is on PATH (idempotent; no other preflight)
   install_framework             # honors TESTPYPI + JAATO_{SDK,SERVER}_VERSION
-  # Re-resolve the editable bot against the new framework — does NOT change bot code.
-  uv pip install --python "$PYV" -e "$BOT_DIR"
+  # The bot speaks the new SDK too — re-pin it; does NOT change bot code.
+  sync_bot_sdk
   # A framework change moves the SERVER binary AND the SDK the bot imports → both restart.
   _sc restart jaato-server.service jaato-tg.service
   sleep 3
@@ -962,17 +1084,20 @@ deploy_framework_only(){
 # that isn't source first, into a dated dir OUTSIDE the clone. --code-only skips
 # this (it touches only src/). No-ops on a fresh box (nothing to back up).
 backup_noncode(){
-  { [ -d "$BOT_DIR/runtime/.jaato" ] || [ -d "$CFG_DIR" ]; } || {
+  { [ -d "$BOT_DIR/runtime/.jaato" ] || [ -d "$CFG_DIR" ] || [ -d "$BOT_CFG_DIR" ]; } || {
     info "No prior install to back up (fresh box)"; return; }
-  local dest="$STATE_DIR/deploy-backups/$(date +%Y%m%d-%H%M%S)"
+  local dest="$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
   info "Backup non-code state -> $dest"
-  mkdir -p "$dest"; chmod 700 "$STATE_DIR/deploy-backups" "$dest" 2>/dev/null || true
+  mkdir -p "$dest"; chmod 700 "$BACKUP_DIR" "$dest" 2>/dev/null || true
   # Customizable workspace tree (persona .jaato/agents, profiles, scripts, session
   # transcripts) — reset --hard reverts the tracked ones (persona/profile).
   [ -d "$BOT_DIR/runtime/.jaato" ] && cp -a "$BOT_DIR/runtime/.jaato" "$dest/runtime-jaato"
   # Generated config + secrets (write_env/write_bot_config/write_profile overwrite
   # these every run). Kept mode-restricted since it holds tokens/keys.
   [ -d "$CFG_DIR" ] && { cp -a "$CFG_DIR" "$dest/config"; chmod -R go-rwx "$dest/config" 2>/dev/null || true; }
+  if [ "$BOT_CFG_DIR" != "$CFG_DIR" ] && [ -d "$BOT_CFG_DIR" ]; then
+    cp -a "$BOT_CFG_DIR" "$dest/bot-config"; chmod -R go-rwx "$dest/bot-config" 2>/dev/null || true
+  fi
   printf '  backed up (restore a file with: cp %s/<path> <target>)\n' "$dest"
 }
 
@@ -981,13 +1106,17 @@ main(){
     --uninstall) uninstall; exit 0 ;;
     --code-only) deploy_code_only; exit 0 ;;
     --framework-only) deploy_framework_only; exit 0 ;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^set -euo/{exit} NR>1' "$0"; exit 0 ;;   # the header block
   esac
   printf '%s\n' "${C_B}jaato Telegram bot — VPS bootstrap (premium-free)${C_0}"
+  check_bot_location
   backup_noncode
-  preflight; fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
+  preflight; ensure_bot_user; own_bot_home
+  fetch; install; collect; write_env; seed_host_tools; write_profile; write_whitelist; write_bot_config; write_wake_json
+  own_bot_home
   install_units; start_and_check
-  printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: journalctl --user -u jaato-tg -f   |   Re-run to upgrade   |   --uninstall to remove"
+  local logs="journalctl -u jaato-tg -f"; [ "$SYSTEMD_MODE" = user ] && logs="journalctl --user -u jaato-tg -f"
+  printf '\n%s\n' "${C_G}${C_B}✓ Done.${C_0} Logs: $logs   |   Re-run to upgrade   |   --uninstall to remove"
   if [ -n "${PREMIUM_WAS:-}" ]; then
     warn "jaato-premium $PREMIUM_WAS was installed in the previous venv and this rebuild REMOVED it.
   It provides the pass:// / vault:// secret resolvers; without it those URIs reach the provider
