@@ -20,10 +20,15 @@ from jaato_client_telegram.session_pool import SessionPool, SessionMetadata
 class _FakeClient:
     """Records the lifecycle calls; mimics WSRecoveryClient's surface."""
 
-    def __init__(self, known_sessions=None):
+    def __init__(self, known_sessions=None, attach_answers=None):
         self.calls = []
         self._known = list(known_sessions or [])
         self._list_cb = None
+        self._handlers = {}
+        # What the daemon emits for an attach, as (event_type, event) pairs;
+        # default: SessionInfo if the id is known, "Session not found" if not
+        # (server SessionManager.attach_session). [] = no answer at all.
+        self._attach_answers = attach_answers
         self.is_connected = False
         self.is_reconnecting = False
 
@@ -33,9 +38,9 @@ class _FakeClient:
         return True
 
     def subscribe(self, event_type, handler):
-        # event subscription (e.g. memory-curation on TOOL_CALL_END); no-op here,
-        # intentionally not recorded so lifecycle call-order assertions stay clean.
-        return lambda: None
+        # not recorded in calls, so lifecycle call-order assertions stay clean
+        self._handlers.setdefault(event_type, []).append(handler)
+        return lambda: self._handlers[event_type].remove(handler)
 
     async def execute_command(self, command, args=None):
         self.calls.append(("execute_command", command, list(args or [])))
@@ -55,6 +60,15 @@ class _FakeClient:
 
     async def attach_session(self, session_id):
         self.calls.append(("attach_session", session_id))
+        answers = self._attach_answers
+        if answers is None:
+            answers = ([(EventType.SESSION_INFO, SimpleNamespace(session_id=session_id))]
+                       if session_id in self._known else
+                       [(EventType.ERROR, SimpleNamespace(
+                           error=f"Session not found: {session_id}", error_type="SessionError"))])
+        for event_type, event in answers:
+            for handler in list(self._handlers.get(event_type, [])):
+                handler(event)
         return True
 
     async def create_session(self, profile=None, agent=None, cascade_driver_id=None):
@@ -119,15 +133,76 @@ def test_reattach_when_session_still_known():
 
 
 def test_create_when_persisted_session_gone():
-    client = _FakeClient(known_sessions=[])  # daemon no longer knows it
+    client = _FakeClient(known_sessions=[])  # daemon: "Session not found: old-sess"
     pool = _make_pool(client, store=_Store({7: "old-sess"}))
     sid = asyncio.run(pool.get_or_create_session(7))
 
     assert sid == "fresh-sess"
     kinds = [c[0] for c in client.calls]
-    assert "list_sessions" in kinds and "create_session" in kinds
-    assert "attach_session" not in kinds
+    assert kinds.index("attach_session") < kinds.index("create_session")
     assert pool.took_reattach(7) is False
+
+
+def test_reattach_never_lists_every_session():
+    """session.list spans every workspace on the daemon and outgrew the 1 MiB
+    frame limit (2026-10-07: 2,092 rows, 1.2 MB) -- each chat then failed."""
+    for known in (["old-sess"], []):
+        client = _FakeClient(known_sessions=known)
+        asyncio.run(_make_pool(client, store=_Store({7: "old-sess"})).get_or_create_session(7))
+        assert "list_sessions" not in [c[0] for c in client.calls]
+
+
+def test_an_error_other_than_not_found_is_raised_not_read_as_gone():
+    """'being unloaded; please retry' must not start a fresh conversation."""
+    client = _FakeClient(attach_answers=[(EventType.ERROR, SimpleNamespace(
+        error="Session old-sess is being unloaded; please retry", error_type="SessionError"))])
+    pool = _make_pool(client, store=_Store({7: "old-sess"}))
+    try:
+        asyncio.run(pool.get_or_create_session(7))
+        raise AssertionError("expected the attach error to be raised")
+    except RuntimeError as e:
+        assert "being unloaded" in str(e)
+    assert "create_session" not in [c[0] for c in client.calls]
+
+
+def test_errors_about_other_sessions_are_not_the_answer():
+    client = _FakeClient(attach_answers=[
+        (EventType.ERROR, SimpleNamespace(error="Session not found: other", error_type="SessionError")),
+        (EventType.SESSION_INFO, SimpleNamespace(session_id="other")),
+        (EventType.SESSION_INFO, SimpleNamespace(session_id="old-sess")),
+    ])
+    pool = _make_pool(client, store=_Store({7: "old-sess"}))
+    assert asyncio.run(pool.get_or_create_session(7)) == "old-sess"
+    assert "create_session" not in [c[0] for c in client.calls]
+
+
+def test_another_sessions_info_is_not_an_attach():
+    client = _FakeClient(attach_answers=[
+        (EventType.SESSION_INFO, SimpleNamespace(session_id="other")),
+        (EventType.ERROR, SimpleNamespace(error="Session not found: old-sess", error_type="SessionError")),
+    ])
+    pool = _make_pool(client, store=_Store({7: "old-sess"}))
+    assert asyncio.run(pool.get_or_create_session(7)) == "fresh-sess"
+
+
+def test_no_answer_raises_instead_of_creating(monkeypatch):
+    import jaato_client_telegram.session_pool as sp
+    monkeypatch.setattr(sp, "_ATTACH_TIMEOUT_S", 0.05)
+    client = _FakeClient(attach_answers=[])
+    pool = _make_pool(client, store=_Store({7: "old-sess"}))
+    try:
+        asyncio.run(pool.get_or_create_session(7))
+        raise AssertionError("expected a timeout")
+    except RuntimeError:
+        pass
+    assert "create_session" not in [c[0] for c in client.calls]
+
+
+def test_the_attach_subscriptions_are_released():
+    client = _FakeClient(known_sessions=["old-sess"])
+    asyncio.run(_make_pool(client, store=_Store({7: "old-sess"})).get_or_create_session(7))
+    assert not client._handlers.get(EventType.SESSION_INFO)
+    assert not client._handlers.get(EventType.ERROR)
 
 
 def test_reuse_live_cached_client():
