@@ -66,6 +66,11 @@ logger = logging.getLogger(__name__)
 # wrap_untrusted_content(text, source=f"wake:{source}") (session_manager.py).
 _WAKE_ECHO_PREFIX = f"{UNTRUSTED_OPEN} source=wake:"
 
+# How long a re-attach may take to be answered. Restoring a session the daemon
+# has unloaded spawns its runner first, so this matches the SDK's own default
+# for create_session (60 s), the other call that waits on a runner.
+_ATTACH_TIMEOUT_S = 60.0
+
 
 def _is_wake_echo(ev: object) -> bool:
     """True for the user-echo that opens a daemon-driven wake turn — the mode-flip
@@ -362,23 +367,47 @@ class SessionPool:
             config_root=(workspace.rstrip("/") + "/.jaato-judge") if workspace else None,
         )
 
-    async def _list_session_ids(self, client: WSRecoveryClient) -> list[str]:
-        """Session ids the daemon currently knows (in-memory AND on disk). The
-        client's list_sessions() is fire-and-forget (reply via SESSION_LIST on the
-        background drain), so subscribe once and await it."""
+    async def _attach_existing(self, client: WSRecoveryClient, session_id: str) -> bool:
+        """Attach to ``session_id``; ``False`` only if the daemon says it does not exist.
+
+        Asks the daemon about THIS session instead of listing every session it
+        knows: ``session.list`` spans every workspace on the daemon (other
+        accounts' too) and outgrew the client's 1 MiB WebSocket frame limit,
+        which closed the connection and failed every chat.
+
+        ``attach_session`` is fire-and-forget; the daemon answers with events
+        (server ``SessionManager.attach_session``): a ``SessionInfoEvent`` for
+        the session when attached, or ``ErrorEvent(SessionError, "Session not
+        found: <id>")`` when neither memory nor disk has it -- the one answer
+        that means "create a new one". Any other error naming the session
+        (e.g. "is being unloaded; please retry") is raised, never read as
+        "gone": a fresh session would silently drop the conversation.
+        Subscribed BEFORE the attach is sent, so the answer cannot be missed.
+        """
         loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
+        outcome: asyncio.Future = loop.create_future()
+        not_found = f"Session not found: {session_id}"
 
-        def _on_list(event) -> None:
-            if not future.done():
-                future.set_result([s.get("id") for s in event.sessions if s.get("id")])
+        def _on_info(event) -> None:
+            if event.session_id == session_id and not outcome.done():
+                outcome.set_result(True)
 
-        unsub = client.subscribe_once(EventType.SESSION_LIST, _on_list)
+        def _on_error(event) -> None:
+            if outcome.done() or session_id not in event.error:
+                return
+            if event.error_type == "SessionError" and event.error == not_found:
+                outcome.set_result(False)
+            else:
+                outcome.set_exception(RuntimeError(f"{event.error_type}: {event.error}"))
+
+        unsubs = [client.subscribe(EventType.SESSION_INFO, _on_info),
+                  client.subscribe(EventType.ERROR, _on_error)]
         try:
-            await client.list_sessions()
-            return await asyncio.wait_for(future, timeout=15.0)
+            await client.attach_session(session_id)
+            return await asyncio.wait_for(outcome, timeout=_ATTACH_TIMEOUT_S)
         finally:
-            unsub()
+            for unsub in unsubs:
+                unsub()
 
     async def bind_wake_command(
         self, chat_id: int, wake_ref: str, trust_keys: list,
@@ -506,15 +535,14 @@ class SessionPool:
                 # before attach IS the subscribed-before-attach ordering guarantee.
                 self._start_wake_watcher(chat_id, client)
 
-                # Re-attach to this chat's persisted session if it still exists on
-                # the daemon (session.list = unified in-memory + on-disk view, so it
-                # survives a daemon restart); otherwise create a fresh one.
+                # Re-attach to this chat's persisted session if the daemon still
+                # has it (in memory or on disk, so it survives a daemon restart);
+                # create a fresh one only when the daemon says it is not found.
                 session_id: str | None = None
                 if self._session_store:
                     persisted = self._session_store.get(chat_id)
                     if persisted:
-                        if persisted in await self._list_session_ids(client):
-                            await client.attach_session(persisted)
+                        if await self._attach_existing(client, persisted):
                             session_id = persisted
                             self._last_reattach[chat_id] = True
                             logger.info("Re-attached chat_id %d to session %s", chat_id, session_id)
