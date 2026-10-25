@@ -29,6 +29,7 @@ confined runner cannot write there) and are loaded at startup without re-prompt.
 import asyncio
 import contextvars
 import hashlib
+import html
 import importlib
 import inspect
 import logging
@@ -442,6 +443,10 @@ class ToolContext:
     # Reaches only HOST tools (this unconfined bot's tools), never server-side
     # model tools like web_search — those run in the confined runner.
     tool_registry: "dict[str, dict] | None" = None
+    # Injected by the bot: run ONE framework plugin tool with no session and no model
+    # turn (SessionPool.invoke_plugin_tool_command). None when unwired —
+    # ctx.invoke_plugin_tool() then returns an error.
+    plugin_tool_fn: "Callable[..., Awaitable[dict]] | None" = None
 
     async def ask(self, text: str, options: list[str], timeout: float = 300.0) -> "str | None":
         """Ask the user a single-choice question (inline buttons) and await their
@@ -531,7 +536,8 @@ class ToolContext:
         ``download_file`` then ``send_to_telegram``).
 
         Reaches only HOST tools — this bot's built-ins plus user-installed tools — NOT
-        server-side model tools (``web_search`` etc.), which run in the confined runner.
+        server-side model tools (``web_search`` etc.), which run in the confined runner;
+        for a framework plugin tool use :meth:`invoke_plugin_tool`.
         Never raises: returns ``{"error": ...}`` for an unknown tool, a missing required
         argument, a failure inside the callee, or if the call chain gets too deep
         (recursion guard, ``MAX_CALL_DEPTH``)."""
@@ -560,6 +566,105 @@ class ToolContext:
         finally:
             _CALL_DEPTH.reset(token)
         return result if isinstance(result, dict) else {"result": result}
+
+    async def invoke_plugin_tool(
+        self,
+        plugin: str,
+        tool: str,
+        args: "dict | None" = None,
+        *,
+        profile: str = "",
+        plugin_configs: "dict | None" = None,
+        on_permission: "Callable[[Any], Any] | None" = None,
+        timeout: float = 300.0,
+    ) -> dict:
+        """Run ONE framework plugin tool (e.g. ``service_connector.call_service``)
+        on the daemon, with no session and no model turn — the route for a host tool
+        that needs a credential the DAEMON resolves (``pass://`` / ``vault://`` in a
+        profile's ``env:`` / ``plugin_configs``). The secret never reaches this
+        process: the daemon resolves it before the runner starts and redacts it from
+        the result. Do NOT read a secret store yourself.
+
+        ``profile`` names a profile of the bot's workspace that enables ``plugin``
+        (or pass ``plugin_configs`` instead — one or the other, never both). There is
+        no default: name the profile that holds the credential.
+
+        A permission ASK raised by the call goes to ``on_permission(event)`` when
+        given (return ``"y"``/``"n"``/...; ``None`` denies). By default it is put to
+        the user of THIS chat as inline buttons; no answer within ``timeout`` denies.
+        Let the profile's permission policy allow the tool for unattended
+        (background) use rather than asking every time.
+
+        Never raises. Returns ``{"result": ...}`` when the tool ran and succeeded,
+        else ``{"error": ..., "category": ..., "result": ...}`` — ``category`` is
+        ``"tool_failed"`` when the tool itself failed (a permission denial included),
+        or the daemon's / bot's reason nothing ran (``not_in_surface``,
+        ``no_workspace``, ``timeout``, ``unsupported_protocol``, ...)."""
+        if self.plugin_tool_fn is None:
+            return {
+                "error": "invoke_plugin_tool is not available (not wired)",
+                "category": "disabled",
+            }
+        if on_permission is None:
+
+            async def _ask_this_chat(event: Any) -> "str | None":
+                return await self._ask_user_permission(event, timeout)
+
+            on_permission = _ask_this_chat
+        try:
+            r = await self.plugin_tool_fn(
+                plugin,
+                tool,
+                args or {},
+                profile=profile,
+                plugin_configs=plugin_configs,
+                on_permission=on_permission,
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001 — tool boundary; surface as an error dict
+            logger.exception("ctx.invoke_plugin_tool(%s.%s) failed", plugin, tool)
+            return {"error": f"{plugin}.{tool} failed: {e}", "category": "client_error"}
+        if not r.get("ok"):
+            return {
+                "error": r.get("error") or f"{plugin}.{tool} did not run",
+                "category": r.get("category") or "not_run",
+                "result": r.get("result"),
+            }
+        if not r.get("success"):
+            return {
+                "error": f"{plugin}.{tool} failed",
+                "category": "tool_failed",
+                "result": r.get("result"),
+            }
+        return {"result": r.get("result")}
+
+    async def _ask_user_permission(self, event: Any, timeout: float) -> "str | None":
+        """Default ``on_permission`` for :meth:`invoke_plugin_tool`: put the ASK to
+        this chat's user as inline buttons (the daemon's own response options) and
+        answer with the chosen key. ``None`` (no answer in time) denies."""
+        options = [
+            (str(o.get("label") or o.get("key")), str(o.get("key")))
+            for o in (getattr(event, "response_options", None) or [])
+            if o.get("key")
+        ] or [("Allow", "y"), ("Deny", "n")]
+        lines = [f"🔐 A host tool asks to run <code>{html.escape(str(event.tool_name))}</code>."]
+        prompt = getattr(event, "prompt_lines", None)
+        if prompt:
+            # Truncate BEFORE escaping, so the cut never splits an HTML entity.
+            lines.append(html.escape("\n".join(str(p) for p in prompt)[:1500]))
+        warnings = getattr(event, "warnings", None)
+        if warnings:
+            lines.append(f"⚠️ {html.escape(str(warnings))}")
+        choice = await ask_user(
+            self.bot,
+            self.chat_id,
+            "\n\n".join(lines),
+            [label for label, _ in options],
+            timeout,
+        )
+        if choice is None:
+            return None
+        return next((key for label, key in options if label == choice), None)
 
 
 def validate_name(name: str) -> None:
@@ -641,6 +746,7 @@ def make_executor(
     bind_fn: "Callable[[int, str, list], Awaitable[dict]] | None" = None,
     unbind_fn: "Callable[[int, str], Awaitable[dict]] | None" = None,
     tool_registry: "dict[str, dict] | None" = None,
+    plugin_tool_fn: "Callable[..., Awaitable[dict]] | None" = None,
 ) -> Callable[[dict], Awaitable[dict]]:
     """Wrap a tool's ``execute(args, ctx)`` into the transport's ``(args)->dict``."""
     ctx = ToolContext(
@@ -652,6 +758,7 @@ def make_executor(
         bind_fn=bind_fn,
         unbind_fn=unbind_fn,
         tool_registry=tool_registry,
+        plugin_tool_fn=plugin_tool_fn,
     )
 
     async def executor(args: dict) -> dict:

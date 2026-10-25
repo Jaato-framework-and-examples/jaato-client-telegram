@@ -28,7 +28,9 @@ async def execute(args, ctx):
 ```
 
 `ctx` carries `ctx.bot` (the aiogram `Bot`) and `ctx.chat_id`, so a tool can send
-Telegram messages, photos, inline buttons, etc.
+Telegram messages, photos, inline buttons, etc. `ctx.call_tool` composes other host
+tools; `ctx.invoke_plugin_tool` runs a framework plugin tool on the daemon (see
+[Credentials](#credentials-call-a-framework-plugin-tool-ctxinvoke_plugin_tool)).
 
 ## How a dynamic tool gets installed
 
@@ -52,6 +54,47 @@ but must **never poll** (`bot.get_updates`, `start_polling`, a second polling
 everything. To **await** a user's button tap without polling, use `ctx.ask(...)`
 (inside `execute`) or `ask_user(bot, chat_id, ...)` (in a later async context such as
 a webhook handler) — the main poll routes the tap back. See `approval_webhook`.
+
+## Credentials: call a framework plugin tool (`ctx.invoke_plugin_tool`)
+
+A host tool runs as the **bot's** account, which has no access to the daemon's secret
+store (`pass://`, `vault://`) and must not get one. So a tool that needs an API
+credential (to poll GitHub in the background, say) must **not** read a secret store,
+a token file or a plaintext env var of its own. It asks the daemon to run a
+**framework plugin tool** that holds the credential instead:
+
+```python
+async def execute(args, ctx):
+    r = await ctx.invoke_plugin_tool(
+        "service_connector", "call_service",
+        {"service": "github", "method": "GET", "path": "/repos/o/r/pulls"},
+        profile="github-ops",          # a profile of the bot's workspace; no default
+    )
+    if "error" in r:
+        return {"error": f"{r['category']}: {r['error']}"}
+    return {"result": r["result"]}
+```
+
+The call runs with no session and no model turn (`invoke_plugin_tool`, protocol 1.37,
+jaato #1606), in a runner of the bot's workspace configured by `profile` (or by a
+`plugin_configs=` block instead — one or the other). The daemon resolves `pass://` /
+`vault://` in the profile's `env:` / `plugin_configs` **before** the runner starts,
+and the result comes back secret-redacted, so the secret never enters the bot process.
+The profile's permission policy and the failure contract apply as in a session.
+
+- **Returns, never raises:** `{"result": ...}` when the tool ran and succeeded, else
+  `{"error", "category", "result"}`. `category` is `tool_failed` when the tool itself
+  failed (a permission denial included), or the reason nothing ran: the daemon's
+  (`not_in_surface`, `no_workspace`, `invalid_request`, `host_failed`,
+  `runner_unreachable`, `timeout`) or the bot's (`unsupported_protocol` for a daemon
+  below protocol 1.37, `unsupported_sdk`, `not_connected`, `disabled`).
+- **Permission ASKs** go to the user of the tool's chat as inline buttons (the
+  daemon's own options); no answer within `timeout` (default 300 s) denies. Pass
+  `on_permission=fn` (`fn(event) -> "y" | "n" | ... | None`) to answer them yourself.
+  For an unattended background call, let the profile's permission policy allow the
+  tool rather than asking on every poll.
+- **Works with the chat detached:** each call dials its own short-lived, session-less
+  connection, so a background task keeps working after idle detach.
 
 ## Example tools
 
