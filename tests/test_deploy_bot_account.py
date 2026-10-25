@@ -24,6 +24,8 @@ echo "$*" >> "$UV_LOG"
 if [ "$1 $2" = "pip show" ]; then
   case "$*" in *"$FRAMEWORK_PY"*) echo "Version: $FW_SDK";; *) echo "Version: $BOT_SDK";; esac
 fi
+# the bot's editable install refusing the pinned SDK (below the bot's floor)
+case "$*" in "pip install"*"-e "*) [ -n "$FAIL_EDITABLE" ] && exit 1;; esac
 exit 0
 """
 
@@ -102,7 +104,8 @@ def test_passes_once_moved_and_on_a_fresh_box(tmp_path):
 
 # ── two venvs: the framework's, and the bot's own ────────────────────────────
 
-def _install(tmp_path, fw_sdk="0.30.0rc2", bot_sdk="0.30.0rc2", testpypi=""):
+def _install(tmp_path, fw_sdk="0.30.0rc7", bot_sdk="0.30.0rc7", testpypi="",
+             fail_editable=""):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "uv").write_text(FAKE_UV)
@@ -118,7 +121,7 @@ def _install(tmp_path, fw_sdk="0.30.0rc2", bot_sdk="0.30.0rc2", testpypi=""):
         tmp_path,
         PATH=f"{bin_dir}:{os.environ['PATH']}", UV_LOG=str(log),
         FRAMEWORK_PY=f"{fw_venv}/bin/python", FW_SDK=fw_sdk, BOT_SDK=bot_sdk,
-        TESTPYPI=testpypi,
+        TESTPYPI=testpypi, FAIL_EDITABLE=fail_editable,
     )
     calls = log.read_text().splitlines() if log.exists() else []
     return r, calls, f"{fw_venv}/bin/python"
@@ -131,21 +134,24 @@ def test_the_framework_venv_gets_the_framework_only(tmp_path):
     assert fw_installs and all("-e " not in c for c in fw_installs), fw_installs
 
 
-def test_the_bot_venv_gets_the_bot_then_the_frameworks_exact_sdk(tmp_path):
+def test_the_bot_venv_gets_the_frameworks_exact_sdk_then_the_bot(tmp_path):
+    """The pin goes in FIRST, so the PyPI-only editable install after it keeps it --
+    and fails when it is below the bot's own jaato-sdk floor (issue #47)."""
     r, calls, _ = _install(tmp_path)
     assert r.returncode == 0, r.stderr
     bot_py = "/home/jaato-tg/venv/bin/python"
     bot_installs = [c for c in calls if c.startswith("pip install") and bot_py in c]
     assert len(bot_installs) == 2, bot_installs
-    assert "-e /home/jaato-tg/jaato-client-telegram" in bot_installs[0]
-    assert bot_installs[1].endswith("jaato-sdk==0.30.0rc2")   # the pin comes LAST
+    assert bot_installs[0].endswith("jaato-sdk==0.30.0rc7")   # the pin comes FIRST
+    assert "-e /home/jaato-tg/jaato-client-telegram" in bot_installs[1]
+    assert "test.pypi.org" not in bot_installs[1]   # the bot's own deps: PyPI only
 
 
 def test_the_sdk_pin_uses_the_frameworks_index(tmp_path):
     """An rc SDK exists only on TestPyPI: the pin must look where the framework did."""
     r, calls, _ = _install(tmp_path, testpypi="1")
     assert r.returncode == 0, r.stderr
-    pin = [c for c in calls if c.endswith("jaato-sdk==0.30.0rc2")][0]
+    pin = [c for c in calls if c.endswith("jaato-sdk==0.30.0rc7")][0]
     assert "--index-url https://test.pypi.org/simple/" in pin
 
 
@@ -158,10 +164,17 @@ def test_both_venvs_are_recreated_and_the_bots_uses_the_system_python(tmp_path):
     assert "--no-managed-python" in bot_venv   # a uv-managed CPython lives under /root
 
 
-def test_refuses_a_bot_sdk_that_differs_from_the_frameworks(tmp_path):
-    r, _, _ = _install(tmp_path, fw_sdk="0.30.0rc2", bot_sdk="0.29.0")
+def test_refuses_a_framework_sdk_below_the_bots_floor(tmp_path):
+    """The editable install after the pin is what enforces pyproject's jaato-sdk floor."""
+    r, _, _ = _install(tmp_path, fail_editable="1")
     assert r.returncode != 0
-    assert "0.29.0" in r.stderr and "0.30.0rc2" in r.stderr
+    assert "floor" in r.stderr and "0.30.0rc7" in r.stderr
+
+
+def test_refuses_a_bot_sdk_that_differs_from_the_frameworks(tmp_path):
+    r, _, _ = _install(tmp_path, fw_sdk="0.30.0rc7", bot_sdk="0.29.0")
+    assert r.returncode != 0
+    assert "0.29.0" in r.stderr and "0.30.0rc7" in r.stderr
 
 
 # ── the unit drops the bot to its account ────────────────────────────────────

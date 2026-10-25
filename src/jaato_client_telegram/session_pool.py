@@ -22,7 +22,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from jaato_sdk import ConnectionState, WSRecoveryClient
 from jaato_sdk.events import ClientType, EventType
@@ -422,6 +422,80 @@ class SessionPool:
             "endpoint": getattr(event, "endpoint", "") or "",
         }
 
+    async def invoke_plugin_tool_command(
+        self,
+        plugin: str,
+        tool: str,
+        args: "dict | None" = None,
+        *,
+        profile: str = "",
+        plugin_configs: "dict | None" = None,
+        on_permission: "Callable[[Any], Any] | None" = None,
+        timeout: float = 300.0,
+    ) -> dict:
+        """Run ONE framework plugin tool with no session and no model turn
+        (``invoke_plugin_tool``, protocol 1.37, jaato #1606) and return
+        ``{ok, category, error, success, result}``. Backs
+        ``ToolContext.invoke_plugin_tool``.
+
+        This is how a host tool reaches daemon-resolved credentials: the daemon
+        resolves ``pass://`` / ``vault://`` in the profile before the runner starts,
+        so the secret never enters this (unprivileged) bot process — the call's
+        result comes back secret-redacted.
+
+        Dials a SHORT-LIVED, session-less client per call rather than reusing the
+        chat's: (1) the chat's client may be gone (idle detach) while a host tool's
+        background task is still running; (2) on the chat's client, the call's
+        permission ASK would also reach the chat's renderer, which would show its
+        own card and answer it a second time. Same workspace + config_root as the
+        chat clients, so ``profile`` names resolve exactly as for a chat session.
+
+        Never raises: a daemon below ``MIN_PLUGIN_TOOL_PROTOCOL`` (the SDK refuses
+        it rather than send a verb the daemon would silently drop), a failed dial,
+        or a timeout come back as ``ok=False`` with a ``category`` naming why."""
+        client = self._make_client(None)
+        if not hasattr(client, "invoke_plugin_tool"):
+            return {"ok": False, "category": "unsupported_sdk", "success": False,
+                    "result": None,
+                    "error": "invoke_plugin_tool: the installed jaato-sdk is too old "
+                             "(needs >= 0.30.0rc7). Upgrade jaato-sdk."}
+        try:
+            if not await client.connect():
+                return {"ok": False, "category": "not_connected", "success": False,
+                        "result": None,
+                        "error": f"invoke_plugin_tool: could not connect to "
+                                 f"{self._ws_config.url}"}
+            event = await client.invoke_plugin_tool(
+                plugin, tool, args or {}, profile=profile,
+                plugin_configs=plugin_configs, on_permission=on_permission,
+                timeout=timeout,
+            )
+        except ValueError as e:
+            # The SDK's protocol floor (MIN_PLUGIN_TOOL_PROTOCOL): a clear refusal,
+            # never a request the daemon would ignore while the caller waits.
+            return {"ok": False, "category": "unsupported_protocol", "success": False,
+                    "result": None, "error": str(e)}
+        except asyncio.TimeoutError:
+            return {"ok": False, "category": "timeout", "success": False, "result": None,
+                    "error": f"invoke_plugin_tool: no answer for {plugin}.{tool} "
+                             f"within {timeout:.0f}s"}
+        except Exception as e:  # noqa: BLE001 — refused / connection lost
+            logger.warning("invoke_plugin_tool(%s.%s) failed: %s", plugin, tool, e)
+            return {"ok": False, "category": "not_connected", "success": False,
+                    "result": None, "error": f"invoke_plugin_tool: {e}"}
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                logger.debug("close of plugin-tool client failed", exc_info=True)
+        return {
+            "ok": bool(getattr(event, "ok", False)),
+            "category": getattr(event, "category", "") or "",
+            "error": getattr(event, "error", "") or "",
+            "success": bool(getattr(event, "success", False)),
+            "result": getattr(event, "result", None),
+        }
+
     async def get_or_create_session(self, chat_id: int) -> str:
         async with self._lock:
             if chat_id in self._sessions:
@@ -700,6 +774,7 @@ class SessionPool:
                     bind_fn=self.bind_wake_command,
                     unbind_fn=self.unbind_wake_command,
                     tool_registry=registry,
+                    plugin_tool_fn=self.invoke_plugin_tool_command,
                 )
                 tools.append({**schema, "handler": handler})
                 registry[name] = {"handler": handler, "schema": schema}

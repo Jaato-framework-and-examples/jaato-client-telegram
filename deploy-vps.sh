@@ -405,13 +405,17 @@ install(){ info "Install (framework venv: PyPI jaato-server/jaato-sdk; bot venv:
 # TestPyPI for it: the bot's own deps (aiogram, …) must come from PyPI only.
 install_bot(){ info "Bot venv -> $BOT_VENV (jaato-sdk + editable bot, owned by $BOT_USER)"
   uv venv --clear --no-managed-python --python "$PYTHON_BIN" "$BOT_VENV"
-  uv pip install --python "$BOT_PYV" -e "$BOT_DIR"
   sync_bot_sdk
 }
 # Pin the bot's jaato-sdk to the version the FRAMEWORK venv holds: the wire
-# schema is the SDK's, and the daemon speaks the one installed beside it.  After
-# the editable install, so the pin -- from TestPyPI when the framework came from
-# there -- replaces whatever the bot's `jaato-sdk>=` resolved to on PyPI.
+# schema is the SDK's, and the daemon speaks the one installed beside it.  The
+# pin goes in FIRST -- from TestPyPI when the framework came from there -- and
+# the editable bot install after it, from PyPI only: that install keeps the
+# pinned SDK and FAILS when the pin is below the bot's own `jaato-sdk>=` floor
+# (a framework too old for the bot's code, e.g. no invoke_plugin_tool) instead
+# of deploying a bot that breaks at runtime.  Re-run on --framework-only too, so
+# a framework downgrade below the floor is refused there as well; the bot's
+# code is the same checkout either way.
 # Proven by importing the bot AS its account: that read is the one that matters.
 sync_bot_sdk(){
   local want got
@@ -419,6 +423,8 @@ sync_bot_sdk(){
   [ -n "$want" ] || die "no jaato-sdk in the framework venv $VENV -- install the framework first"
   fw_index_args
   uv pip install --python "$BOT_PYV" ${FW_IDX[@]+"${FW_IDX[@]}"} "jaato-sdk==$want"
+  uv pip install --python "$BOT_PYV" -e "$BOT_DIR" \
+    || die "the bot does not install beside jaato-sdk $want (below the bot's jaato-sdk floor in pyproject.toml?)"
   own_bot_home
   got=$(as_bot "$BOT_PYV" -c 'import importlib.metadata as m, jaato, jaato_client_telegram; print(m.version("jaato-sdk"))') \
     || die "the bot venv does not import as $BOT_USER (see the traceback above)"
@@ -1108,7 +1114,8 @@ deploy_framework_only(){
   [ -x "$BOT_PYV" ] || die "framework-only needs the bot's own venv at $BOT_VENV — run a full deploy first"
   install_uv                    # ensure uv is on PATH (idempotent; no other preflight)
   install_framework             # honors TESTPYPI + JAATO_{SDK,SERVER}_VERSION
-  # The bot speaks the new SDK too — re-pin it; does NOT change bot code.
+  # The bot speaks the new SDK too — re-pin it (and refuse one below the bot's
+  # floor); does NOT change bot code.
   sync_bot_sdk
   # A framework change moves the SERVER binary AND the SDK the bot imports → both restart.
   _sc restart jaato-server.service jaato-tg.service
