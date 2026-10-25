@@ -585,9 +585,11 @@ class ToolContext:
         process: the daemon resolves it before the runner starts and redacts it from
         the result. Do NOT read a secret store yourself.
 
-        ``profile`` names a profile of the bot's workspace that enables ``plugin``
-        (or pass ``plugin_configs`` instead — one or the other, never both). There is
-        no default: name the profile that holds the credential.
+        ``profile`` names a profile under ``<workspace>/.jaato-judge/profiles/`` that
+        enables ``plugin`` — e.g. ``github_ci`` for GitHub with a read-only CI token
+        — or pass ``plugin_configs`` instead (one or the other, never both). There is
+        no default: name the profile that holds the credential. It lives in
+        ``.jaato-judge``, not ``.jaato``, so the chat model cannot spawn it.
 
         A permission ASK raised by the call goes to ``on_permission(event)`` when
         given (return ``"y"``/``"n"``/...; ``None`` denies). By default it is put to

@@ -1,0 +1,44 @@
+# github_ci — a PLUGIN-TOOL profile, not a session: no provider, no model, no
+# persona. Host tools name it in ctx.invoke_plugin_tool(..., profile="github_ci")
+# to call GitHub with a token the bot's account never sees (issue #47):
+#
+#   r = await ctx.invoke_plugin_tool("service_connector", "call_service", {
+#       "url": "https://api.github.com/repos/<owner>/<repo>/actions/runs",
+#       "method": "GET",
+#       "auth": {"type": "bearer", "token_env": "GITHUB_CI_TOKEN"},
+#   }, profile="github_ci")
+#
+# The daemon resolves `env:` (pass:// included) BEFORE the runner starts and
+# hands the runner the plaintext; the confined runner cannot exec `pass` itself,
+# so the token must arrive this way -- never as a pass:// in `auth`. Results come
+# back secret-redacted.
+#
+# Lives in the isolated .jaato-judge config_root (NOT the bot's .jaato/) for the
+# same reason as judge/curator: the chat's `subagent` plugin discovers every
+# profile under .jaato/profiles/, and a spawnable profile holding this token
+# would hand the model an authenticated GitHub client. SessionPool dials plugin
+# tool calls with this config_root (invoke_plugin_tool_command).
+name: github_ci
+description: >
+  Authenticated GitHub API calls (read-only CI token) for host tools, through
+  service_connector.call_service. Not a chat profile.
+
+plugins:
+  # call_service only: discover/import/configure tools would let a caller store
+  # services or auth under this profile; nothing here needs them.
+  - "service_connector(tools:[call_service])"
+
+env:
+  # The read-only CI token (fine-grained PAT: Actions + Contents read). Created
+  # in the DAEMON's pass store; the bot's account cannot read that store.
+  GITHUB_CI_TOKEN: "pass://jaato/github/ci-read-org"
+
+plugin_configs:
+  permission:
+    policy:
+      # Host tools call this unattended (a background CI poller): an ASK would
+      # page the chat's user on every poll. call_service is the only tool in
+      # the surface, so the whitelist is exactly what the profile can do.
+      defaultPolicy: deny
+      whitelist:
+        tools: [call_service]

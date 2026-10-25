@@ -9,7 +9,10 @@ routing to the chat's user.
 """
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
+
+import yaml
 
 import jaato_client_telegram.host_tool_loader as loader
 from jaato_client_telegram.host_tool_loader import ToolContext
@@ -130,7 +133,7 @@ class _FakeClient:
 
 def _pool(fc):
     return SimpleNamespace(
-        _make_client=lambda chat_id=None: fc, _ws_config=SimpleNamespace(url="ws://daemon")
+        _make_plugin_tool_client=lambda: fc, _ws_config=SimpleNamespace(url="ws://daemon")
     )
 
 
@@ -176,3 +179,46 @@ def test_pool_command_timeout():
     fc = _FakeClient(raises=asyncio.TimeoutError())
     r = asyncio.run(SessionPool.invoke_plugin_tool_command(_pool(fc), "p", "t", timeout=5))
     assert r["category"] == "timeout"
+
+
+# ---- the github_ci plugin-tool profile + where plugin-tool calls dial ------
+
+RUNTIME = Path(__file__).resolve().parent.parent / "runtime"
+
+
+def test_plugin_tool_client_dials_the_isolated_config_root(monkeypatch):
+    """Plugin-tool profiles live in .jaato-judge, which the chat's subagent plugin
+    does not discover -- the client must resolve profiles from there."""
+    import jaato_client_telegram.session_pool as sp
+
+    seen = {}
+
+    def fake_client(url, **kw):
+        seen.update(url=url, **kw)
+
+    monkeypatch.setattr(sp, "WSRecoveryClient", fake_client)
+    me = SimpleNamespace(
+        _ws_config=SimpleNamespace(url="ws://daemon", secret_token="", workspace="/ws"),
+        _build_ssl_context=lambda: None,
+    )
+    me._internal_conn = lambda: SessionPool._internal_conn(me)
+    SessionPool._make_plugin_tool_client(me)
+    assert seen["config_root"] == "/ws/.jaato-judge"
+    assert seen["workspace_path"] == "/ws"
+
+
+def test_github_ci_profile_is_call_service_only_and_unattended():
+    profile = yaml.safe_load((RUNTIME / ".jaato-judge/profiles/github_ci.yaml").read_text())
+    assert profile["name"] == "github_ci"
+    assert profile["plugins"] == ["service_connector(tools:[call_service])"]
+    assert "provider" not in profile and "model" not in profile  # not a session
+    # the token is a daemon-resolved secret URI, never a literal
+    assert profile["env"]["GITHUB_CI_TOKEN"].startswith("pass://")
+    policy = profile["plugin_configs"]["permission"]["policy"]
+    assert policy["defaultPolicy"] == "deny"
+    assert policy["whitelist"]["tools"] == ["call_service"]
+
+
+def test_github_ci_profile_is_not_in_the_chat_config_root():
+    """In .jaato/profiles the chat model could spawn it as a subagent."""
+    assert not list((RUNTIME / ".jaato").glob("**/github_ci.yaml"))

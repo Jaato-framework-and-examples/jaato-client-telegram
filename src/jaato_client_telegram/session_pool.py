@@ -356,7 +356,9 @@ class SessionPool:
         still resolves its own profile from this root, while ``workspace_path`` (the
         bot's workspace) gives its memory plugin the bot's own ``.jaato/memories``.
         Passed to ``WSRecoveryClient.session(**conn, profile=..., agent=..., ...)``
-        in enrichment._judge and curator.run_curator."""
+        in enrichment._judge and curator.run_curator, and to the session-less
+        client of ``invoke_plugin_tool_command`` -- so a host tool's plugin-tool
+        profile (e.g. ``github_ci``, holding a credential) lives here too."""
         workspace = self._ws_config.workspace
         return dict(
             url=self._ws_config.url,
@@ -451,6 +453,11 @@ class SessionPool:
             "endpoint": getattr(event, "endpoint", "") or "",
         }
 
+    def _make_plugin_tool_client(self) -> WSRecoveryClient:
+        """A session-less client for ONE plugin tool call (see
+        ``invoke_plugin_tool_command``), on the internal dial."""
+        return WSRecoveryClient(**self._internal_conn())
+
     async def invoke_plugin_tool_command(
         self,
         plugin: str,
@@ -476,13 +483,18 @@ class SessionPool:
         chat's: (1) the chat's client may be gone (idle detach) while a host tool's
         background task is still running; (2) on the chat's client, the call's
         permission ASK would also reach the chat's renderer, which would show its
-        own card and answer it a second time. Same workspace + config_root as the
-        chat clients, so ``profile`` names resolve exactly as for a chat session.
+        own card and answer it a second time.
+
+        Dialled like the internal sessions (``_internal_conn``): same workspace,
+        but the ISOLATED ``.jaato-judge`` config_root, so ``profile`` names a
+        profile under ``<workspace>/.jaato-judge/profiles/`` (e.g. ``github_ci``).
+        A credential-holding profile must not live in the bot's ``.jaato/``: the
+        chat's ``subagent`` plugin offers every profile there to the model.
 
         Never raises: a daemon below ``MIN_PLUGIN_TOOL_PROTOCOL`` (the SDK refuses
         it rather than send a verb the daemon would silently drop), a failed dial,
         or a timeout come back as ``ok=False`` with a ``category`` naming why."""
-        client = self._make_client(None)
+        client = self._make_plugin_tool_client()
         if not hasattr(client, "invoke_plugin_tool"):
             return {"ok": False, "category": "unsupported_sdk", "success": False,
                     "result": None,

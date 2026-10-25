@@ -67,8 +67,12 @@ a token file or a plaintext env var of its own. It asks the daemon to run a
 async def execute(args, ctx):
     r = await ctx.invoke_plugin_tool(
         "service_connector", "call_service",
-        {"service": "github", "method": "GET", "path": "/repos/o/r/pulls"},
-        profile="github-ops",          # a profile of the bot's workspace; no default
+        {
+            "url": "https://api.github.com/repos/o/r/actions/runs?per_page=5",
+            "method": "GET",
+            "auth": {"type": "bearer", "token_env": "GITHUB_CI_TOKEN"},
+        },
+        profile="github_ci",           # runtime/.jaato-judge/profiles/github_ci.yaml
     )
     if "error" in r:
         return {"error": f"{r['category']}: {r['error']}"}
@@ -81,6 +85,28 @@ jaato #1606), in a runner of the bot's workspace configured by `profile` (or by 
 `vault://` in the profile's `env:` / `plugin_configs` **before** the runner starts,
 and the result comes back secret-redacted, so the secret never enters the bot process.
 The profile's permission policy and the failure contract apply as in a session.
+
+**The profile.** `profile` names a profile under `runtime/.jaato-judge/profiles/` —
+the isolated config root the judge and curator use — **never** `.jaato/profiles/`:
+the chat's `subagent` plugin offers every profile there to the model, and a
+spawnable profile holding a token hands the model an authenticated client. A
+credential profile enables only the tool it needs, maps the secret into `env:`, and
+whitelists that tool so an unattended call never asks. The tracked
+[`github_ci`](../../runtime/.jaato-judge/profiles/github_ci.yaml) is the pattern:
+
+```yaml
+name: github_ci
+plugins: ["service_connector(tools:[call_service])"]
+env:
+  GITHUB_CI_TOKEN: "pass://jaato/github/ci-read-org"   # in the DAEMON's pass store
+plugin_configs:
+  permission:
+    policy: {defaultPolicy: deny, whitelist: {tools: [call_service]}}
+```
+
+Name the variable in `auth.token_env`; never put a `pass://` URI in the call's own
+`auth` — the confined runner cannot run `pass`, so only the daemon-resolved `env:`
+reaches it.
 
 - **Returns, never raises:** `{"result": ...}` when the tool ran and succeeded, else
   `{"error", "category", "result"}`. `category` is `tool_failed` when the tool itself
