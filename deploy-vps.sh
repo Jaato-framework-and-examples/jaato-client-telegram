@@ -21,6 +21,19 @@
 # upgraded to a TestPyPI build). e.g.:
 #   TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh
 #
+# Framework builds published ONLY as GitHub Releases (the jaato repo is private and
+# no longer publishes to (Test)PyPI): GITHUB_RELEASES=1 downloads the wheels of the
+# pinned versions from the releases of $JAATO_RELEASES_REPO (tags <pkg>-<version>),
+# verifies them against each release's SHA256SUMS, and installs them with
+# --find-links -- every dependency still resolves from PyPI.  The repo is private:
+# the token comes from JAATO_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN, else from a
+# logged-in `gh`.  Or fill a directory with the wheels yourself (no GitHub
+# credentials on the box) and point JAATO_WHEELS_DIR at it; a SHA256SUMS in it is
+# checked.  Both need BOTH versions pinned (there is no index to pick "latest"
+# from), and neither combines with TESTPYPI.  e.g.:
+#   GITHUB_RELEASES=1 JAATO_SDK_VERSION=0.30.0rc30 JAATO_SERVER_VERSION=1.3.0rc32 ./deploy-vps.sh --framework-only
+#   JAATO_WHEELS_DIR=/root/wheels JAATO_SDK_VERSION=0.30.0rc30 JAATO_SERVER_VERSION=1.3.0rc32 ./deploy-vps.sh
+#
 # Provider selection AND the per-provider key env-var name are discovered from
 # `jaato-scaffold explain` — nothing about providers is hardcoded here.
 #
@@ -31,8 +44,8 @@
 # Code-only: test a branch's CODE without a full redeploy — updates only src/ and
 #            restarts the bot, leaving config, profile, persona and venv untouched:
 #            CODE_REF=<branch> ./deploy-vps.sh --code-only
-# Framework-only: reinstall ONLY jaato-server + jaato-sdk (honors TESTPYPI +
-#            version pins) into the existing venv and restart both services, leaving
+# Framework-only: reinstall ONLY jaato-server + jaato-sdk (honors TESTPYPI /
+#            GITHUB_RELEASES / JAATO_WHEELS_DIR + version pins) into the existing venv and restart both services, leaving
 #            config, profile, persona and bot code untouched — for testing a
 #            pre-release framework build or bumping the framework in place:
 #            TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh --framework-only
@@ -62,6 +75,13 @@ JAATO_SDK_VERSION="${JAATO_SDK_VERSION:-}"
 # Non-empty => install the framework from TestPyPI (PyPI kept as --extra-index-url
 # for everything else + deps). For pre-publish testing. See the header block.
 TESTPYPI="${TESTPYPI:-}"
+# Non-empty => take the PINNED framework wheels from GitHub Releases of this repo,
+# checksum-verified, cached under RELEASE_CACHE.  See the header block.
+GITHUB_RELEASES="${GITHUB_RELEASES:-}"
+JAATO_RELEASES_REPO="${JAATO_RELEASES_REPO:-Jaato-framework-and-examples/jaato}"
+RELEASE_CACHE="${JAATO_RELEASE_CACHE:-$HOME/.cache/jaato-tg/release-wheels}"
+# A directory of framework wheels the operator filled (no GitHub credentials needed).
+JAATO_WHEELS_DIR="${JAATO_WHEELS_DIR:-}"
 WS_PORT="${JAATO_WS_PORT:-8080}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -323,7 +343,8 @@ fetch(){ info "Fetch bot repo (bot=$BOT_REF; jaato-server/sdk come from PyPI, no
 
 # ── 3. Install (uv venv + PyPI framework + editable bot; no premium) ──────────
 # Install the FRAMEWORK (jaato-server + jaato-sdk) into $VENV. Honors the version
-# pins (JAATO_SERVER_VERSION/JAATO_SDK_VERSION) and TESTPYPI. Shared by the full
+# pins (JAATO_SERVER_VERSION/JAATO_SDK_VERSION), TESTPYPI and the release wheel
+# sources (GITHUB_RELEASES / JAATO_WHEELS_DIR). Shared by the full
 # install() and the --framework-only mode (which reuses the EXISTING venv), so the
 # resolution rules cannot drift between them.
 install_framework(){
@@ -346,14 +367,20 @@ install_framework(){
   # from TestPyPI when TESTPYPI is set (PyPI kept as the extra index).
   uv pip install --python "$PYV" ${FW_IDX[@]+"${FW_IDX[@]}"} "$sdk" "$srv"
   printf '  framework from %s: jaato-sdk %s, jaato-server[extras] %s\n' \
-    "$([ -n "$TESTPYPI" ] && echo 'TestPyPI (+PyPI extra)' || echo 'PyPI')" \
+    "$(_fw_source_name)" \
     "$(_dist_version "$PYV" jaato-sdk)" "$(_dist_version "$PYV" jaato-server)"
+}
+_fw_source_name(){
+  if [ -n "$TESTPYPI" ]; then echo 'TestPyPI (+PyPI extra)'
+  elif [ -n "$GITHUB_RELEASES$JAATO_WHEELS_DIR" ]; then echo 'release wheels (+PyPI)'
+  else echo 'PyPI'; fi
 }
 # The installed version of a distribution in a venv (empty if absent).
 _dist_version(){ uv pip show --python "$1" "$2" 2>/dev/null | sed -n 's/^Version: //p'; }
 # The index arguments for a FRAMEWORK package, into FW_IDX: empty (PyPI), or
-# TestPyPI-first when TESTPYPI is set.  Shared by the framework install and the
-# bot's jaato-sdk pin, which must resolve the same version from the same index.
+# TestPyPI-first when TESTPYPI is set, plus the release wheels' --find-links.
+# Shared by the framework install and the bot's jaato-sdk pin, which must resolve
+# the same version from the same source.
 fw_index_args(){
   FW_IDX=()
   if [ -n "$TESTPYPI" ]; then
@@ -374,6 +401,91 @@ fw_index_args(){
           --prerelease allow )
     info "  TestPyPI ENABLED for framework (sdk=${JAATO_SDK_VERSION:-latest} server=${JAATO_SERVER_VERSION:-latest}); other packages + deps from PyPI"
   fi
+  fw_release_links
+  FW_IDX+=(${FW_LINKS[@]+"${FW_LINKS[@]}"})
+}
+
+# The --find-links arguments for framework wheels that live on NO index, into
+# FW_LINKS: the operator's JAATO_WHEELS_DIR and/or the GitHub Release downloads.
+# Prepared once per run -- the framework install and the bot's SDK pin then take
+# the SAME wheels, which keeps the bot on the framework's exact version.  Only
+# --find-links, never --no-index: every dependency still resolves from PyPI.
+# No --prerelease allow either: both pins are explicit (required below), which is
+# what lets uv take an rc for them without opening pre-releases to every dep.
+fw_release_links(){
+  [ -n "${FW_LINKS_READY:-}" ] && return 0
+  FW_LINKS=()
+  if [ -n "$GITHUB_RELEASES$JAATO_WHEELS_DIR" ]; then
+    [ -z "$TESTPYPI" ] || die "TESTPYPI and GITHUB_RELEASES / JAATO_WHEELS_DIR are alternative framework sources -- set one"
+    [ -n "$JAATO_SDK_VERSION" ] && [ -n "$JAATO_SERVER_VERSION" ] \
+      || die "a release framework source installs exact versions: set JAATO_SDK_VERSION and JAATO_SERVER_VERSION (there is no index to pick 'latest' from)"
+  fi
+  if [ -n "$JAATO_WHEELS_DIR" ]; then
+    [ -d "$JAATO_WHEELS_DIR" ] || die "JAATO_WHEELS_DIR=$JAATO_WHEELS_DIR is not a directory"
+    if [ -f "$JAATO_WHEELS_DIR/SHA256SUMS" ]; then
+      _verify_wheels "$JAATO_WHEELS_DIR" || die "wheels in $JAATO_WHEELS_DIR do not match its SHA256SUMS"
+    fi
+    FW_LINKS+=(--find-links "$JAATO_WHEELS_DIR")
+    info "  framework wheels from $JAATO_WHEELS_DIR (deps from PyPI)"
+  fi
+  if [ -n "$GITHUB_RELEASES" ]; then
+    _release_wheels jaato-sdk "$JAATO_SDK_VERSION"; FW_LINKS+=(--find-links "$RELEASE_DIR")
+    _release_wheels jaato-server "$JAATO_SERVER_VERSION"; FW_LINKS+=(--find-links "$RELEASE_DIR")
+    info "  framework wheels from GitHub Releases of $JAATO_RELEASES_REPO (deps from PyPI)"
+  fi
+  FW_LINKS_READY=1
+}
+# A dir's wheels against its SHA256SUMS: every wheel must be LISTED there (an
+# unlisted one would pass `--ignore-missing` unchecked) and match.  The sdists the
+# file also lists are not downloaded, hence --ignore-missing.
+_verify_wheels(){ local dir="$1" whl
+  [ -f "$dir/SHA256SUMS" ] || return 1
+  compgen -G "$dir/*.whl" >/dev/null || return 1
+  for whl in "$dir"/*.whl; do
+    awk '{ sub(/^[*]/, "", $2); print $2 }' "$dir/SHA256SUMS" \
+      | grep -qxF "$(basename "$whl")" || return 1
+  done
+  (cd "$dir" && sha256sum --quiet --ignore-missing -c SHA256SUMS >/dev/null)
+}
+# The GitHub token for the PRIVATE releases repo: env first, then a logged-in gh.
+_github_token(){
+  local t="${JAATO_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+  [ -z "$t" ] && command -v gh >/dev/null 2>&1 && t=$(gh auth token 2>/dev/null || true)
+  printf '%s' "$t"
+}
+# curl against the GitHub API with the token passed on a config FILE descriptor,
+# never in argv (where `ps` would show it to every account on the box).
+_gh_curl(){ local tok="$1"; shift
+  curl -fsSL --retry 3 -K <(printf 'header = "Authorization: Bearer %s"\n' "$tok") \
+    -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+}
+# Download the wheels + SHA256SUMS of release <pkg>-<version> into
+# $RELEASE_CACHE/<tag> (reused when already there and verified) and set
+# RELEASE_DIR to it.  One dir per release: each carries its own SHA256SUMS.
+_release_wheels(){ local pkg="$1" ver="$2" tag dir tok meta name url
+  tag="$pkg-$ver"; dir="$RELEASE_CACHE/$tag"; RELEASE_DIR="$dir"
+  if _verify_wheels "$dir" 2>/dev/null; then
+    printf '  %s: cached in %s (verified)\n' "$tag" "$dir"; return 0
+  fi
+  tok=$(_github_token)
+  [ -n "$tok" ] || die "GITHUB_RELEASES: no token for the private $JAATO_RELEASES_REPO -- set JAATO_GITHUB_TOKEN (contents: read) or log in with gh, or fill JAATO_WHEELS_DIR instead"
+  meta=$(_gh_curl "$tok" -H "Accept: application/vnd.github+json" \
+           "https://api.github.com/repos/$JAATO_RELEASES_REPO/releases/tags/$tag") \
+    || die "no GitHub Release $tag in $JAATO_RELEASES_REPO (or the token cannot read it)"
+  rm -rf "$dir"; mkdir -p "$dir"
+  while IFS=$'\t' read -r name url; do
+    [ -n "$name" ] || continue
+    case "$name" in */*|.*) die "release $tag: refusing asset name $name";; esac
+    _gh_curl "$tok" -H "Accept: application/octet-stream" -o "$dir/$name" "$url" \
+      || die "release $tag: download of $name failed"
+  done < <(printf '%s' "$meta" | "$PYTHON_BIN" -c '
+import json, sys
+for a in json.load(sys.stdin).get("assets", []):
+    if a["name"].endswith(".whl") or a["name"] == "SHA256SUMS":
+        print(a["name"] + "\t" + a["url"])')
+  [ -f "$dir/SHA256SUMS" ] || die "release $tag has no SHA256SUMS -- refusing unverified wheels"
+  _verify_wheels "$dir" || die "release $tag: wheels do not match its SHA256SUMS (or none were published)"
+  printf '  %s: downloaded + verified -> %s\n' "$tag" "$dir"
 }
 
 install(){ info "Install (framework venv: PyPI jaato-server/jaato-sdk; bot venv: jaato-sdk + editable bot)"
@@ -409,7 +521,8 @@ install_bot(){ info "Bot venv -> $BOT_VENV (jaato-sdk + editable bot, owned by $
 }
 # Pin the bot's jaato-sdk to the version the FRAMEWORK venv holds: the wire
 # schema is the SDK's, and the daemon speaks the one installed beside it.  The
-# pin goes in FIRST -- from TestPyPI when the framework came from there -- and
+# pin goes in FIRST -- from wherever the framework came from (TestPyPI, the
+# release wheels) -- and
 # the editable bot install after it, from PyPI only: that install keeps the
 # pinned SDK and FAILS when the pin is below the bot's own `jaato-sdk>=` floor
 # (a framework too old for the bot's code, e.g. no invoke_plugin_tool) instead
@@ -1099,13 +1212,15 @@ deploy_code_only(){
 
 # ── Framework-only upgrade (no config/profile/persona regen) ─────────────────
 # Reinstall ONLY the framework (jaato-server + jaato-sdk) into the EXISTING venv —
-# honoring TESTPYPI + JAATO_SERVER_VERSION/JAATO_SDK_VERSION — then re-resolve the
+# honoring TESTPYPI / GITHUB_RELEASES / JAATO_WHEELS_DIR + JAATO_SERVER_VERSION /
+# JAATO_SDK_VERSION — then re-resolve the
 # bot's jaato-sdk to match and restart BOTH services. Config, profile, persona, whitelist AND
 # the bot code are left untouched (no git reset, no regen, no backup). This is the
 # supported way to test a pre-release framework build (TESTPYPI=1) or to bump the
 # framework on a hand-managed box without a full redeploy. For a bot CODE change
 # use --code-only; for a full (re)deploy run with no flag.
 #   TESTPYPI=1 JAATO_SDK_VERSION=0.20.0 JAATO_SERVER_VERSION=0.13.0 ./deploy-vps.sh --framework-only
+#   GITHUB_RELEASES=1 JAATO_SDK_VERSION=0.30.0rc30 JAATO_SERVER_VERSION=1.3.0rc32 ./deploy-vps.sh --framework-only
 deploy_framework_only(){
   info "Framework-only upgrade -> $VENV (config, profile, persona, bot code untouched)"
   check_venv_location --framework-only
@@ -1113,7 +1228,7 @@ deploy_framework_only(){
   [ -d "$VENV" ] || die "framework-only needs an existing venv at $VENV — run a full deploy first"
   [ -x "$BOT_PYV" ] || die "framework-only needs the bot's own venv at $BOT_VENV — run a full deploy first"
   install_uv                    # ensure uv is on PATH (idempotent; no other preflight)
-  install_framework             # honors TESTPYPI + JAATO_{SDK,SERVER}_VERSION
+  install_framework             # honors TESTPYPI / GITHUB_RELEASES / JAATO_WHEELS_DIR + JAATO_{SDK,SERVER}_VERSION
   # The bot speaks the new SDK too — re-pin it (and refuse one below the bot's
   # floor); does NOT change bot code.
   sync_bot_sdk
